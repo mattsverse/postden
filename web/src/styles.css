@@ -1,0 +1,100 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+/* Self-hosted, so the site makes no third-party requests. */
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+@import "@fontsource/instrument-serif/400.css";
+@import "@fontsource/instrument-serif/400-italic.css";
+
+@theme {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Instrument Serif", ui-serif, Georgia, serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, monospace;
+
+  /* The app icon's navy (assets/icon/postden.svg), stretched into a scale. */
+  --color-ink-50: #f5f6f9;
+  --color-ink-100: #e7eaf1;
+  --color-ink-200: #cdd3e0;
+  --color-ink-300: #a7b0c4;
+  --color-ink-400: #7d88a1;
+  --color-ink-500: #5a6681;
+  --color-ink-600: #424e69;
+  --color-ink-700: #313c55;
+  --color-ink-800: #26324a;
+  --color-ink-850: #1a2335;
+  --color-ink-900: #0f1522;
+  --color-ink-950: #0a0f19;
+
+  --color-paper: #fbfaf7;
+  /* Fills and focus rings. Text uses accent-ink on light and accent-soft on dark, for AA contrast. */
+  --color-accent: #5b7bd5;
+  --color-accent-ink: #3a58ad;
+  --color-accent-soft: #9fb3ec;
+  --color-signal: #d9912f;
+}
+
+/* Accent-colored text that passes WCAG AA on both themes. */
+@utility text-accent-fg {
+  color: var(--color-accent-ink);
+  @media (prefers-color-scheme: dark) {
+    color: var(--color-accent-soft);
+  }
+}
+
+html {
+  color-scheme: light dark;
+  scroll-behavior: smooth;
+}
+
+body {
+  @apply bg-paper font-sans text-ink-900 antialiased dark:bg-ink-950 dark:text-ink-50;
+  font-feature-settings: "cv11", "ss01";
+}
+
+::selection {
+  @apply bg-accent/25;
+}
+
+:focus-visible {
+  @apply outline-2 outline-offset-2 outline-accent-ink dark:outline-accent-soft;
+}
+
+/* Tint the Markdown prose with the ink scale instead of Tailwind's gray. */
+.prose {
+  --tw-prose-body: var(--color-ink-700);
+  --tw-prose-headings: var(--color-ink-900);
+  --tw-prose-links: var(--color-ink-900);
+  --tw-prose-bold: var(--color-ink-900);
+  --tw-prose-bullets: var(--color-ink-300);
+  --tw-prose-counters: var(--color-ink-400);
+  --tw-prose-hr: var(--color-ink-100);
+  --tw-prose-code: var(--color-ink-900);
+  --tw-prose-invert-body: var(--color-ink-200);
+  --tw-prose-invert-headings: #fff;
+  --tw-prose-invert-links: #fff;
+  --tw-prose-invert-bold: #fff;
+  --tw-prose-invert-bullets: var(--color-ink-500);
+  --tw-prose-invert-counters: var(--color-ink-400);
+  --tw-prose-invert-hr: var(--color-ink-800);
+  --tw-prose-invert-code: #fff;
+}
+
+/* This block is unlayered, so it outranks `dark:prose-invert`; set the dark colors here too. */
+@media (prefers-color-scheme: dark) {
+  .prose {
+    --tw-prose-body: var(--color-ink-200);
+    --tw-prose-headings: #fff;
+    --tw-prose-links: #fff;
+    --tw-prose-bold: #fff;
+    --tw-prose-bullets: var(--color-ink-500);
+    --tw-prose-counters: var(--color-ink-400);
+    --tw-prose-hr: var(--color-ink-800);
+    --tw-prose-code: #fff;
+  }
+}
+
+/* The summary list under "The short version" reads as a callout. */
+.prose h2#the-short-version + ul {
+  @apply rounded-xl border border-ink-900/10 bg-white px-6 py-5 dark:border-white/15 dark:bg-ink-900;
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "initial-version": "0.1.0",
+      "include-component-in-tag": false,
+      "include-v-in-tag": true,
+      "bump-minor-pre-major": true,
+      "draft": true,
+      "force-tag-creation": true,
+      "exclude-paths": ["web"],
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value == 'postden' || @.name.value == 'postden-core' || @.name.value == 'postden-mail' || @.name.value == 'postden-store' || @.name.value == 'postden-ai' || @.name.value == 'postden-secrets' || @.name.value == 'postden-app' || @.name.value == 'postden-html' || @.name.value == 'postden-update')].version"
+        }
+      ]
+    }
+  }
+}
