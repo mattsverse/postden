@@ -1,0 +1,27 @@
+[package]
+name = "postden"
+description = "Postden desktop app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+postden-core.workspace = true
+postden-mail.workspace = true
+postden-store.workspace = true
+postden-ai.workspace = true
+postden-secrets.workspace = true
+postden-app.workspace = true
+postden-html.workspace = true
+postden-update.workspace = true
+# `native-file-dialog`: picking a signature's images.
+rune = { workspace = true, features = ["native-file-dialog"] }
+# `markdown` draws HTML mail, converted to Markdown.
+rune-kit = { workspace = true, features = ["markdown"] }
+jiff.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
