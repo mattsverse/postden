@@ -1,0 +1,12 @@
+// Deploys the built site as a Cloudflare Worker that only serves static files.
+// Build first (`bun run build`), then `bunx wrangler deploy`.
+{
+  "name": "postden",
+  "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": "./dist/client",
+    // Serve 404.html, with a 404 status, for any URL that isn't a file.
+    "not_found_handling": "404-page"
+  },
+  "previews": {}
+}
