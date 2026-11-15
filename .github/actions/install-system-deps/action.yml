@@ -1,0 +1,10 @@
+name: Install system dependencies
+description: Installs the native libraries needed to build postden. Does nothing on macOS and Windows.
+
+runs:
+  using: composite
+  steps:
+    - name: Install Linux system dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev

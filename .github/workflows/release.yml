@@ -113,6 +113,7 @@ jobs:
         with:
           version: 2026.11.6
           cache: false
+      - uses: ./.github/actions/install-system-deps
       - name: Add Rust target
         run: rustup target add "${{ matrix.target }}"
       # On Linux this also builds the .deb and .rpm packages.
