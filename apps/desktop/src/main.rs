@@ -7,6 +7,7 @@ mod account_settings;
 mod compose;
 mod form;
 mod rich;
+mod search;
 mod state;
 mod update;
 mod view;
@@ -42,7 +43,8 @@ fn main() {
 
 /// ⇧⌘B (and ⌃⌘S on macOS) shows and hides the sidebar, ⌘, opens the settings and Escape closes
 /// them (or the update announcement over them, or an account's settings with nothing unsaved),
-/// and ⌘N starts a new message. With a message open, ⇧⌘U marks it read or unread, ⌘R and ⇧⌘R
+/// and ⌘N starts a new message. ⌘F searches the list, and Escape in the search field ends the
+/// search. With a message open, ⇧⌘U marks it read or unread, ⌘R and ⇧⌘R
 /// reply to the sender or everyone, and Escape goes back to the list. While writing, ⌘↩ sends,
 /// and ⌘K links the selected text, as it does in a signature.
 fn on_key(s: &mut Mail, ev: &KeyEvent, _: &mut Tx) -> bool {
@@ -89,6 +91,10 @@ fn on_key(s: &mut Mail, ev: &KeyEvent, _: &mut Tx) -> bool {
     }
     if ev.is_command('n') && !ev.mods.shift {
         s.compose();
+        return true;
+    }
+    if ev.is_command('f') && !ev.mods.shift && !s.accounts.is_empty() {
+        s.focus_search();
         return true;
     }
     if s.reader.is_some() {

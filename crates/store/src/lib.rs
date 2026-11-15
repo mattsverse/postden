@@ -31,6 +31,15 @@ pub struct StoredMessage {
     pub envelope: Envelope,
 }
 
+/// Which cached mail to look through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope<'a> {
+    /// Every account's mailbox with this role, such as every inbox.
+    Role(Role),
+    /// One of an account's mailboxes.
+    Mailbox { account: &'a str, name: &'a str },
+}
+
 const SCHEMA: &str = "
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
@@ -609,6 +618,65 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Whether a cached message is read, or `None` when it isn't cached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn seen(&self, account: &str, mailbox: &str, uid: u32) -> Result<Option<bool>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT seen FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+                params![account, mailbox, uid],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The `limit` most recent messages in `scope` for which `matches` holds, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn matching_messages(
+        &self,
+        scope: Scope<'_>,
+        mut matches: impl FnMut(&Envelope) -> bool,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        const ORDER: &str = "ORDER BY m.date IS NULL, m.date DESC, m.uid DESC";
+        let (mut stmt, params) = match scope {
+            Scope::Role(role) => (
+                self.conn.prepare(&format!(
+                    "SELECT {MESSAGE_COLUMNS} FROM messages m
+                     JOIN mailboxes b ON b.account = m.account AND b.name = m.mailbox
+                     WHERE b.role = ?1 {ORDER}"
+                ))?,
+                vec![role.as_str()],
+            ),
+            Scope::Mailbox { account, name } => (
+                self.conn.prepare(&format!(
+                    "SELECT {MESSAGE_COLUMNS} FROM messages m
+                     WHERE m.account = ?1 AND m.mailbox = ?2 {ORDER}"
+                ))?,
+                vec![account, name],
+            ),
+        };
+        let mut found = Vec::new();
+        // Rows are read one by one, so a search stops as soon as it has enough.
+        for message in stmt.query_map(rusqlite::params_from_iter(params), message_from_row)? {
+            if found.len() >= limit {
+                break;
+            }
+            let message = message?;
+            if matches(&message.envelope) {
+                found.push(message);
+            }
+        }
+        Ok(found)
+    }
+
     /// How many messages each account has unread in its inbox, by account id. Accounts with none
     /// are left out.
     ///
@@ -1032,6 +1100,11 @@ mod tests {
             !store.set_seen("me@example.com", "INBOX", 2, true).unwrap(),
             "not cached"
         );
+        assert_eq!(
+            store.seen("me@example.com", "INBOX", 1).unwrap(),
+            Some(false)
+        );
+        assert_eq!(store.seen("me@example.com", "INBOX", 2).unwrap(), None);
     }
 
     #[test]
@@ -1187,6 +1260,49 @@ mod tests {
                 .unwrap()
                 .map(|(name, _)| name),
             Some("Sent Items".to_owned())
+        );
+    }
+
+    #[test]
+    fn matching_messages_are_newest_first_within_their_scope() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account("a@example.com")).unwrap();
+        store.save_account(&account("b@example.com")).unwrap();
+        let inbox = [envelope(1, 10), envelope(2, 30), envelope(3, 20)];
+        store
+            .save_messages("a@example.com", "INBOX", Role::Inbox, 1, &inbox)
+            .unwrap();
+        store
+            .save_messages("b@example.com", "INBOX", Role::Inbox, 1, &[envelope(4, 40)])
+            .unwrap();
+        store
+            .save_messages("a@example.com", "Sent", Role::Sent, 1, &[envelope(5, 50)])
+            .unwrap();
+        let not_2 = |e: &Envelope| e.uid != 2;
+        let uids = |found: Vec<StoredMessage>| -> Vec<u32> {
+            found.into_iter().map(|m| m.envelope.uid).collect()
+        };
+
+        let every_inbox = store
+            .matching_messages(Scope::Role(Role::Inbox), not_2, 10)
+            .unwrap();
+        assert_eq!(uids(every_inbox), [4, 3, 1], "Sent is left out");
+        let one = Scope::Mailbox {
+            account: "a@example.com",
+            name: "INBOX",
+        };
+        assert_eq!(
+            uids(store.matching_messages(one, not_2, 10).unwrap()),
+            [3, 1]
+        );
+        assert_eq!(
+            uids(store.matching_messages(one, not_2, 1).unwrap()),
+            [3],
+            "only as many as asked for"
+        );
+        assert_eq!(
+            uids(store.matching_messages(one, |_| false, 10).unwrap()),
+            Vec::<u32>::new()
         );
     }
 

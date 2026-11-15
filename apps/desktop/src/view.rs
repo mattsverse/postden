@@ -22,6 +22,7 @@ use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
 use crate::compose::{ComposeForm, Mode, Preview};
 use crate::form::{AccountForm, SECURITY, Step, security_index};
 use crate::rich::RichEditor;
+use crate::search::{SERVER_PAGE, ServerSearch};
 use crate::state::{INBOX as INBOX_NAME, Mail, Reader, Showing};
 use crate::update::{self, Phase};
 
@@ -239,6 +240,11 @@ fn title(s: &Mail) -> String {
         }
         .into();
     }
+    showing_title(s)
+}
+
+/// What the list shows, by name: "All inboxes", an account's name, or a mailbox and its account's.
+fn showing_title(s: &Mail) -> String {
     match &s.showing {
         Showing::All(Role::Sent) => "Sent".into(),
         Showing::All(_) => "All inboxes".into(),
@@ -435,27 +441,155 @@ fn avatar(name: &str, k: &Kit) -> El {
         .child(text(initial).font(k.ty.small_medium).color(Color::WHITE))
 }
 
+/// The message list, under the search bar once there's an account.
 fn inbox(s: &Mail, k: &Kit) -> El {
-    if s.shown().next().is_none() {
-        let hint = if s.accounts.is_empty() {
-            "Add an account to get started."
-        } else if s.showing_sent() {
-            "No sent mail yet."
-        } else if matches!(&s.showing, Showing::Mailbox { name, .. } if name != INBOX_NAME) {
-            "Nothing here yet. Other mailboxes are checked every few minutes."
-        } else {
-            "No mail yet. New messages appear here as they arrive."
-        };
-        return col()
-            .key("empty")
-            .w_full()
-            .grow(1.0)
-            .center()
-            .child(text(hint).font(k.ty.ui).color(k.c.text_muted));
+    let list = message_list(s, k);
+    if s.accounts.is_empty() {
+        return list;
     }
+    col()
+        .key("inbox")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(search_bar(s, k))
+        .child(list)
+}
+
+/// The search field, and, unless the list already shows every inbox, whether to search just what
+/// it shows or every inbox.
+fn search_bar(s: &Mail, k: &Kit) -> El {
+    let mut input = TextInput::new(&s.search.query)
+        .label("Search mail")
+        .placeholder("Search by subject, sender or recipient (⌘F)")
+        .leading_icon(&glyphs::SEARCH)
+        .width(None)
+        .on_edit(|s: &mut Mail| &mut s.search.query)
+        .on_change(|s: &mut Mail, _| s.search_changed())
+        .on_submit(|s: &mut Mail, _| s.search_server())
+        .on_key(|s: &mut Mail, ev: &rune::KeyEvent, _| {
+            ev.key == rune::Key::Escape && s.clear_search()
+        });
+    if !s.search.query.text.is_empty() {
+        input = input.clear_button().on_action(|s: &mut Mail, _| {
+            s.clear_search();
+        });
+    }
+    let mut bar = row()
+        .key("search")
+        .w_full()
+        .px(20.0)
+        .pt(4.0)
+        .pb(10.0)
+        .gap(12.0)
+        .center_y()
+        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+        .child(row().grow(1.0).min_w(0.0).child(input.build(k)));
+    if s.showing != Showing::All(Role::Inbox) {
+        let here = showing_title(s);
+        let labels = [here.as_str(), "All inboxes"];
+        bar = bar.child(
+            SegmentedControl::new(&labels, Some(usize::from(s.search.everywhere)))
+                .label("Search in")
+                .fit()
+                .on_pick(|s: &mut Mail, i, _| s.search_everywhere(i == 1))
+                .build(k),
+        );
+    }
+    bar
+}
+
+/// The end of a search's results: a button to search the server too, a spinner while it does,
+/// a word when it held back matches, and a way to try again where it failed.
+fn server_search(s: &Mail, k: &Kit) -> El {
+    let end = row()
+        .key("server-search")
+        .w_full()
+        .min_h(48.0)
+        .px(20.0)
+        .gap(8.0)
+        .center();
+    let note = |words: String| text(words).font(k.ty.small).color(k.c.text_muted);
+    let button = |label: &str, key: &str| {
+        Button::new(label)
+            .variant(ButtonVariant::Ghost)
+            .on_press(Mail::search_server)
+            .build(k)
+            .key(key)
+    };
+    match s.search.server() {
+        ServerSearch::Running => end
+            .child(
+                Spinner::new()
+                    .size(16.0)
+                    .color(k.c.icon_muted)
+                    .build(k)
+                    .enter_delay(SPINNER_DELAY),
+            )
+            .child(note("Searching the server…".into())),
+        ServerSearch::Failed(n) => {
+            let mailboxes = if n == 1 {
+                "a mailbox".to_owned()
+            } else {
+                format!("{n} mailboxes")
+            };
+            end.child(note(format!("Couldn't search {mailboxes} on the server.")))
+                .child(button("Try again", "search-server-again"))
+        }
+        ServerSearch::Done if s.search.more => end.child(note(format!(
+            "Showing the newest {SERVER_PAGE} matches on the server from each mailbox. \
+             Add words to narrow the search."
+        ))),
+        ServerSearch::Done => end.child(note(
+            "Includes matches on the server, in message text too.".into(),
+        )),
+        ServerSearch::NotAsked => end.child(button(
+            "Search the server, in message text too (↩)",
+            "search-server",
+        )),
+    }
+}
+
+/// What the list says when it has nothing to show.
+fn empty_list(s: &Mail, k: &Kit) -> El {
+    let searching = s.search.is_active();
+    let server = s.search.server();
+    let hint = if searching && server == ServerSearch::Running {
+        "No cached mail matches. Searching the server…"
+    } else if searching && server == ServerSearch::Done {
+        "Nothing matches, here or on the server."
+    } else if searching {
+        "No cached mail matches."
+    } else if s.accounts.is_empty() {
+        "Add an account to get started."
+    } else if s.showing_sent() {
+        "No sent mail yet."
+    } else if matches!(&s.showing, Showing::Mailbox { name, .. } if name != INBOX_NAME) {
+        "Nothing here yet. Other mailboxes are checked every few minutes."
+    } else {
+        "No mail yet. New messages appear here as they arrive."
+    };
+    let mut empty = col()
+        .key("empty")
+        .w_full()
+        .grow(1.0)
+        .center()
+        .gap(4.0)
+        .child(text(hint).font(k.ty.ui).color(k.c.text_muted));
+    if searching && matches!(server, ServerSearch::NotAsked | ServerSearch::Failed(_)) {
+        empty = empty.child(server_search(s, k));
+    }
+    empty
+}
+
+fn message_list(s: &Mail, k: &Kit) -> El {
+    if s.shown().next().is_none() {
+        return empty_list(s, k);
+    }
+    let searching = s.search.is_active();
     let now = Zoned::now();
     // Mail from several accounts says whose it is.
-    let multiple_accounts = s.showing.account().is_none() && s.accounts.len() > 1;
+    let multiple_accounts = s.listing().account().is_none() && s.accounts.len() > 1;
     let sent = s.showing_sent();
     let mut list = col().key("messages").w_full();
     for m in s.shown() {
@@ -521,6 +655,9 @@ fn inbox(s: &Mail, k: &Kit) -> El {
     }
     if s.has_older() {
         list = list.child(older(s, k));
+    }
+    if searching {
+        list = list.child(server_search(s, k));
     }
     list.scroll(ScrollSpec {
         stick_bottom: false,
