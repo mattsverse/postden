@@ -18,13 +18,15 @@ use postden_core::secrets::{SecretStore, SecretString};
 use postden_mail::imap::{Status, WatchConfig};
 use postden_secrets::Backend;
 use postden_store::{Scope, Store, StoredMessage};
-use rune::{AppHandle, FileDialogOptions, ImageCache, Taskbar, Tray, Tx, WindowHandle};
+use rune::{
+    AppHandle, FileDialogOptions, ImageCache, PointerPress, Taskbar, Tray, Tx, WindowHandle,
+};
 use rune_kit::shell::PaneState;
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
 use crate::compose::{ComposeForm, Mode};
 use crate::form::{AccountForm, GoogleSignIn, Step};
-use crate::search::{self, MailboxKey, SERVER_PAGE, Search};
+use crate::search::{self, MailboxKey, MessageKey, SERVER_PAGE, Search};
 use crate::update::{self, Phase, Updater};
 
 /// How many messages the list shows at first.
@@ -54,6 +56,23 @@ pub(crate) struct Reader {
 impl Reader {
     fn is(&self, account: &str, mailbox: &str, uid: u32) -> bool {
         is_message(&self.message, account, mailbox, uid)
+    }
+}
+
+/// The menu of a message in the list, opened by right-clicking it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MessageMenu {
+    pub(crate) message: MessageKey,
+    /// Where it was right-clicked, which the menu opens at.
+    pub(crate) point: PointerPress,
+    /// Its "Move to" submenu is open.
+    pub(crate) move_open: bool,
+}
+
+impl MessageMenu {
+    pub(crate) fn is(&self, account: &str, mailbox: &str, uid: u32) -> bool {
+        let (a, b, u) = &self.message;
+        a == account && b == mailbox && *u == uid
     }
 }
 
@@ -170,6 +189,13 @@ pub(crate) struct Mail {
     pub(crate) collapsed: HashSet<String>,
     /// The toolbar's ⋯ menu is open.
     pub(crate) actions_open: bool,
+    /// The menu of a message in the list, while it's open.
+    pub(crate) message_menu: Option<MessageMenu>,
+    /// A reply asked for before its message was downloaded: the message, and whether to everyone.
+    /// It starts once the message opens.
+    pending_reply: Option<(MessageKey, bool)>,
+    /// Messages being moved, left out of the list until the server answers.
+    moving: HashSet<MessageKey>,
     /// The message being written, shown over the reader and the list.
     pub(crate) compose: ComposeForm,
     /// The app's preferences, as last saved.
@@ -216,6 +242,9 @@ impl Mail {
             reader: None,
             compose: ComposeForm::default(),
             actions_open: false,
+            message_menu: None,
+            pending_reply: None,
+            moving: HashSet::new(),
             collapsed: HashSet::new(),
             settings: Settings::default(),
             settings_open: false,
@@ -357,7 +386,12 @@ impl Mail {
                 .collect::<Result<Vec<_>, _>>()
         });
         match (mailboxes, messages, services.store.unread_counts()) {
-            (Ok(accounts), Ok(messages), Ok(unread)) => {
+            (Ok(accounts), Ok(mut messages), Ok(unread)) => {
+                messages.retain(|m| {
+                    !self
+                        .moving
+                        .contains(&(m.account.clone(), m.mailbox.clone(), m.envelope.uid))
+                });
                 self.mailboxes = accounts
                     .iter()
                     .map(|(mailboxes, a)| (a.id.clone(), mailboxes.clone()))
@@ -450,16 +484,7 @@ impl Mail {
                 mailbox,
                 count,
                 done,
-            } => {
-                let key = (account, mailbox);
-                self.fetching_older.remove(&key);
-                if done {
-                    self.no_older.insert(key);
-                }
-                // Make room for what came, as it's older than everything listed.
-                self.list_limit = self.list_limit.max(self.messages.len() + count);
-                self.reload();
-            }
+            } => self.older_fetched(account, mailbox, count, done),
             Update::OlderFailed {
                 account,
                 mailbox,
@@ -479,6 +504,13 @@ impl Mail {
                 self.notify(format!("{account}: {error}"));
                 self.reload();
             }
+            Update::Moved {
+                account,
+                mailbox,
+                uid,
+                to,
+                result,
+            } => self.moved(&account, &mailbox, uid, &to, result),
             Update::Sent { account, result } => self.sent(&account, result),
             Update::Searched {
                 id,
@@ -502,6 +534,50 @@ impl Mail {
         }
     }
 
+    /// Older mail was saved: `count` messages, and, if `done`, nothing older is left.
+    fn older_fetched(&mut self, account: String, mailbox: String, count: usize, done: bool) {
+        let key = (account, mailbox);
+        self.fetching_older.remove(&key);
+        if done {
+            self.no_older.insert(key);
+        }
+        // Make room for what came, as it's older than everything listed.
+        self.list_limit = self.list_limit.max(self.messages.len() + count);
+        self.reload();
+    }
+
+    /// The server moved a message asked for with [`Mail::move_message`], or refused to, which
+    /// lists it where it was again.
+    fn moved(
+        &mut self,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        to: &str,
+        result: Result<bool, String>,
+    ) {
+        self.moving
+            .remove(&(account.to_owned(), mailbox.to_owned(), uid));
+        let to = self.mailbox_label(account, to);
+        match result {
+            Ok(current) => {
+                // If the mailbox started over meanwhile, what a search found there under this
+                // UID is another message.
+                if current {
+                    self.search.forget_message(account, mailbox, uid);
+                }
+                self.notify(format!("Moved to {to}"));
+            }
+            Err(error) => {
+                let label = self.label(account).to_owned();
+                self.notify(format!(
+                    "{label}: couldn't move the message to {to}: {error}"
+                ));
+            }
+        }
+        self.reload();
+    }
+
     /// A message asked for with [`Mail::open_message`] was downloaded, or couldn't be.
     fn opened(
         &mut self,
@@ -522,10 +598,19 @@ impl Mail {
                 .and_then(|b| b.html.as_deref())
                 .map(postden_html::to_markdown)
                 .filter(|md| !md.trim().is_empty());
+            let downloaded = body.is_ok();
             reader.body = Some(body);
             // The server, not a click, brought it, which would land the text at once:
             // ask for its entrance anyway, so it fades in over the spinner.
             tx.animated();
+            let waiting = self
+                .pending_reply
+                .take_if(|(key, _)| key.0 == account && key.1 == mailbox && key.2 == uid);
+            // Failing to download, the reader says why, and a reply waits to be asked again. A
+            // message started meanwhile isn't replaced.
+            if let (Some((_, all)), true, false) = (waiting, downloaded, self.compose.open) {
+                self.reply(all);
+            }
         }
         // Read now, or, if the download failed, unread again as the store still says.
         self.reload();
@@ -658,6 +743,8 @@ impl Mail {
             .or_else(|| self.showing.account().map(str::to_owned))
             .or_else(|| self.accounts.first().map(|a| a.id.clone()));
         if let Some(account) = account {
+            // Writing this, a reply still waiting for its message to download no longer starts.
+            self.pending_reply = None;
             self.form.open = false;
             self.settings_open = false;
             let draft = Draft {
@@ -770,6 +857,7 @@ impl Mail {
 
     /// Opens a message in the main pane, downloading it and marking it read.
     pub(crate) fn open_message(&mut self, account: &str, mailbox: &str, uid: u32) {
+        self.pending_reply = None;
         let Some(message) = self
             .messages
             .iter_mut()
@@ -807,37 +895,125 @@ impl Mail {
 
     pub(crate) fn close_reader(&mut self) {
         self.reader = None;
+        self.pending_reply = None;
     }
 
     /// Flips the open message between read and unread.
     pub(crate) fn toggle_seen(&mut self) {
-        let (Ok(services), Some(reader)) = (&self.services, &mut self.reader) else {
+        let Some(reader) = &self.reader else { return };
+        let m = &reader.message;
+        let (account, mailbox, uid) = (m.account.clone(), m.mailbox.clone(), m.envelope.uid);
+        self.set_seen(&account, &mailbox, uid, !m.envelope.seen);
+    }
+
+    /// Marks a message read or unread. It's shown so right away; the store catches up once the
+    /// server agrees.
+    pub(crate) fn set_seen(&mut self, account: &str, mailbox: &str, uid: u32, seen: bool) {
+        let Ok(services) = &self.services else { return };
+        if let Err(e) = services
+            .mailroom
+            .set_seen(&services.store, account, mailbox, uid, seen)
+        {
+            self.notify(e.to_string());
             return;
-        };
-        let m = &mut reader.message;
-        let seen = !m.envelope.seen;
-        match services.mailroom.set_seen(
-            &services.store,
-            &m.account,
-            &m.mailbox,
-            m.envelope.uid,
-            seen,
-        ) {
-            Ok(()) => {
-                m.envelope.seen = seen;
-                let (account, mailbox, uid) =
-                    (m.account.clone(), m.mailbox.clone(), m.envelope.uid);
-                if let Some(listed) = self
-                    .messages
-                    .iter_mut()
-                    .find(|l| is_message(l, &account, &mailbox, uid))
-                {
-                    listed.envelope.seen = seen;
-                }
-                self.search.set_seen(&account, &mailbox, uid, seen);
-            }
-            Err(e) => self.notify(e.to_string()),
         }
+        if let Some(reader) = &mut self.reader
+            && reader.is(account, mailbox, uid)
+        {
+            reader.message.envelope.seen = seen;
+        }
+        if let Some(listed) = self
+            .messages
+            .iter_mut()
+            .find(|l| is_message(l, account, mailbox, uid))
+        {
+            listed.envelope.seen = seen;
+        }
+        self.search.set_seen(account, mailbox, uid, seen);
+    }
+
+    /// Opens the menu of a message in the list at `point`, where it was right-clicked.
+    pub(crate) fn open_message_menu(
+        &mut self,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        point: PointerPress,
+    ) {
+        self.message_menu = Some(MessageMenu {
+            message: (account.to_owned(), mailbox.to_owned(), uid),
+            point,
+            move_open: false,
+        });
+    }
+
+    pub(crate) fn close_message_menu(&mut self) {
+        self.message_menu = None;
+    }
+
+    /// Shows or hides the message menu's "Move to" submenu.
+    pub(crate) const fn toggle_move_menu(&mut self) {
+        if let Some(menu) = &mut self.message_menu {
+            menu.move_open = !menu.move_open;
+        }
+    }
+
+    /// Replies to a message, to its sender or everyone. It opens first, as the reply quotes it,
+    /// and the reply starts once it's downloaded.
+    pub(crate) fn reply_to(&mut self, account: &str, mailbox: &str, uid: u32, all: bool) {
+        let open = self.reader.as_ref().filter(|r| r.is(account, mailbox, uid));
+        match open.map(|r| &r.body) {
+            Some(Some(Ok(_))) => return self.reply(all),
+            // Still downloading: it replies once that's done.
+            Some(None) => {}
+            _ => self.open_message(account, mailbox, uid),
+        }
+        let downloading = self
+            .reader
+            .as_ref()
+            .is_some_and(|r| r.is(account, mailbox, uid) && r.body.is_none());
+        if downloading {
+            self.pending_reply = Some(((account.to_owned(), mailbox.to_owned(), uid), all));
+        }
+    }
+
+    /// Moves a message to another of its account's mailboxes. It leaves the list at once, and
+    /// comes back if the server refuses.
+    pub(crate) fn move_message(&mut self, account: &str, mailbox: &str, uid: u32, to: &str) {
+        let Ok(services) = &self.services else { return };
+        if let Err(e) = services
+            .mailroom
+            .move_message(&services.store, account, mailbox, uid, to)
+        {
+            let label = self.label(account).to_owned();
+            self.notify(format!("{label}: couldn't move the message: {e}"));
+            return;
+        }
+        self.moving
+            .insert((account.to_owned(), mailbox.to_owned(), uid));
+        if self
+            .reader
+            .as_ref()
+            .is_some_and(|r| r.is(account, mailbox, uid))
+        {
+            self.reader = None;
+        }
+        self.reload();
+    }
+
+    /// The account's mailbox with `role`, as last listed, if it has one.
+    pub(crate) fn mailbox_with_role(&self, account: &str, role: Role) -> Option<&Mailbox> {
+        self.mailboxes
+            .get(account)
+            .and_then(|list| list.iter().find(|m| m.role == role))
+    }
+
+    /// The name to show for one of the account's mailboxes.
+    fn mailbox_label(&self, account: &str, name: &str) -> String {
+        self.mailboxes
+            .get(account)
+            .and_then(|list| list.iter().find(|m| m.name == name))
+            .map_or_else(|| name.to_owned(), Mailbox::label)
     }
 
     /// Downloads the open message again, after a failure.

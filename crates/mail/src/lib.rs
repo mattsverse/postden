@@ -44,6 +44,10 @@ pub enum Error {
     UidValidityChanged(String),
     #[error("the message is no longer on the server")]
     MessageGone,
+    /// The server supports neither MOVE nor UIDPLUS, so a message can't be moved without risking
+    /// others.
+    #[error("the server can't move messages")]
+    CantMove,
     #[error("SMTP error: {0}")]
     Smtp(#[source] lettre::transport::smtp::Error),
     #[error("{0:?} isn't a valid email address")]

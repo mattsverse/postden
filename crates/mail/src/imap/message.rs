@@ -1,4 +1,4 @@
-//! Opening one message, and setting whether it's been read.
+//! Opening one message, setting whether it's been read, and moving it to another mailbox.
 //!
 //! Each call opens a connection of its own, so it never waits behind a watcher's IDLE.
 
@@ -70,6 +70,59 @@ pub async fn set_seen(
     let result = async {
         select(&mut session, mailbox, uid_validity).await?;
         store_seen(&mut session, uid, seen).await
+    }
+    .await;
+    let _ignored = session.logout().await;
+    result
+}
+
+/// Moves message `uid` from `mailbox` to the account's mailbox `to`. See [`open_message`] for
+/// `uid_validity`. A message no longer in `mailbox` is left alone, and that isn't an error.
+///
+/// Uses MOVE (RFC 6851), or else COPY, flags the original `\Deleted` and expunges just it
+/// (UIDPLUS, RFC 4315). A server with neither is refused: a plain EXPUNGE would also remove
+/// every other message flagged `\Deleted` in the mailbox.
+///
+/// # Errors
+///
+/// Returns an error when the connection fails, the mailbox changed, the server can't move
+/// messages, or it refused to.
+pub async fn move_message(
+    server: &Server,
+    credentials: &Credentials,
+    mailbox: &str,
+    uid_validity: u32,
+    uid: u32,
+    to: &str,
+) -> Result<()> {
+    let mut session = connect(server, credentials).await?;
+    let result = async {
+        let capabilities = with_timeout(session.capabilities()).await?;
+        select(&mut session, mailbox, uid_validity).await?;
+        let uid = uid.to_string();
+        if capabilities.has_str("MOVE") {
+            with_timeout(session.uid_mv(&uid, to)).await
+        } else if capabilities.has_str("UIDPLUS") {
+            with_timeout(session.uid_copy(&uid, to)).await?;
+            with_timeout(async {
+                session
+                    .uid_store(&uid, "+FLAGS.SILENT (\\Deleted)")
+                    .await?
+                    .try_for_each(|_fetch| async { Ok(()) })
+                    .await
+            })
+            .await?;
+            with_timeout(async {
+                session
+                    .uid_expunge(&uid)
+                    .await?
+                    .try_for_each(|_uid| async { Ok(()) })
+                    .await
+            })
+            .await
+        } else {
+            Err(Error::CantMove)
+        }
     }
     .await;
     let _ignored = session.logout().await;

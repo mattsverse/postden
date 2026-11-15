@@ -49,8 +49,8 @@ pub struct Envelope {
     pub seen: bool,
 }
 
-/// What a mailbox is for. Each account has one inbox and at most one Sent mailbox, though their
-/// names differ by server; every other mailbox is [`Role::Other`].
+/// What a mailbox is for. Each account has one inbox and at most one Sent, Archive and Trash
+/// mailbox, though their names differ by server; every other mailbox is [`Role::Other`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Role {
     /// Where mail arrives: `INBOX`.
@@ -58,7 +58,11 @@ pub enum Role {
     Inbox,
     /// Where sent mail is kept, such as `Sent` or `[Gmail]/Sent Mail`.
     Sent,
-    /// Any other mailbox: folders, archives, drafts, trash.
+    /// Where messages go when they're archived, such as `Archive` or Gmail's `[Gmail]/All Mail`.
+    Archive,
+    /// Where messages go when they're deleted, such as `Trash` or `Deleted Items`.
+    Trash,
+    /// Any other mailbox: folders, drafts, junk.
     Other,
 }
 
@@ -69,6 +73,8 @@ impl Role {
         match self {
             Self::Inbox => "inbox",
             Self::Sent => "sent",
+            Self::Archive => "archive",
+            Self::Trash => "trash",
             Self::Other => "other",
         }
     }
@@ -76,9 +82,15 @@ impl Role {
     /// The role named by [`Role::as_str`], if any.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
-        [Self::Inbox, Self::Sent, Self::Other]
-            .into_iter()
-            .find(|r| r.as_str() == name)
+        [
+            Self::Inbox,
+            Self::Sent,
+            Self::Archive,
+            Self::Trash,
+            Self::Other,
+        ]
+        .into_iter()
+        .find(|r| r.as_str() == name)
     }
 }
 

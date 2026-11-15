@@ -2,7 +2,7 @@
 //!
 //! Account passwords never land here; they live in a [`postden_core::secrets::SecretStore`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use postden_core::account::{Account, Auth, Security, Server, Signature};
@@ -142,6 +142,11 @@ const MESSAGE_COLUMNS: &str = "m.account, m.mailbox, m.uid, m.message_id, m.from
 #[derive(Debug)]
 pub struct Store {
     conn: Connection,
+    /// Messages [`Store::remove_message`] dropped, by account, mailbox and UID, which mail
+    /// fetched before they were dropped mustn't bring back. A UID isn't reused while its
+    /// mailbox's UIDVALIDITY holds, so they're kept until it changes. Fetches don't outlive the
+    /// app, so this isn't saved.
+    removed: HashSet<(String, String, u32)>,
 }
 
 impl Store {
@@ -182,7 +187,10 @@ impl Store {
             }
             conn.execute_batch(&format!("PRAGMA user_version = {VERSION}"))?;
         }
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            removed: HashSet::new(),
+        })
     }
 
     /// Adds `account`, or replaces the settings of the account with the same id.
@@ -513,6 +521,9 @@ impl Store {
                 "DELETE FROM messages WHERE account = ?1 AND mailbox = ?2",
                 [account, mailbox],
             )?;
+            // Its UIDs now name other messages.
+            self.removed
+                .retain(|(a, m, _)| !(a == account && m == mailbox));
         }
         tx.execute(
             "INSERT INTO mailboxes VALUES (?1, ?2, ?3, ?4)
@@ -520,7 +531,8 @@ impl Store {
                 uid_validity = excluded.uid_validity, role = excluded.role",
             params![account, mailbox, uid_validity, role.as_str()],
         )?;
-        insert_messages(&tx, account, mailbox, messages)?;
+        let kept = kept(&self.removed, account, mailbox, messages);
+        insert_messages(&tx, account, mailbox, &kept)?;
         tx.commit()?;
         Ok(())
     }
@@ -550,7 +562,8 @@ impl Store {
         if cached != Some(uid_validity) {
             return Ok(false);
         }
-        insert_messages(&tx, account, mailbox, messages)?;
+        let kept = kept(&self.removed, account, mailbox, messages);
+        insert_messages(&tx, account, mailbox, &kept)?;
         tx.commit()?;
         Ok(true)
     }
@@ -578,6 +591,22 @@ impl Store {
             "UPDATE messages SET seen = ?4 WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
             params![account, mailbox, uid, seen],
         )? > 0)
+    }
+
+    /// Drops a cached message, such as one moved to another mailbox. Returns whether it was cached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    /// Mail fetched before then and saved after doesn't bring it back.
+    pub fn remove_message(&mut self, account: &str, mailbox: &str, uid: u32) -> Result<bool> {
+        let removed = self.conn.execute(
+            "DELETE FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+            params![account, mailbox, uid],
+        )? > 0;
+        self.removed
+            .insert((account.to_owned(), mailbox.to_owned(), uid));
+        Ok(removed)
     }
 
     /// The `limit` most recent messages in every account's mailbox with this role, newest first.
@@ -812,6 +841,20 @@ fn account_from_row(row: &Row<'_>) -> Result<Account> {
 }
 
 /// Inserts `messages` into `mailbox`, updating any already there.
+/// `messages` from `mailbox`, without those [`Store::remove_message`] dropped.
+fn kept(
+    removed: &HashSet<(String, String, u32)>,
+    account: &str,
+    mailbox: &str,
+    messages: &[Envelope],
+) -> Vec<Envelope> {
+    messages
+        .iter()
+        .filter(|e| !removed.contains(&(account.to_owned(), mailbox.to_owned(), e.uid)))
+        .cloned()
+        .collect()
+}
+
 fn insert_messages(
     tx: &rusqlite::Transaction<'_>,
     account: &str,
@@ -976,6 +1019,70 @@ mod tests {
             .unwrap();
         store.save_signature("me@example.com", None).unwrap();
         assert_eq!(store.signature("me@example.com").unwrap(), None);
+    }
+
+    #[test]
+    fn a_moved_message_leaves_the_cache_and_the_unread_count() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account("me@example.com")).unwrap();
+        store
+            .save_messages(
+                "me@example.com",
+                "INBOX",
+                Role::Inbox,
+                1,
+                &[envelope(1, 10), envelope(2, 20)],
+            )
+            .unwrap();
+        assert!(store.remove_message("me@example.com", "INBOX", 2).unwrap());
+        assert!(
+            !store.remove_message("me@example.com", "INBOX", 2).unwrap(),
+            "already gone"
+        );
+        let left: Vec<u32> = store
+            .recent_messages(Role::Inbox, 10)
+            .unwrap()
+            .iter()
+            .map(|m| m.envelope.uid)
+            .collect();
+        assert_eq!(left, [1]);
+        assert_eq!(
+            store.unread_counts().unwrap().get("me@example.com"),
+            Some(&1)
+        );
+
+        // Fetched before it was moved, saved after: it stays gone.
+        store
+            .save_messages(
+                "me@example.com",
+                "INBOX",
+                Role::Inbox,
+                1,
+                &[envelope(2, 20)],
+            )
+            .unwrap();
+        store
+            .save_older_messages("me@example.com", "INBOX", 1, &[envelope(2, 20)])
+            .unwrap();
+        let cached = |store: &Store| store.recent_messages(Role::Inbox, 10).unwrap().len();
+        assert_eq!(cached(&store), 1);
+        // Started over, its UIDs name other messages, so UID 2 is a new one.
+        store
+            .save_messages(
+                "me@example.com",
+                "INBOX",
+                Role::Inbox,
+                2,
+                &[envelope(2, 20)],
+            )
+            .unwrap();
+        assert_eq!(cached(&store), 1);
+        assert_eq!(
+            store.recent_messages(Role::Inbox, 10).unwrap()[0]
+                .envelope
+                .uid,
+            2
+        );
     }
 
     #[test]
