@@ -11,6 +11,10 @@ tracked_paths = [
   "apps/**"
 ]
 
+excluded_branches = [
+    "release-please--branches--main"
+]
+
 # Skip pull requests whose head branch matches one of these glob patterns, such as
 # automated release branches. Exclusions take precedence over included_branches.
 # excluded_branches = ["release/**"]
