@@ -92,6 +92,14 @@ impl MailboxMenu {
     }
 }
 
+/// A body's HTML as Markdown, to show, if it has HTML with something in it.
+fn markdown(body: &Body) -> Option<String> {
+    body.html
+        .as_deref()
+        .map(postden_html::to_markdown)
+        .filter(|md| !md.trim().is_empty())
+}
+
 fn is_message(m: &StoredMessage, account: &str, mailbox: &str, uid: u32) -> bool {
     m.account == account && m.mailbox == mailbox && m.envelope.uid == uid
 }
@@ -356,7 +364,7 @@ impl Mail {
             ..WatchConfig::default()
         };
         let notify = handle.clone();
-        let mailroom = Mailroom::start(&database, config, move |update| {
+        let mailroom = Mailroom::start(&database, config, settings.prefetch, move |update| {
             notify.update(move |s: &mut Self, tx| s.apply(update, tx));
         })
         .map_err(|e| e.to_string())?;
@@ -649,12 +657,7 @@ impl Mail {
         if let Some(reader) = &mut self.reader
             && reader.is(account, mailbox, uid)
         {
-            reader.markdown = body
-                .as_ref()
-                .ok()
-                .and_then(|b| b.html.as_deref())
-                .map(postden_html::to_markdown)
-                .filter(|md| !md.trim().is_empty());
+            reader.markdown = body.as_ref().ok().and_then(markdown);
             let downloaded = body.is_ok();
             reader.body = Some(body);
             // The server, not a click, brought it, which would land the text at once:
@@ -912,8 +915,9 @@ impl Mail {
         self.compose = ComposeForm::default();
     }
 
-    /// Opens a message in the main pane, downloading it and marking it read. One the list doesn't
-    /// show, such as one a search leaves out, opens from the cache.
+    /// Opens a message in the main pane, downloading it unless it was downloaded ahead, and
+    /// marking it read. One the list doesn't show, such as one a search leaves out, opens from
+    /// the cache.
     pub(crate) fn open_message(&mut self, account: &str, mailbox: &str, uid: u32) {
         self.pending_reply = None;
         let listed = self
@@ -934,12 +938,17 @@ impl Mail {
             markdown: None,
         };
         if let Ok(services) = &self.services {
-            if let Err(e) = services
+            let opened = services
                 .mailroom
-                .open(&services.store, account, mailbox, uid)
-            {
+                .open(&services.store, account, mailbox, uid);
+            if let Err(e) = opened {
                 reader.body = Some(Err(e.to_string()));
             } else {
+                // Downloaded ahead, it shows at once; otherwise once it's downloaded.
+                if let Ok(Some(body)) = opened {
+                    reader.markdown = markdown(&body);
+                    reader.body = Some(Ok(body));
+                }
                 // Shown read right away; the store catches up once the server agrees.
                 reader.message.envelope.seen = true;
                 if let Some(listed) = self
@@ -1062,12 +1071,14 @@ impl Mail {
             Some(None) => {}
             _ => self.open_message(account, mailbox, uid),
         }
-        let downloading = self
-            .reader
-            .as_ref()
-            .is_some_and(|r| r.is(account, mailbox, uid) && r.body.is_none());
-        if downloading {
-            self.pending_reply = Some(((account.to_owned(), mailbox.to_owned(), uid), all));
+        let open = self.reader.as_ref().filter(|r| r.is(account, mailbox, uid));
+        match open.map(|r| &r.body) {
+            // Downloaded ahead, it opened at once.
+            Some(Some(Ok(_))) => self.reply(all),
+            Some(None) => {
+                self.pending_reply = Some(((account.to_owned(), mailbox.to_owned(), uid), all));
+            }
+            _ => {}
         }
     }
 
@@ -1664,6 +1675,20 @@ impl Mail {
             self.settings.theme = theme;
             self.save_settings();
         }
+    }
+
+    /// Downloads the newest `count` messages of each inbox ahead of their opening, or, with 0,
+    /// each message only once it's opened.
+    pub(crate) fn set_prefetch(&mut self, count: usize) {
+        let Ok(services) = &self.services else {
+            return;
+        };
+        if services.mailroom.prefetch() == count {
+            return;
+        }
+        services.mailroom.set_prefetch(count);
+        self.settings.prefetch = count;
+        self.save_settings();
     }
 
     /// Checks mail every `every` on servers that can't push it, reconnecting every account.

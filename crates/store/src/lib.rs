@@ -7,7 +7,7 @@ use std::path::Path;
 
 use postden_core::account::{Account, Auth, Security, Server, Signature};
 pub use postden_core::message::MailboxState;
-use postden_core::message::{Address, Envelope, InlineImage, Mailbox, Role};
+use postden_core::message::{Address, Body, Envelope, InlineImage, Mailbox, Role};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 /// Why a [`Store`] call failed.
@@ -86,6 +86,24 @@ CREATE TABLE IF NOT EXISTS messages (
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS messages_by_date ON messages(date DESC);
+
+-- Messages downloaded ahead of their opening. Address lists are encoded as in messages.to_list;
+-- references and attachment names are separated by U+001E.
+CREATE TABLE IF NOT EXISTS bodies (
+    account      TEXT NOT NULL,
+    mailbox      TEXT NOT NULL,
+    uid          INTEGER NOT NULL,
+    to_list      TEXT NOT NULL,
+    cc_list      TEXT NOT NULL,
+    reply_to     TEXT NOT NULL,
+    refs         TEXT NOT NULL,
+    text         TEXT NOT NULL,
+    html         TEXT,
+    attachments  TEXT NOT NULL,
+    PRIMARY KEY (account, mailbox, uid),
+    FOREIGN KEY (account, mailbox, uid) REFERENCES messages(account, mailbox, uid)
+        ON DELETE CASCADE
+) STRICT;
 
 -- Every mailbox the server last listed for an account, synced or not.
 CREATE TABLE IF NOT EXISTS listed_mailboxes (
@@ -623,6 +641,109 @@ impl Store {
         Ok(removed)
     }
 
+    /// Caches a message's downloaded body. Returns whether it was cached: not when the message
+    /// itself isn't, such as one moved away meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub fn save_body(&self, account: &str, mailbox: &str, uid: u32, body: &Body) -> Result<bool> {
+        Ok(self.conn.execute(
+            "INSERT INTO bodies
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+             WHERE EXISTS (SELECT 1 FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3)
+             ON CONFLICT(account, mailbox, uid) DO UPDATE SET
+                to_list = excluded.to_list, cc_list = excluded.cc_list,
+                reply_to = excluded.reply_to, refs = excluded.refs, text = excluded.text,
+                html = excluded.html, attachments = excluded.attachments",
+            params![
+                account,
+                mailbox,
+                uid,
+                encode_addresses(&body.to),
+                encode_addresses(&body.cc),
+                encode_addresses(&body.reply_to),
+                body.references.join("\u{1e}"),
+                body.text,
+                body.html,
+                body.attachments.join("\u{1e}"),
+            ],
+        )? > 0)
+    }
+
+    /// A message's cached body, or `None` when it wasn't downloaded ahead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn body(&self, account: &str, mailbox: &str, uid: u32) -> Result<Option<Body>> {
+        let list = |column: String| -> Vec<String> {
+            column
+                .split('\u{1e}')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT to_list, cc_list, reply_to, refs, text, html, attachments FROM bodies
+                 WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+                params![account, mailbox, uid],
+                |row| {
+                    Ok(Body {
+                        to: decode_addresses(&row.get::<_, String>(0)?),
+                        cc: decode_addresses(&row.get::<_, String>(1)?),
+                        reply_to: decode_addresses(&row.get::<_, String>(2)?),
+                        references: list(row.get(3)?),
+                        text: row.get(4)?,
+                        html: row.get(5)?,
+                        attachments: list(row.get(6)?),
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// The UIDs among the `newest` most recent messages in `mailbox` whose bodies aren't cached,
+    /// newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn missing_bodies(&self, account: &str, mailbox: &str, newest: usize) -> Result<Vec<u32>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.uid FROM (
+                SELECT uid, date FROM messages WHERE account = ?1 AND mailbox = ?2
+                ORDER BY date IS NULL, date DESC, uid DESC LIMIT ?3
+             ) m
+             WHERE NOT EXISTS (
+                SELECT 1 FROM bodies b WHERE b.account = ?1 AND b.mailbox = ?2 AND b.uid = m.uid
+             )
+             ORDER BY m.date IS NULL, m.date DESC, m.uid DESC",
+        )?;
+        let newest = i64::try_from(newest).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![account, mailbox, newest], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Drops the cached bodies in `mailbox` but those of its `newest` most recent messages.
+    /// Returns how many were dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub fn trim_bodies(&self, account: &str, mailbox: &str, newest: usize) -> Result<usize> {
+        let newest = i64::try_from(newest).unwrap_or(i64::MAX);
+        Ok(self.conn.execute(
+            "DELETE FROM bodies WHERE account = ?1 AND mailbox = ?2 AND uid NOT IN (
+                SELECT uid FROM messages WHERE account = ?1 AND mailbox = ?2
+                ORDER BY date IS NULL, date DESC, uid DESC LIMIT ?3
+             )",
+            params![account, mailbox, newest],
+        )?)
+    }
+
     /// The `limit` most recent messages in every account's mailbox with this role, newest first.
     ///
     /// # Errors
@@ -1075,6 +1196,68 @@ mod tests {
             .unwrap();
         store.save_signature("me@example.com", None).unwrap();
         assert_eq!(store.signature("me@example.com").unwrap(), None);
+    }
+
+    #[test]
+    fn bodies_downloaded_ahead_round_trip_and_go_with_their_message() {
+        let mut store = Store::open_in_memory().unwrap();
+        let me = "me@example.com";
+        store.save_account(&account(me)).unwrap();
+        store
+            .save_messages(me, "INBOX", Role::Inbox, 1, &[envelope(1, 10)])
+            .unwrap();
+        let body = Body {
+            to: vec![Address {
+                name: Some("Me".into()),
+                email: Some("me@example.com".into()),
+            }],
+            cc: Vec::new(),
+            reply_to: vec![Address {
+                name: None,
+                email: Some("list@example.com".into()),
+            }],
+            references: vec!["a@example.com".into(), "b@example.com".into()],
+            text: "Hello".into(),
+            html: Some("<p>Hello</p>".into()),
+            attachments: vec!["report.pdf".into()],
+        };
+        assert_eq!(store.body(me, "INBOX", 1).unwrap(), None);
+        assert!(store.save_body(me, "INBOX", 1, &body).unwrap());
+        assert_eq!(store.body(me, "INBOX", 1).unwrap(), Some(body.clone()));
+        assert!(
+            !store.save_body(me, "INBOX", 2, &body).unwrap(),
+            "not cached, so its body isn't either"
+        );
+        // Updated in place, the message keeps its body.
+        store
+            .save_messages(me, "INBOX", Role::Inbox, 1, &[envelope(1, 10)])
+            .unwrap();
+        assert!(store.body(me, "INBOX", 1).unwrap().is_some());
+        store.remove_message(me, "INBOX", 1).unwrap();
+        assert_eq!(store.body(me, "INBOX", 1).unwrap(), None);
+    }
+
+    #[test]
+    fn only_the_newest_bodies_are_missing_or_kept() {
+        let mut store = Store::open_in_memory().unwrap();
+        let me = "me@example.com";
+        store.save_account(&account(me)).unwrap();
+        let messages: Vec<_> = (1..=4).map(|uid| envelope(uid, i64::from(uid))).collect();
+        store
+            .save_messages(me, "INBOX", Role::Inbox, 1, &messages)
+            .unwrap();
+        assert_eq!(store.missing_bodies(me, "INBOX", 2).unwrap(), [4, 3]);
+        for uid in [1, 3] {
+            store.save_body(me, "INBOX", uid, &Body::default()).unwrap();
+        }
+        assert_eq!(store.missing_bodies(me, "INBOX", 3).unwrap(), [4, 2]);
+        assert_eq!(store.trim_bodies(me, "INBOX", 3).unwrap(), 1, "UID 1");
+        assert!(store.body(me, "INBOX", 3).unwrap().is_some());
+        assert_eq!(store.trim_bodies(me, "INBOX", 0).unwrap(), 1);
+        assert_eq!(
+            store.missing_bodies(me, "INBOX", 0).unwrap(),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]

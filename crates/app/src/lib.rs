@@ -5,7 +5,8 @@
 //! - [`start_google_sign_in`] and [`finish_google_sign_in`]: adding a Gmail account by signing in
 //!   with Google.
 //! - [`check_logins`]: checking a new account's IMAP and SMTP logins.
-//! - [`Mailroom`]: watching every account's inbox and saving what arrives, and sending mail.
+//! - [`Mailroom`]: watching every account's inbox and saving what arrives, downloading its newest
+//!   messages ahead when asked to, and sending mail.
 //! - [`Draft`]: a message being written, blank or as a reply.
 //! - [`signature`]: what each account adds below the mail it sends, images included.
 //! - [`Settings`]: the app's preferences, such as its [`Theme`] and whether to check for updates.
@@ -31,7 +32,7 @@ use jiff::{Timestamp, Zoned};
 pub use mailroom::{Mailroom, Update};
 use postden_core::message::Envelope;
 use postden_secrets::Backend;
-pub use settings::{POLL_INTERVALS, Settings, Theme};
+pub use settings::{POLL_INTERVALS, PREFETCH_COUNTS, Settings, Theme};
 
 /// Why a Postden operation failed, phrased for the user.
 #[derive(Debug, thiserror::Error)]
