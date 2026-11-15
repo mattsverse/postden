@@ -20,12 +20,14 @@ postden-update.workspace = true
 rune = { workspace = true, features = ["native-file-dialog"] }
 # `markdown` draws HTML mail, converted to Markdown.
 rune-kit = { workspace = true, features = ["markdown"] }
+rune-notify.workspace = true
 jiff.workspace = true
 png.workspace = true
 tokio.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus.workspace = true
+futures.workspace = true
 
 [lints]
 workspace = true

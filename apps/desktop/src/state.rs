@@ -13,7 +13,7 @@ use postden_app::{
     smtp_password_key, start_google_sign_in,
 };
 use postden_core::account::{Account, Signature};
-use postden_core::message::{Body, Mailbox, Role};
+use postden_core::message::{Body, Envelope, Mailbox, Role};
 use postden_core::secrets::{SecretStore, SecretString};
 use postden_mail::imap::{Status, WatchConfig};
 use postden_secrets::Backend;
@@ -26,6 +26,7 @@ use rune_kit::shell::PaneState;
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
 use crate::compose::{ComposeForm, Mode};
 use crate::form::{AccountForm, GoogleSignIn, Step};
+use crate::notifications::{self, Alert, Target};
 use crate::search::{self, MailboxKey, MessageKey, SERVER_PAGE, Search};
 use crate::update::{self, Phase, Updater};
 
@@ -167,6 +168,9 @@ pub(crate) struct Mail {
     window: Option<WindowHandle>,
     /// The unread count the app's icon shows, `None` until it's shown on the current window.
     badge: Option<usize>,
+    /// The window has the keyboard focus: the user is looking at the mail, so new mail isn't
+    /// announced with a system notification.
+    focused: bool,
     /// The services, or why they couldn't start.
     pub(crate) services: Result<Services, String>,
     pub(crate) accounts: Vec<Account>,
@@ -239,6 +243,7 @@ impl Mail {
             tray: None,
             window: None,
             badge: None,
+            focused: false,
             services: Err(error),
             accounts: Vec::new(),
             statuses: HashMap::new(),
@@ -456,19 +461,20 @@ impl Mail {
             }
             Update::Mail {
                 account,
+                mailbox,
                 role: Role::Inbox,
                 count,
                 first_sync,
-                ..
+                uid_validity,
+                unread,
             } => {
-                let label = self.label(&account).to_owned();
-                self.notify(postden_app::mail_notice(
-                    &label,
-                    count,
-                    first_sync,
-                    &Zoned::now(),
-                ));
-                self.reload();
+                let target = Target {
+                    account,
+                    mailbox,
+                    uid_validity,
+                    uid: None,
+                };
+                self.inbox_mail(target, count, first_sync, &unread);
             }
             Update::CopyFailed { account, error } => {
                 let label = self.label(&account).to_owned();
@@ -906,19 +912,24 @@ impl Mail {
         self.compose = ComposeForm::default();
     }
 
-    /// Opens a message in the main pane, downloading it and marking it read.
+    /// Opens a message in the main pane, downloading it and marking it read. One the list doesn't
+    /// show, such as one a search leaves out, opens from the cache.
     pub(crate) fn open_message(&mut self, account: &str, mailbox: &str, uid: u32) {
         self.pending_reply = None;
-        let Some(message) = self
+        let listed = self
             .messages
-            .iter_mut()
+            .iter()
             .find(|m| is_message(m, account, mailbox, uid))
-        else {
+            .cloned();
+        let cached = || {
+            let services = self.services.as_ref().ok()?;
+            services.store.message(account, mailbox, uid).ok().flatten()
+        };
+        let Some(message) = listed.or_else(cached) else {
             return;
         };
-        let listed = message.clone();
         let mut reader = Reader {
-            message: listed,
+            message,
             body: None,
             markdown: None,
         };
@@ -930,7 +941,14 @@ impl Mail {
                 reader.body = Some(Err(e.to_string()));
             } else {
                 // Shown read right away; the store catches up once the server agrees.
-                message.envelope.seen = true;
+                reader.message.envelope.seen = true;
+                if let Some(listed) = self
+                    .messages
+                    .iter_mut()
+                    .find(|m| is_message(m, account, mailbox, uid))
+                {
+                    listed.envelope.seen = true;
+                }
                 self.search.set_seen(account, mailbox, uid, true);
             }
         }
@@ -1114,6 +1132,75 @@ impl Mail {
                 .get(account)
                 .and_then(|list| list.iter().find(|m| m.name == *name))
                 .is_some_and(|m| m.role == Role::Sent),
+        }
+    }
+
+    /// Mail was saved in an inbox, `count` messages of which `unread` are new and unread: the
+    /// notice says so, the list shows it, and a system notification announces it.
+    fn inbox_mail(&mut self, target: Target, count: usize, first_sync: bool, unread: &[Envelope]) {
+        let label = self.label(&target.account).to_owned();
+        self.notify(postden_app::mail_notice(
+            &label,
+            count,
+            first_sync,
+            &Zoned::now(),
+        ));
+        self.reload();
+        self.announce(&label, target, unread);
+    }
+
+    /// Tells the user about mail that arrived unread in an inbox with a system notification,
+    /// unless they're looking at the window or turned notifications off.
+    fn announce(&self, label: &str, mut target: Target, unread: &[Envelope]) {
+        let Ok(services) = &self.services else { return };
+        let looking = self.focused && self.handle.as_ref().is_some_and(AppHandle::is_visible);
+        if !self.settings.notify_new_mail || looking {
+            return;
+        }
+        let Some((title, body)) = postden_app::new_mail_alert(label, unread) else {
+            return;
+        };
+        target.uid = match unread {
+            [only] => Some(only.uid),
+            _ => None,
+        };
+        let alert = Alert {
+            title,
+            body,
+            target,
+        };
+        notifications::post(&alert, &services.mailroom.handle());
+    }
+
+    /// The window gained or lost the keyboard focus.
+    pub(crate) const fn focus_changed(&mut self, focused: bool, _: &mut Tx) {
+        self.focused = focused;
+    }
+
+    /// A notification about new mail was clicked: the window comes back with the message open,
+    /// or with the account's inbox listed for several, or once the mailbox started over (its
+    /// UIDs may name other messages then). A search is ended, as it would hide the new mail. A message being written stays in front, as it does for everything else, and the
+    /// new mail waits unread in the list.
+    pub(crate) fn notification_clicked(&mut self, target: &Target) {
+        self.bring_forward();
+        #[cfg(target_os = "macos")]
+        rune_notify::bring_to_front();
+        if self.compose.open {
+            return;
+        }
+        self.clear_search();
+        let showing = if self.showing == ALL_INBOXES {
+            ALL_INBOXES.clone()
+        } else {
+            Showing::inbox(&target.account)
+        };
+        self.show(showing);
+        let uid_validity = self.services.as_ref().ok().and_then(|s| {
+            let state = s.store.mailbox_state(&target.account, &target.mailbox);
+            state.ok().flatten().map(|state| state.uid_validity)
+        });
+        if let Some(uid) = target.message(uid_validity) {
+            self.open_message(&target.account, &target.mailbox, uid);
         }
     }
 
@@ -1659,6 +1746,15 @@ impl Mail {
             handle.open();
             true
         })
+    }
+
+    /// Announces new mail with system notifications, or stops.
+    pub(crate) fn set_notify_new_mail(&mut self, on: bool) {
+        if self.settings.notify_new_mail == on {
+            return;
+        }
+        self.settings.notify_new_mail = on;
+        self.save_settings();
     }
 
     /// Keeps the app running once its window closes, or has closing it quit.

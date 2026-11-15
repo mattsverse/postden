@@ -38,6 +38,12 @@ pub enum Update {
         role: Role,
         count: usize,
         first_sync: bool,
+        /// The mailbox's UIDVALIDITY the messages were saved under: their UIDs name them only
+        /// while it holds.
+        uid_validity: u32,
+        /// The new messages that arrived unread, oldest first, to tell the user about. Empty on a
+        /// first sync.
+        unread: Vec<Envelope>,
     },
     /// Mail older than what was cached, asked for with [`Mailroom::fetch_older`], was saved.
     /// `done` says the mailbox has nothing older left on the server.
@@ -883,6 +889,12 @@ fn save_messages(
             role,
             count: messages.len(),
             first_sync,
+            uid_validity,
+            unread: if first_sync {
+                Vec::new()
+            } else {
+                messages.iter().filter(|m| !m.seen).cloned().collect()
+            },
         }),
         Err(e) => Some(Update::SaveFailed {
             account,
@@ -947,8 +959,9 @@ mod tests {
                 Update::Mail {
                     count: 2,
                     first_sync: true,
+                    ref unread,
                     ..
-                }
+                } if unread.is_empty()
             ),
             "got {first:?}"
         );
@@ -959,12 +972,34 @@ mod tests {
                 Update::Mail {
                     count: 1,
                     first_sync: false,
+                    ref unread,
                     ..
-                }
+                } if unread.iter().map(|m| m.uid).eq([3])
             ),
             "got {next:?}"
         );
         assert_eq!(store.recent_messages(Role::Inbox, 10).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn new_mail_already_read_is_not_unread() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        save(&mut store, messages(1, &[1]));
+        let mut job = messages(1, &[2, 3]);
+        if let Job::Watched(Event::Messages { messages, .. }) = &mut job
+            && let Some(read) = messages.first_mut()
+        {
+            read.seen = true;
+        }
+        let update = save(&mut store, job).remove(0);
+        assert!(
+            matches!(
+                update,
+                Update::Mail { count: 2, ref unread, .. } if unread.iter().map(|m| m.uid).eq([3])
+            ),
+            "got {update:?}"
+        );
     }
 
     #[test]

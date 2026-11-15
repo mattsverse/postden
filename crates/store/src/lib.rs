@@ -661,6 +661,25 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// One cached message, or `None` when it isn't cached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn message(&self, account: &str, mailbox: &str, uid: u32) -> Result<Option<StoredMessage>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {MESSAGE_COLUMNS} FROM messages m
+                     WHERE m.account = ?1 AND m.mailbox = ?2 AND m.uid = ?3"
+                ),
+                params![account, mailbox, uid],
+                message_from_row,
+            )
+            .optional()?)
+    }
+
     /// Whether a cached message is read, or `None` when it isn't cached.
     ///
     /// # Errors
@@ -974,6 +993,29 @@ mod tests {
         assert!(
             !store.set_names("nobody@example.com", None, None).unwrap(),
             "no such account"
+        );
+    }
+
+    #[test]
+    fn one_message_is_read_by_its_uid() {
+        let mut store = Store::open_in_memory().unwrap();
+        let a = account("me@example.com");
+        store.save_account(&a).unwrap();
+        store
+            .save_messages(
+                &a.id,
+                "INBOX",
+                Role::Inbox,
+                1,
+                &[envelope(1, 10), envelope(2, 20)],
+            )
+            .unwrap();
+        let found = store.message(&a.id, "INBOX", 1).unwrap().unwrap();
+        assert_eq!(found.envelope, envelope(1, 10));
+        assert_eq!(
+            store.message(&a.id, "INBOX", 3).unwrap(),
+            None,
+            "not cached"
         );
     }
 
