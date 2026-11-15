@@ -15,7 +15,7 @@ mod sent;
 mod watch;
 
 pub use connection::{Session, check_login, connect};
-pub use message::{move_message, open_message, set_seen};
+pub use message::{mark_all_seen, move_message, open_message, set_seen};
 pub use older::{Older, fetch_older};
 pub use refresh::refresh;
 pub use search::{Found, search};

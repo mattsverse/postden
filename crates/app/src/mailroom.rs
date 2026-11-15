@@ -11,8 +11,8 @@ use postden_core::account::{Account, Server};
 use postden_core::message::{Body, Envelope, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
-    Event, Found, Older, Status, WatchConfig, fetch_older, move_message, open_message, refresh,
-    save_sent_copy, search, set_seen, watch,
+    Event, Found, Older, Status, WatchConfig, fetch_older, mark_all_seen, move_message,
+    open_message, refresh, save_sent_copy, search, set_seen, watch,
 };
 use postden_mail::{Credentials, smtp};
 use postden_store::Store;
@@ -88,6 +88,15 @@ pub enum Update {
         uid: u32,
         error: String,
     },
+    /// Every message in a mailbox was marked read, as asked with [`Mailroom::mark_all_seen`], on
+    /// the server and in the store; or it wasn't, and the store still says what it did before.
+    /// Marked, it's the UID every message below was marked under, the mailbox's UIDNEXT then; or
+    /// `None` if the mailbox started over meanwhile, as its UIDs name other messages now.
+    AllSeen {
+        account: String,
+        mailbox: String,
+        result: Result<Option<u32>, String>,
+    },
     /// A message asked for with [`Mailroom::move_message`] was moved to the account's mailbox `to`
     /// and dropped from the store, to be cached in `to` once that mailbox syncs; or it wasn't, and
     /// the store still holds it where it was. Moved, it says whether `uid` still named it when
@@ -110,6 +119,35 @@ pub enum Update {
     CopyFailed { account: String, error: String },
 }
 
+/// Marks a mailbox read in the store once the server did, up to the UIDNEXT it was marked under.
+fn all_seen(
+    store: &Store,
+    account: String,
+    mailbox: String,
+    uid_validity: u32,
+    result: Result<u32, String>,
+) -> Update {
+    let result = result.and_then(|up_to| {
+        // Started over meanwhile, the cached UIDs name other messages than were marked.
+        let current = store
+            .mailbox_state(&account, &mailbox)
+            .map_err(|e| e.to_string())?
+            .is_some_and(|state| state.uid_validity == uid_validity);
+        if !current {
+            return Ok(None);
+        }
+        store
+            .set_all_seen(&account, &mailbox, up_to)
+            .map_err(|e| e.to_string())?;
+        Ok(Some(up_to))
+    });
+    Update::AllSeen {
+        account,
+        mailbox,
+        result,
+    }
+}
+
 /// Work for the store thread: what watchers report, and results of work done for the UI.
 #[derive(Debug)]
 enum Job {
@@ -126,6 +164,13 @@ enum Job {
         uid: u32,
         seen: bool,
         result: Result<(), String>,
+    },
+    AllSeen {
+        account: String,
+        mailbox: String,
+        uid_validity: u32,
+        /// The mailbox's UIDNEXT when it was marked: every message below it is read.
+        result: Result<u32, String>,
     },
     Moved(Moving, Result<(), String>),
     Sent {
@@ -385,6 +430,30 @@ impl Mailroom {
                 mailbox,
                 uid,
                 seen,
+                result,
+            });
+        });
+        Ok(())
+    }
+
+    /// Marks every message in a mailbox read in the background, including those not cached. The
+    /// result arrives as [`Update::AllSeen`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Mailroom::open`].
+    pub fn mark_all_seen(&self, store: &Store, account: &str, mailbox: &str) -> Result<()> {
+        let (server, credentials, uid_validity) = self.target(store, account, mailbox)?;
+        let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
+        let jobs = self.jobs.clone();
+        self.handle.spawn(async move {
+            let result = mark_all_seen(&server, &credentials, &mailbox, uid_validity)
+                .await
+                .map_err(|e| e.to_string());
+            let _ignored = jobs.send(Job::AllSeen {
+                account,
+                mailbox,
+                uid_validity,
                 result,
             });
         });
@@ -663,6 +732,12 @@ fn save(store: &mut Store, job: Job) -> Vec<Update> {
                 },
             }]
         }
+        Job::AllSeen {
+            account,
+            mailbox,
+            uid_validity,
+            result,
+        } => vec![all_seen(store, account, mailbox, uid_validity, result)],
         Job::Moved(moving, result) => vec![moved(store, moving, result)],
         Job::Sent { account, result } => vec![Update::Sent { account, result }],
         Job::CopyFailed { account, error } => vec![Update::CopyFailed { account, error }],
@@ -1047,6 +1122,46 @@ mod tests {
             [Update::Seen { seen: false, .. }]
         ));
         assert!(!seen(&store));
+    }
+
+    #[test]
+    fn a_mailbox_marked_read_is_read_in_the_store_only_under_its_uid_validity() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        save(&mut store, messages(1, &[1, 2]));
+        let job = |uid_validity, result| Job::AllSeen {
+            account: "me@example.com".into(),
+            mailbox: "INBOX".into(),
+            uid_validity,
+            result,
+        };
+        let seen = |store: &Store, uid| store.seen("me@example.com", "INBOX", uid).unwrap();
+
+        let failed = save(&mut store, job(1, Err("offline".into())));
+        assert!(matches!(
+            failed.as_slice(),
+            [Update::AllSeen { result: Err(_), .. }]
+        ));
+        assert_eq!(seen(&store, 1), Some(false));
+        let stale = save(&mut store, job(2, Ok(3)));
+        assert!(matches!(
+            stale.as_slice(),
+            [Update::AllSeen {
+                result: Ok(None),
+                ..
+            }]
+        ));
+        assert_eq!(seen(&store, 1), Some(false), "another UIDVALIDITY's UIDs");
+        let done = save(&mut store, job(1, Ok(2)));
+        assert!(matches!(
+            done.as_slice(),
+            [Update::AllSeen {
+                result: Ok(Some(2)),
+                ..
+            }]
+        ));
+        assert_eq!(seen(&store, 1), Some(true));
+        assert_eq!(seen(&store, 2), Some(false), "came after it was marked");
     }
 
     #[test]

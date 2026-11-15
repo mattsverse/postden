@@ -24,7 +24,7 @@ use crate::compose::{ComposeForm, Mode, Preview};
 use crate::form::{AccountForm, SECURITY, Step, security_index};
 use crate::rich::RichEditor;
 use crate::search::{SERVER_PAGE, ServerSearch};
-use crate::state::{INBOX as INBOX_NAME, Mail, MessageMenu, Reader, Showing};
+use crate::state::{INBOX as INBOX_NAME, Mail, MailboxMenu, MessageMenu, Reader, Showing};
 use crate::update::{self, Phase};
 
 static INBOX: Icon = Icon {
@@ -143,7 +143,11 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
     let toolbar = toolbar.trailing(trailing);
     update_dialog(s, &k, &mut layer);
     let window = SplitView::new(main)
-        .sidebar(&s.sidebar, |s: &mut Mail| &mut s.sidebar, sidebar(s, &k))
+        .sidebar(
+            &s.sidebar,
+            |s: &mut Mail| &mut s.sidebar,
+            sidebar(s, &k, &mut layer),
+        )
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())
         .frame_inset(8.0)
@@ -284,7 +288,7 @@ fn unavailable(error: &str, k: &Kit) -> El {
         )
 }
 
-fn sidebar(s: &Mail, k: &Kit) -> El {
+fn sidebar(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     let badge = |n: usize| (n > 0).then(|| n.to_string());
     let showing = |role| !s.form.open && !s.settings_open && s.showing == Showing::All(role);
     let mut all = SidebarRow::new("All inboxes")
@@ -338,32 +342,69 @@ fn sidebar(s: &Mail, k: &Kit) -> El {
         sidebar = sidebar.child(account_row(s, account, k));
         if !s.collapsed.contains(&account.id) {
             let listed = s.mailboxes.get(&account.id).map_or(&[][..], Vec::as_slice);
-            for mailbox in listed.iter().filter(|m| m.role != Role::Inbox) {
-                sidebar = sidebar.child(mailbox_row(s, &account.id, mailbox, k));
+            // The inbox first, so it stands out from the rest.
+            let (inbox, rest): (Vec<_>, Vec<_>) =
+                listed.iter().partition(|m| m.role == Role::Inbox);
+            for mailbox in inbox.into_iter().chain(rest) {
+                sidebar = sidebar.child(mailbox_row(s, &account.id, mailbox, k, layer));
             }
         }
     }
     sidebar.build(k)
 }
 
-/// One of an account's mailboxes other than its inbox, under the account.
-fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit) -> El {
+/// One of an account's mailboxes, under the account. Right-clicking it opens its menu.
+fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut Vec<El>) -> El {
     let showing = Showing::Mailbox {
         account: account.to_owned(),
         name: mailbox.name.clone(),
     };
     let selected = !s.form.open && !s.settings_open && s.showing == showing;
-    SidebarRow::new(mailbox.label())
-        .icon(if mailbox.role == Role::Sent {
-            &SENT
-        } else {
-            &FOLDER
+    let mut r = SidebarRow::new(mailbox.label())
+        .icon(match mailbox.role {
+            Role::Inbox => &INBOX,
+            Role::Sent => &SENT,
+            _ => &FOLDER,
         })
         .depth(1)
         .selected(selected)
-        .on_select(move |s: &mut Mail, _| s.show(showing.clone()))
+        .on_select(move |s: &mut Mail, _| s.show(showing.clone()));
+    let unread = s.unread(Some(account));
+    if mailbox.role == Role::Inbox && unread > 0 {
+        r = r.badge(unread.to_string());
+    }
+    let (menu_account, menu_mailbox) = (account.to_owned(), mailbox.name.clone());
+    let r = r
         .build(k)
         .key(format!("mailbox-{account}-{}", mailbox.name))
+        .on_secondary_press(move |s: &mut Mail, point, _| {
+            s.open_mailbox_menu(&menu_account, &menu_mailbox, point);
+        });
+    match &s.mailbox_menu {
+        Some(menu) if menu.is(account, &mailbox.name) => mailbox_menu(menu, r, k, layer),
+        _ => r,
+    }
+}
+
+/// A mailbox's menu, open at where it was right-clicked.
+fn mailbox_menu(menu: &MailboxMenu, row: El, k: &Kit, layer: &mut Vec<El>) -> El {
+    let (account, mailbox) = &menu.mailbox;
+    let (a, b) = (account.clone(), mailbox.clone());
+    context_menu(
+        format!("mailbox-menu-{account}-{mailbox}"),
+        row,
+        Some(menu.point),
+    )
+    .min_width(200.0)
+    .on_close(Mail::close_mailbox_menu)
+    .item(
+        MenuItem::new("Mark all as read").on_select(move |s: &mut Mail| {
+            s.close_mailbox_menu();
+            s.mark_all_seen(&a, &b);
+        }),
+    )
+    .build(k, layer)
+    .w_full()
 }
 
 fn account_row(s: &Mail, account: &Account, k: &Kit) -> El {
@@ -391,6 +432,7 @@ fn account_row(s: &Mail, account: &Account, k: &Kit) -> El {
     let remove = account.id.clone();
     let toggle = account.id.clone();
     let expanded = !s.collapsed.contains(&account.id);
+    let inbox_listed = expanded && s.mailbox_with_role(&account.id, Role::Inbox).is_some();
     let disclosure = IconButton::new(if expanded {
         &glyphs::TRIANGLE_DOWN
     } else {
@@ -409,9 +451,15 @@ fn account_row(s: &Mail, account: &Account, k: &Kit) -> El {
         .height(45.0)
         .avatar(avatar(account.label(), k))
         .subtitle(subtitle)
-        .selected(!s.form.open && !s.settings_open && s.showing.is(&account.id, INBOX_NAME))
+        // Its mailboxes listed, the inbox's own row shows it's selected.
+        .selected(
+            !inbox_listed
+                && !s.form.open
+                && !s.settings_open
+                && s.showing.is(&account.id, INBOX_NAME),
+        )
         .trailing(disclosure)
-        // The account itself stands for its inbox; its other mailboxes are the rows below.
+        // The account itself stands for its inbox; its mailboxes, the inbox first, are the rows below.
         .on_select(move |s: &mut Mail, _| s.show(Showing::inbox(&select)))
         .on_close(move |s: &mut Mail, _| s.remove(&remove));
     if confirming {

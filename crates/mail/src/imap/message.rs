@@ -76,6 +76,51 @@ pub async fn set_seen(
     result
 }
 
+/// Marks every message in `mailbox` read. See [`open_message`] for `uid_validity`.
+///
+/// Returns the mailbox's UIDNEXT when it was selected: what was marked is every message with a
+/// UID below it, so mail arriving meanwhile stays unread.
+///
+/// # Errors
+///
+/// Returns an error when the connection fails or the mailbox changed.
+pub async fn mark_all_seen(
+    server: &Server,
+    credentials: &Credentials,
+    mailbox: &str,
+    uid_validity: u32,
+) -> Result<u32> {
+    let mut session = connect(server, credentials).await?;
+    let result = async {
+        let selected = with_timeout(session.select(mailbox)).await?;
+        if selected.uid_validity != Some(uid_validity) {
+            return Err(Error::UidValidityChanged(mailbox.to_owned()));
+        }
+        // Without UIDNEXT, which every IMAP4rev1 server sends, mark everything there is.
+        let up_to = selected.uid_next.unwrap_or(u32::MAX);
+        if selected.exists == 0 || up_to <= 1 {
+            return Ok(up_to);
+        }
+        let range = if up_to == u32::MAX {
+            "1:*".to_owned()
+        } else {
+            format!("1:{}", up_to - 1)
+        };
+        with_timeout(async {
+            session
+                .uid_store(range, "+FLAGS.SILENT (\\Seen)")
+                .await?
+                .try_for_each(|_fetch| async { Ok(()) })
+                .await
+        })
+        .await?;
+        Ok(up_to)
+    }
+    .await;
+    let _ignored = session.logout().await;
+    result
+}
+
 /// Moves message `uid` from `mailbox` to the account's mailbox `to`. See [`open_message`] for
 /// `uid_validity`. A message no longer in `mailbox` is left alone, and that isn't an error.
 ///

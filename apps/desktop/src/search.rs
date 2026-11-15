@@ -63,6 +63,9 @@ pub(crate) struct Search {
     /// Messages moved out of their mailbox while a search was still out, which may bring them
     /// back as they were before. Kept until every search out came back.
     moved: HashSet<MessageKey>,
+    /// Mailboxes marked read below a UID while a search was still out, which may bring their
+    /// messages back unread as they were before. Kept until every search out came back.
+    read_below: HashMap<MailboxKey, u32>,
     /// What the server found, cached or not.
     pub(crate) found: Vec<StoredMessage>,
     /// A mailbox had more matches on the server than it sent.
@@ -81,6 +84,7 @@ impl Default for Search {
             failed: HashSet::new(),
             unconfirmed: HashMap::new(),
             moved: HashSet::new(),
+            read_below: HashMap::new(),
             found: Vec::new(),
             more: false,
         }
@@ -124,6 +128,7 @@ impl Search {
         self.searched.clear();
         self.failed.clear();
         self.moved.clear();
+        self.read_below.clear();
         self.found.clear();
         self.more = false;
     }
@@ -145,12 +150,17 @@ impl Search {
             Ok((found, more)) => {
                 self.more |= more;
                 // A message changed before this search came back shows the change still awaited,
-                // and one moved away meanwhile isn't there anymore.
+                // one in a mailbox marked read meanwhile is read, and one moved away meanwhile
+                // isn't there anymore.
                 let moved = &self.moved;
+                let read_below = self.read_below.get(&key).copied();
                 let found = found.into_iter().filter(|m| {
                     !moved.contains(&(m.account.clone(), m.mailbox.clone(), m.envelope.uid))
                 });
                 self.found.extend(found.map(|mut m| {
+                    if read_below.is_some_and(|up_to| m.envelope.uid < up_to) {
+                        m.envelope.seen = true;
+                    }
                     let key = (m.account.clone(), m.mailbox.clone(), m.envelope.uid);
                     if let Some(change) = self.unconfirmed.get(&key) {
                         m.envelope.seen = change.shown;
@@ -168,6 +178,7 @@ impl Search {
             // change the server answered.
             drop_answered(&mut self.unconfirmed);
             self.moved.clear();
+            self.read_below.clear();
         }
         true
     }
@@ -227,6 +238,32 @@ impl Search {
                 change.shown = seen;
                 m.envelope.seen = seen;
             }
+        }
+    }
+
+    /// Shows every message in a mailbox with a UID below `up_to` read, as the server marked them
+    /// so: those found, and those searches still out bring back.
+    pub(crate) fn set_mailbox_seen(&mut self, account: &str, mailbox: &str, up_to: u32) {
+        for m in &mut self.found {
+            if m.account == account && m.mailbox == mailbox && m.envelope.uid < up_to {
+                m.envelope.seen = true;
+            }
+        }
+        for ((a, b, uid), change) in &mut self.unconfirmed {
+            if a == account && b == mailbox && *uid < up_to {
+                // A change still out settles on read, what the server last agreed to.
+                change.confirmed = true;
+                if change.pending == 0 {
+                    change.shown = true;
+                }
+            }
+        }
+        if !self.pending.is_empty() {
+            let below = self
+                .read_below
+                .entry((account.to_owned(), mailbox.to_owned()))
+                .or_default();
+            *below = (*below).max(up_to);
         }
     }
 
@@ -406,6 +443,50 @@ mod tests {
             .unwrap()
             .envelope
             .seen
+    }
+
+    #[test]
+    fn a_mailbox_marked_read_stays_read_once_a_change_still_out_settles() {
+        let mut search = Search {
+            found: vec![
+                stored("a", 1, Some(10)),
+                stored("b", 2, Some(20)),
+                stored("a", 3, Some(30)),
+            ],
+            ..Search::default()
+        };
+        search.set_seen("a", "INBOX", 1, false);
+        search.set_mailbox_seen("a", "INBOX", 3);
+        assert!(seen(&search, 1));
+        assert!(!seen(&search, 2), "another account's inbox");
+        assert!(!seen(&search, 3), "arrived after it was marked");
+        search.settle("a", "INBOX", 1, None);
+        assert!(
+            seen(&search, 1),
+            "refused, it shows what the server last agreed to"
+        );
+    }
+
+    #[test]
+    fn a_search_out_while_a_mailbox_is_marked_read_brings_it_back_read() {
+        let mut search = Search {
+            asked: Some("invoice".into()),
+            pending: [("a", "INBOX"), ("a", "Receipts")]
+                .map(|(a, m)| (a.to_owned(), m.to_owned()))
+                .into(),
+            ..Search::default()
+        };
+        search.set_mailbox_seen("a", "INBOX", 2);
+        // Searched before the mailbox was marked, answered after.
+        let found = vec![stored("a", 1, Some(10)), stored("a", 2, Some(20))];
+        assert!(search.answered("a", "INBOX", Ok((found, false))));
+        assert!(seen(&search, 1));
+        assert!(!seen(&search, 2), "arrived after it was marked");
+        assert!(search.answered("a", "Receipts", Ok((Vec::new(), false))));
+        assert!(
+            search.read_below.is_empty(),
+            "forgotten once every search came back"
+        );
     }
 
     #[test]
