@@ -1400,6 +1400,16 @@ fn settings(s: &Mail, k: &Kit) -> El {
             ),
             row().child(interval),
         ))
+        .child(setting_section(
+            k,
+            "Closing the window",
+            Some(CLOSING_ABOUT),
+            Switch::new(s.settings.keep_running)
+                .label("Keep running in the background")
+                .on_toggle(|s: &mut Mail| s.set_keep_running(!s.settings.keep_running))
+                .build(k)
+                .key("keep-running"),
+        ))
         .child(setting_section(k, "Accounts", None, accounts))
         .child(setting_section(
             k,
@@ -1420,6 +1430,15 @@ fn settings(s: &Mail, k: &Kit) -> El {
         .grow(1.0)
         .min_h(0.0)
 }
+
+/// What keeping the app running does, said for where the window comes back from.
+const CLOSING_ABOUT: &str = if cfg!(target_os = "macos") {
+    "Postden keeps checking mail with its window closed, and shows what's unread on its Dock \
+     icon. Click the Dock icon to bring the window back, and quit with ⌘Q."
+} else {
+    "Postden keeps checking mail with its window closed. Click its tray icon to bring the \
+     window back, and quit from the tray icon's menu. Without a tray, closing the window quits."
+};
 
 /// A titled group of settings, with an optional explanation under its control.
 fn setting_section(k: &Kit, title: &str, about: Option<&str>, control: El) -> El {

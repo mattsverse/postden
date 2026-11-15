@@ -2,6 +2,8 @@
 //!
 //! One window: accounts and their connection status on the left, every inbox's mail on the right,
 //! updated as it arrives. Accounts are added, and mail written, from forms in the window.
+//! Closing the window keeps the app running in the tray (the Dock on macOS), and the app's icon
+//! shows how much mail is unread.
 
 mod account_settings;
 mod compose;
@@ -9,6 +11,7 @@ mod form;
 mod rich;
 mod search;
 mod state;
+mod tray;
 mod update;
 mod view;
 
@@ -24,6 +27,14 @@ const APP_ID: &str = "com.matteogassend.postden";
 
 fn main() {
     rune::set_app_id(APP_ID);
+    // A headless run (`--snap`, `--tree`, `--help`) is a tool's, not the user's: it neither hands
+    // itself to the running app nor puts an icon in the tray.
+    let headless = rune::is_headless();
+    // Launching Postden again brings back the running one's window, closed or not, instead of
+    // starting a second app on the same mail (Linux and Windows; macOS does this itself).
+    if !headless && !rune::single_instance(APP_ID) {
+        return;
+    }
     // Content runs under a transparent titlebar; the traffic lights sit centred on the toolbar,
     // which the shell frames 8 points down (as rune-kit's shell example sets it up).
     let chrome = Chrome {
@@ -36,9 +47,32 @@ fn main() {
         on_key: Some(on_key),
         ..AppSpec::new("Postden", (1040.0, 680.0), Mail::not_started, view::view)
     })
-    .chrome(chrome);
+    .chrome(chrome)
+    // Closing the window keeps mail coming in, unless the settings say otherwise (`on_close`):
+    // the tray icon, or the Dock icon on macOS, brings it back.
+    .keep_running()
+    .on_close(Mail::window_closed)
+    .on_reopen(on_reopen);
     let handle = app.handle();
-    app.init(move || Mail::start(handle)).run();
+    let window = handle.clone();
+    app.on_window(move |w| {
+        let w = w.clone();
+        window.update(move |s: &mut Mail, _| s.attach_window(w));
+    })
+    .init(move || {
+        if !headless {
+            tray::spawn(handle.clone());
+        }
+        Mail::start(handle)
+    })
+    .run();
+}
+
+/// The window comes back (the Dock icon, or launching Postden again). On Linux that also brings
+/// it to the front, as Windows and macOS do; Rune's default there only shows a hidden window.
+fn on_reopen(s: &mut Mail, _visible: bool, _: &mut Tx) -> bool {
+    state::reopened();
+    cfg!(target_os = "linux") && s.bring_forward()
 }
 
 /// ⇧⌘B (and ⌃⌘S on macOS) shows and hides the sidebar, ⌘, opens the settings and Escape closes

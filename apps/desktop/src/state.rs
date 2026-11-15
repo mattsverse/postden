@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use jiff::Zoned;
@@ -17,7 +18,7 @@ use postden_core::secrets::{SecretStore, SecretString};
 use postden_mail::imap::{Status, WatchConfig};
 use postden_secrets::Backend;
 use postden_store::{Scope, Store, StoredMessage};
-use rune::{AppHandle, FileDialogOptions, ImageCache, Tx};
+use rune::{AppHandle, FileDialogOptions, ImageCache, Taskbar, Tray, Tx, WindowHandle};
 use rune_kit::shell::PaneState;
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
@@ -105,6 +106,16 @@ static ALL_INBOXES: Showing = Showing::All(Role::Inbox);
 /// The inbox's name on every server.
 pub(crate) const INBOX: &str = "INBOX";
 
+/// Counts the window's closes and reopenings, so a check started when it closed only acts on that
+/// close. Shared, not in [`Mail`], so the tray's thread bumps it the moment its icon is clicked,
+/// before an update already queued could act on the close.
+static CLOSES: AtomicU64 = AtomicU64::new(0);
+
+/// The window is coming back: what its last close started no longer applies. Any thread.
+pub(crate) fn reopened() {
+    CLOSES.fetch_add(1, Ordering::AcqRel);
+}
+
 /// How long a notice shows before it closes on its own.
 const NOTICE_SECS: u64 = 6;
 
@@ -115,6 +126,13 @@ const UPDATE_CHECK_EVERY: Duration = Duration::from_hours(24);
 
 pub(crate) struct Mail {
     handle: Option<AppHandle<Self>>,
+    /// The tray icon, kept for as long as the app runs. `None` where there's none, and until it
+    /// has started.
+    tray: Option<Tray>,
+    /// The window, once it exists, for the unread count on the app's icon.
+    window: Option<WindowHandle>,
+    /// The unread count the app's icon shows, `None` until it's shown on the current window.
+    badge: Option<usize>,
     /// The services, or why they couldn't start.
     pub(crate) services: Result<Services, String>,
     pub(crate) accounts: Vec<Account>,
@@ -175,6 +193,9 @@ impl Mail {
     fn failed(handle: Option<AppHandle<Self>>, error: String) -> Self {
         Self {
             handle,
+            tray: None,
+            window: None,
+            badge: None,
             services: Err(error),
             accounts: Vec::new(),
             statuses: HashMap::new(),
@@ -345,6 +366,7 @@ impl Mail {
                 self.messages = messages;
                 self.listed = self.listed_mailboxes();
                 self.unread = unread;
+                self.show_badge();
                 if let Some(reader) = &mut self.reader {
                     let m = &reader.message;
                     let (account, mailbox, uid) = (&m.account, &m.mailbox, m.envelope.uid);
@@ -843,6 +865,30 @@ impl Mail {
         }
     }
 
+    /// The window was made, or made again: its icon shows the unread count.
+    pub(crate) fn attach_window(&mut self, window: WindowHandle) {
+        self.window = Some(window);
+        self.badge = None;
+        self.show_badge();
+    }
+
+    /// Shows how many inbox messages are unread on the app's icon: the Dock's on macOS, the
+    /// taskbar button's on Windows. Linux has no badge.
+    fn show_badge(&mut self) {
+        let Some(window) = &self.window else { return };
+        let unread = self.unread(None);
+        if self.badge == Some(unread) {
+            return;
+        }
+        let description = match unread {
+            1 => "1 unread message".to_owned(),
+            n => format!("{n} unread messages"),
+        };
+        let count = u32::try_from(unread).unwrap_or(u32::MAX);
+        window.set_taskbar(Taskbar::new().badge(count, description));
+        self.badge = Some(unread);
+    }
+
     /// How many inbox messages are unread, in one account or all of them.
     pub(crate) fn unread(&self, account: Option<&str>) -> usize {
         account.map_or_else(
@@ -1306,6 +1352,69 @@ impl Mail {
             }
             Err(e) => self.notify(e.to_string()),
         }
+        self.save_settings();
+    }
+
+    /// The window closed: the app quits, unless the setting says to keep running, the app
+    /// started (otherwise the setting wasn't read, and there's no mail to keep checking), and
+    /// something brings the window back: the tray icon, or the Dock on macOS.
+    pub(crate) fn window_closed(&mut self, tx: &mut Tx) {
+        reopened();
+        let way_back = cfg!(target_os = "macos") || self.tray.is_some();
+        if self.settings.keep_running && self.services.is_ok() && way_back {
+            #[cfg(target_os = "linux")]
+            self.quit_without_tray_host();
+        } else {
+            tx.quit();
+        }
+    }
+
+    /// Quits if no tray host shows the tray icon, as on GNOME without an extension: Rune makes the
+    /// icon either way. Asks off the UI thread, so the window is already gone when it quits, and
+    /// stays if the window came back in the meantime.
+    #[cfg(target_os = "linux")]
+    fn quit_without_tray_host(&self) {
+        let (Ok(services), Some(handle)) = (&self.services, &self.handle) else {
+            return;
+        };
+        let (handle, id) = (handle.clone(), CLOSES.load(Ordering::Acquire));
+        services.mailroom.handle().spawn(async move {
+            if !crate::tray::host_registered().await {
+                handle.update(move |_: &mut Self, tx| {
+                    if CLOSES.load(Ordering::Acquire) == id {
+                        tx.quit();
+                    }
+                });
+            }
+        });
+    }
+
+    /// The tray icon started: closing the window keeps the app running from now on.
+    #[cfg_attr(
+        target_os = "macos",
+        expect(
+            clippy::missing_const_for_fn,
+            reason = "Rune's tray only drops its icon off macOS"
+        )
+    )]
+    pub(crate) fn attach_tray(&mut self, tray: Tray) {
+        self.tray = Some(tray);
+    }
+
+    /// Shows the window and brings it to the front. Returns whether it could ask to.
+    pub(crate) fn bring_forward(&self) -> bool {
+        self.handle.as_ref().is_some_and(|handle| {
+            handle.open();
+            true
+        })
+    }
+
+    /// Keeps the app running once its window closes, or has closing it quit.
+    pub(crate) fn set_keep_running(&mut self, on: bool) {
+        if self.settings.keep_running == on {
+            return;
+        }
+        self.settings.keep_running = on;
         self.save_settings();
     }
 
