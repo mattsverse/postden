@@ -1,0 +1,18 @@
+# Janitor CLI version used by the generated GitHub Actions workflow.
+version = "latest"
+
+[review]
+# Append per-run model token usage and estimated cost to the main review comment.
+track_spend = false
+
+# Run a review when at least one changed path matches one of these glob patterns.
+tracked_paths = [
+  "crates/**",
+  "apps/**"
+]
+
+# Skip pull requests whose head branch matches one of these glob patterns, such as
+# automated release branches. Exclusions take precedence over included_branches.
+# excluded_branches = ["release/**"]
+# Review only pull requests whose head branch matches one of these glob patterns.
+# included_branches = ["**"]
