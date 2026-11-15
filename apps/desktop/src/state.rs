@@ -16,22 +16,20 @@ use postden_core::message::{Body, Mailbox, Role};
 use postden_core::secrets::{SecretStore, SecretString};
 use postden_mail::imap::{Status, WatchConfig};
 use postden_secrets::Backend;
-use postden_store::{Store, StoredMessage};
+use postden_store::{Scope, Store, StoredMessage};
 use rune::{AppHandle, FileDialogOptions, ImageCache, Tx};
 use rune_kit::shell::PaneState;
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
 use crate::compose::{ComposeForm, Mode};
 use crate::form::{AccountForm, GoogleSignIn, Step};
+use crate::search::{self, MailboxKey, SERVER_PAGE, Search};
 use crate::update::{self, Phase, Updater};
 
 /// How many messages the list shows at first.
 const LIST_LIMIT: usize = 300;
 /// How many more messages the list shows, or fetches from each mailbox, once scrolled to its end.
 const LIST_PAGE: usize = 100;
-
-/// A mailbox, by account id and name.
-type MailboxKey = (String, String);
 
 /// What the app runs on once started.
 pub(crate) struct Services {
@@ -91,7 +89,18 @@ impl Showing {
     pub(crate) fn is(&self, account: &str, name: &str) -> bool {
         matches!(self, Self::Mailbox { account: a, name: n } if a == account && n == name)
     }
+
+    /// The cached mail this shows.
+    fn scope(&self) -> Scope<'_> {
+        match self {
+            Self::All(role) => Scope::Role(*role),
+            Self::Mailbox { account, name } => Scope::Mailbox { account, name },
+        }
+    }
 }
+
+/// What a search of every inbox looks through.
+static ALL_INBOXES: Showing = Showing::All(Role::Inbox);
 
 /// The inbox's name on every server.
 pub(crate) const INBOX: &str = "INBOX";
@@ -114,6 +123,8 @@ pub(crate) struct Mail {
     /// What the list shows, and its mail.
     pub(crate) showing: Showing,
     pub(crate) messages: Vec<StoredMessage>,
+    /// The search over the list. While it has a query, the list shows what matches.
+    pub(crate) search: Search,
     /// How many messages the list may show. It grows as the list is scrolled to its end.
     list_limit: usize,
     /// The synced mailboxes whose mail the list shows.
@@ -168,6 +179,7 @@ impl Mail {
             accounts: Vec::new(),
             statuses: HashMap::new(),
             messages: Vec::new(),
+            search: Search::default(),
             list_limit: LIST_LIMIT,
             listed: Vec::new(),
             fetching_older: HashSet::new(),
@@ -287,12 +299,34 @@ impl Mail {
     /// Rereads accounts and mail from the store.
     fn reload(&mut self) {
         let Ok(services) = &self.services else { return };
-        let messages = match &self.showing {
-            Showing::All(role) => services.store.recent_messages(*role, self.list_limit),
-            Showing::Mailbox { account, name } => {
-                services
-                    .store
-                    .mailbox_messages(account, name, self.list_limit)
+        let messages = if let Some(query) = self.search.query() {
+            services
+                .store
+                .matching_messages(
+                    self.listing().scope(),
+                    |e| search::matches(e, query),
+                    self.list_limit,
+                )
+                .map(|cached| self.search.merge(cached, self.list_limit))
+                .and_then(|mut merged| {
+                    // A server match the cache holds but whose headers don't match (its text
+                    // did) shows as read or unread as the cache says, which follows the server.
+                    for m in &mut merged {
+                        let (a, b, uid) = (&m.account, &m.mailbox, m.envelope.uid);
+                        if let Some(seen) = services.store.seen(a, b, uid)? {
+                            m.envelope.seen = seen;
+                        }
+                    }
+                    Ok(merged)
+                })
+        } else {
+            match &self.showing {
+                Showing::All(role) => services.store.recent_messages(*role, self.list_limit),
+                Showing::Mailbox { account, name } => {
+                    services
+                        .store
+                        .mailbox_messages(account, name, self.list_limit)
+                }
             }
         };
         let mailboxes = services.store.accounts().and_then(|accounts| {
@@ -337,8 +371,10 @@ impl Mail {
             ..
         } = &update
         {
-            // Started over: what was older is to be fetched again.
+            // Started over: what was older is to be fetched again, and what a search found there
+            // is gone.
             self.no_older.remove(&(account.clone(), mailbox.clone()));
+            self.search.forget_mailbox(account, mailbox);
         }
         match update {
             Update::Status { account, status } => {
@@ -374,26 +410,19 @@ impl Mail {
                 mailbox,
                 uid,
                 body,
+            } => self.opened(&account, &mailbox, uid, body, tx),
+            // Sent mail is shown as it's listed, without a notice.
+            Update::Mail { .. } => self.reload(),
+            Update::Mailboxes { account } => self.mailboxes_listed(&account),
+            Update::Seen {
+                account,
+                mailbox,
+                uid,
+                seen,
             } => {
-                if let Some(reader) = &mut self.reader
-                    && reader.is(&account, &mailbox, uid)
-                {
-                    reader.markdown = body
-                        .as_ref()
-                        .ok()
-                        .and_then(|b| b.html.as_deref())
-                        .map(postden_html::to_markdown)
-                        .filter(|md| !md.trim().is_empty());
-                    reader.body = Some(body);
-                    // The server, not a click, brought it, which would land the text at once:
-                    // ask for its entrance anyway, so it fades in over the spinner.
-                    tx.animated();
-                }
-                // Read now, or, if the download failed, unread again as the store still says.
+                self.search.settle(&account, &mailbox, uid, Some(seen));
                 self.reload();
             }
-            // Sent mail is shown as it's listed, without a notice.
-            Update::Mail { .. } | Update::Seen { .. } | Update::Mailboxes { .. } => self.reload(),
             Update::Older {
                 account,
                 mailbox,
@@ -418,11 +447,183 @@ impl Mail {
                 self.notify(format!("{label}: couldn't fetch older mail: {error}"));
                 self.fetching_older.remove(&(account, mailbox));
             }
-            Update::SeenFailed { account, error } => {
+            Update::SeenFailed {
+                account,
+                mailbox,
+                uid,
+                error,
+            } => {
+                self.search.settle(&account, &mailbox, uid, None);
                 self.notify(format!("{account}: {error}"));
                 self.reload();
             }
             Update::Sent { account, result } => self.sent(&account, result),
+            Update::Searched {
+                id,
+                account,
+                mailbox,
+                result,
+            } => self.searched(id, &account, &mailbox, result),
+        }
+    }
+
+    /// The server listed an account's mailboxes. What a search found in one deleted or renamed
+    /// on the server is gone.
+    fn mailboxes_listed(&mut self, account: &str) {
+        self.reload();
+        let listed = self.mailboxes.get(account);
+        let gone = |a: &str, m: &str| {
+            a == account && !listed.is_some_and(|l| l.iter().any(|b| b.name == m))
+        };
+        if self.search.forget_gone(gone) {
+            self.reload();
+        }
+    }
+
+    /// A message asked for with [`Mail::open_message`] was downloaded, or couldn't be.
+    fn opened(
+        &mut self,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        body: Result<Body, String>,
+        tx: &mut Tx,
+    ) {
+        self.search
+            .settle(account, mailbox, uid, body.is_ok().then_some(true));
+        if let Some(reader) = &mut self.reader
+            && reader.is(account, mailbox, uid)
+        {
+            reader.markdown = body
+                .as_ref()
+                .ok()
+                .and_then(|b| b.html.as_deref())
+                .map(postden_html::to_markdown)
+                .filter(|md| !md.trim().is_empty());
+            reader.body = Some(body);
+            // The server, not a click, brought it, which would land the text at once:
+            // ask for its entrance anyway, so it fades in over the spinner.
+            tx.animated();
+        }
+        // Read now, or, if the download failed, unread again as the store still says.
+        self.reload();
+    }
+
+    /// The server finished searching a mailbox, for the search running now or one replaced.
+    fn searched(
+        &mut self,
+        id: u64,
+        account: &str,
+        mailbox: &str,
+        result: Result<postden_mail::imap::Found, String>,
+    ) {
+        if id != self.search.id {
+            return;
+        }
+        let answer = result.as_ref().map_err(|_error| ()).map(|found| {
+            let messages = found.messages.iter().map(|envelope| StoredMessage {
+                account: account.to_owned(),
+                mailbox: mailbox.to_owned(),
+                envelope: envelope.clone(),
+            });
+            (messages.collect(), found.more)
+        });
+        if !self.search.answered(account, mailbox, answer) {
+            return;
+        }
+        match result {
+            Ok(_) => self.reload(),
+            Err(error) => {
+                let label = self.label(account).to_owned();
+                self.notify(format!("{label}: couldn't search {mailbox}: {error}"));
+            }
+        }
+    }
+
+    /// What the list shows: what's selected, or, searching everywhere, every inbox.
+    pub(crate) fn listing(&self) -> &Showing {
+        if self.search.everywhere && self.search.is_active() {
+            &ALL_INBOXES
+        } else {
+            &self.showing
+        }
+    }
+
+    /// The query changed: matches it in the cache. What the server found for the last one no
+    /// longer stands.
+    pub(crate) fn search_changed(&mut self) {
+        if !self.search.asked_server() {
+            self.search.forget_server();
+        }
+        self.list_limit = LIST_LIMIT;
+        self.reload();
+    }
+
+    /// Searches every inbox, or just what's selected.
+    pub(crate) fn search_everywhere(&mut self, everywhere: bool) {
+        if self.search.everywhere != everywhere {
+            self.search.everywhere = everywhere;
+            self.search.forget_server();
+            self.list_limit = LIST_LIMIT;
+            self.reload();
+        }
+    }
+
+    /// Ends the search, showing the whole list again. Returns whether there was one.
+    pub(crate) fn clear_search(&mut self) -> bool {
+        if self.search.query.text.is_empty() {
+            return false;
+        }
+        self.search.query.clear();
+        self.search_changed();
+        true
+    }
+
+    /// Puts the caret in the search field, back on the list.
+    pub(crate) fn focus_search(&mut self) {
+        self.reader = None;
+        self.search.query.focused = true;
+    }
+
+    /// Asks the server of each mailbox searched for what matches, beyond what's cached and in the
+    /// message text.
+    pub(crate) fn search_server(&mut self) {
+        let Some(query) = self.search.query().map(str::to_owned) else {
+            return;
+        };
+        let mailboxes = self.mailboxes_of(self.listing());
+        let Ok(services) = &self.services else { return };
+        if mailboxes.is_empty() {
+            self.notify(
+                "Nothing here has synced yet, so there's nothing to search on the server".into(),
+            );
+            return;
+        }
+        self.search.forget_server();
+        let mut failed = Vec::new();
+        for key in mailboxes {
+            match services.mailroom.search(
+                &services.store,
+                &key.0,
+                &key.1,
+                &query,
+                self.search.id,
+                SERVER_PAGE,
+            ) {
+                Ok(()) => {
+                    self.search.pending.insert(key);
+                }
+                Err(e) => {
+                    failed.push(format!("{}: {e}", self.label(&key.0)));
+                    self.search.failed.insert(key);
+                }
+            }
+        }
+        self.search.asked = Some(query);
+        // What the last search found goes until this one's answers come.
+        self.reload();
+        if !failed.is_empty() {
+            self.notify(format!("Couldn't search the server. {}", failed.join("; ")));
         }
     }
 
@@ -569,6 +770,7 @@ impl Mail {
             } else {
                 // Shown read right away; the store catches up once the server agrees.
                 message.envelope.seen = true;
+                self.search.set_seen(account, mailbox, uid, true);
             }
         }
         self.reader = Some(reader);
@@ -610,6 +812,7 @@ impl Mail {
                 {
                     listed.envelope.seen = seen;
                 }
+                self.search.set_seen(&account, &mailbox, uid, seen);
             }
             Err(e) => self.notify(e.to_string()),
         }
@@ -630,7 +833,7 @@ impl Mail {
 
     /// Whether the list shows sent mail, so it says whom each message went to.
     pub(crate) fn showing_sent(&self) -> bool {
-        match &self.showing {
+        match self.listing() {
             Showing::All(role) => *role == Role::Sent,
             Showing::Mailbox { account, name } => self
                 .mailboxes
@@ -668,6 +871,10 @@ impl Mail {
             services.mailroom.refresh(account);
         }
         if self.showing != showing {
+            // A search goes on in the mailbox now shown, unless it looks through every inbox.
+            if !self.search.everywhere {
+                self.search.forget_server();
+            }
             self.showing = showing;
             self.list_limit = LIST_LIMIT;
             self.reload();
@@ -676,10 +883,15 @@ impl Mail {
 
     /// The synced mailboxes whose mail [`Mail::showing`] lists.
     fn listed_mailboxes(&self) -> Vec<MailboxKey> {
+        self.mailboxes_of(&self.showing)
+    }
+
+    /// The synced mailboxes whose mail `showing` lists.
+    fn mailboxes_of(&self, showing: &Showing) -> Vec<MailboxKey> {
         let Ok(services) = &self.services else {
             return Vec::new();
         };
-        match &self.showing {
+        match showing {
             Showing::Mailbox { account, name } => vec![(account.clone(), name.clone())],
             Showing::All(role) => self
                 .accounts
@@ -693,7 +905,11 @@ impl Mail {
     }
 
     /// Whether the list has more to show past its end: cached, or still on a server.
+    /// While searching, that's only more cached matches: the server is searched as a whole.
     pub(crate) fn has_older(&self) -> bool {
+        if self.search.is_active() {
+            return self.messages.len() >= self.list_limit;
+        }
         self.messages.len() >= self.list_limit
             || !self.fetching_older.is_empty()
             || self.listed.iter().any(|m| !self.no_older.contains(m))
@@ -714,9 +930,12 @@ impl Mail {
         if listed >= self.list_limit {
             self.list_limit += LIST_PAGE;
             self.reload();
-            if self.messages.len() > listed {
+            if self.messages.len() > listed || self.search.is_active() {
                 return;
             }
+        }
+        if self.search.is_active() {
+            return;
         }
         let Ok(services) = &self.services else { return };
         for key in &self.listed {
@@ -1270,6 +1489,8 @@ impl Mail {
         if self.showing.account() == Some(id) {
             self.showing = Showing::All(Role::Inbox);
         }
+        // What the server found may be its mail.
+        self.search.forget_server();
         if self
             .reader
             .as_ref()

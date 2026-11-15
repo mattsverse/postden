@@ -11,8 +11,8 @@ use postden_core::account::{Account, Server};
 use postden_core::message::{Body, Envelope, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
-    Event, Older, Status, WatchConfig, fetch_older, open_message, refresh, save_sent_copy,
-    set_seen, watch,
+    Event, Found, Older, Status, WatchConfig, fetch_older, open_message, refresh, save_sent_copy,
+    search, set_seen, watch,
 };
 use postden_mail::{Credentials, smtp};
 use postden_store::Store;
@@ -53,6 +53,17 @@ pub enum Update {
         mailbox: String,
         error: String,
     },
+    /// A search asked for with [`Mailroom::search`] finished in one mailbox. What it found isn't
+    /// saved: the cache holds a mailbox's newest mail without gaps, and matches can be anywhere.
+    /// If the mailbox started over (a new UIDVALIDITY) since the search began, it failed: its
+    /// UIDs would name other messages now.
+    Searched {
+        /// The id the search was started with.
+        id: u64,
+        account: String,
+        mailbox: String,
+        result: Result<Found, String>,
+    },
     /// Fetched mail couldn't be saved.
     SaveFailed { account: String, error: String },
     /// A message asked for with [`Mailroom::open`] was downloaded, or couldn't be. Once downloaded
@@ -71,7 +82,12 @@ pub enum Update {
         seen: bool,
     },
     /// Marking a message read or unread failed. The store still says what it did before.
-    SeenFailed { account: String, error: String },
+    SeenFailed {
+        account: String,
+        mailbox: String,
+        uid: u32,
+        error: String,
+    },
     /// A message handed to [`Mailroom::send`] was accepted by the account's SMTP server, or wasn't.
     /// On success, it's the `Message-ID` it was sent with.
     Sent {
@@ -112,6 +128,13 @@ enum Job {
         mailbox: String,
         uid_validity: u32,
         result: Result<Older, String>,
+    },
+    Searched {
+        id: u64,
+        account: String,
+        mailbox: String,
+        uid_validity: u32,
+        result: Result<Found, String>,
     },
 }
 
@@ -378,6 +401,39 @@ impl Mailroom {
         Ok(())
     }
 
+    /// Searches `mailbox` on the server in the background for the newest `count` messages holding
+    /// every word of `query`. The result arrives as [`Update::Searched`], carrying `id`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Mailroom::open`].
+    pub fn search(
+        &self,
+        store: &Store,
+        account: &str,
+        mailbox: &str,
+        query: &str,
+        id: u64,
+        count: usize,
+    ) -> Result<()> {
+        let (server, credentials, uid_validity) = self.target(store, account, mailbox)?;
+        let (account, mailbox, query) = (account.to_owned(), mailbox.to_owned(), query.to_owned());
+        let jobs = self.jobs.clone();
+        self.handle.spawn(async move {
+            let result = search(&server, &credentials, &mailbox, uid_validity, &query, count)
+                .await
+                .map_err(|e| e.to_string());
+            let _ignored = jobs.send(Job::Searched {
+                id,
+                account,
+                mailbox,
+                uid_validity,
+                result,
+            });
+        });
+        Ok(())
+    }
+
     /// Lists and syncs `account`'s mailboxes other than the inbox now, rather than at the next
     /// interval. Does nothing for an account that isn't watched.
     pub fn refresh(&self, account: &str) {
@@ -537,7 +593,12 @@ fn save(store: &mut Store, job: Job) -> Vec<Update> {
                     uid,
                     seen,
                 },
-                Err(error) => Update::SeenFailed { account, error },
+                Err(error) => Update::SeenFailed {
+                    account,
+                    mailbox,
+                    uid,
+                    error,
+                },
             }]
         }
         Job::Sent { account, result } => vec![Update::Sent { account, result }],
@@ -548,6 +609,40 @@ fn save(store: &mut Store, job: Job) -> Vec<Update> {
             uid_validity,
             result,
         } => vec![save_older(store, account, mailbox, uid_validity, result)],
+        Job::Searched {
+            id,
+            account,
+            mailbox,
+            uid_validity,
+            result,
+        } => vec![searched(store, id, account, mailbox, uid_validity, result)],
+    }
+}
+
+/// What a search found, unless its mailbox started over since. Jobs are saved in order, so a
+/// restart saved before this is seen here, and one saved after reaches the UI after it.
+fn searched(
+    store: &Store,
+    id: u64,
+    account: String,
+    mailbox: String,
+    uid_validity: u32,
+    result: Result<Found, String>,
+) -> Update {
+    let current = store
+        .mailbox_state(&account, &mailbox)
+        .map_err(|e| e.to_string())
+        .map(|state| state.map(|s| s.uid_validity));
+    let result = match current {
+        Ok(Some(current)) if current == uid_validity => result,
+        Ok(_) => Err(format!("{mailbox} changed on the server; search again")),
+        Err(error) => Err(error),
+    };
+    Update::Searched {
+        id,
+        account,
+        mailbox,
+        result,
     }
 }
 
@@ -758,6 +853,40 @@ mod tests {
         assert!(
             matches!(empty.as_slice(), [Update::Older { done: true, .. }]),
             "nothing came back, so nothing more to ask for: {empty:?}"
+        );
+    }
+
+    #[test]
+    fn search_results_from_before_a_mailbox_restarted_are_refused() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        save(&mut store, messages(1, &[1]));
+        let job = |uid_validity| Job::Searched {
+            id: 3,
+            account: "me@example.com".into(),
+            mailbox: "INBOX".into(),
+            uid_validity,
+            result: Ok(Found {
+                messages: Vec::new(),
+                more: false,
+            }),
+        };
+        assert!(
+            matches!(
+                save(&mut store, job(1)).as_slice(),
+                [Update::Searched {
+                    id: 3,
+                    result: Ok(_),
+                    ..
+                }]
+            ),
+            "same UIDVALIDITY"
+        );
+        save(&mut store, messages(2, &[1]));
+        let stale = save(&mut store, job(1));
+        assert!(
+            matches!(stale.as_slice(), [Update::Searched { result: Err(_), .. }]),
+            "got {stale:?}"
         );
     }
 
