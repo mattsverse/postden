@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/mattsverse/postden/compare/v0.2.0...v0.3.0) (2026-11-15)
+
+
+### Features
+
+* keep running in the tray and badge unread mail ([13bc0c0](https://github.com/mattsverse/postden/commit/13bc0c0398ccc07d96703f254af8fff1ea25add3))
+
 ## [0.2.0](https://github.com/mattsverse/postden/compare/v0.1.0...v0.2.0) (2026-11-15)
 
 
