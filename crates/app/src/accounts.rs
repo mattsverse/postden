@@ -283,6 +283,7 @@ pub fn remove_account(store: &Store, secrets: &dyn SecretStore, id: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{Memory, ReadOnly};
 
     fn new() -> NewAccount {
         NewAccount {
@@ -316,42 +317,6 @@ mod tests {
         .unwrap();
         assert_eq!(a.imap.port, 1143);
         assert_eq!(a.smtp.username, "me", "a blank SMTP user name falls back");
-    }
-
-    /// A secret store in memory.
-    #[derive(Debug, Default)]
-    struct Memory(std::sync::Mutex<std::collections::HashMap<SecretKey, String>>);
-
-    impl Memory {
-        fn secrets(
-            &self,
-        ) -> Result<
-            std::sync::MutexGuard<'_, std::collections::HashMap<SecretKey, String>>,
-            SecretError,
-        > {
-            self.0
-                .lock()
-                .map_err(|e| SecretError::Unavailable(e.to_string()))
-        }
-    }
-
-    impl SecretStore for Memory {
-        fn get(&self, key: &SecretKey) -> Result<Option<SecretString>, SecretError> {
-            Ok(self
-                .secrets()?
-                .get(key)
-                .map(|s| SecretString::from(s.clone())))
-        }
-        fn set(&self, key: &SecretKey, secret: &SecretString) -> Result<(), SecretError> {
-            use postden_core::secrets::ExposeSecret as _;
-            self.secrets()?
-                .insert(key.clone(), secret.expose_secret().to_owned());
-            Ok(())
-        }
-        fn delete(&self, key: &SecretKey) -> Result<(), SecretError> {
-            self.secrets()?.remove(key);
-            Ok(())
-        }
     }
 
     fn smtp(secrets: &Memory) -> String {
@@ -421,22 +386,6 @@ mod tests {
         );
         assert!(remove_account(&store, &secrets, &account.id).unwrap());
         assert!(secrets.0.lock().unwrap().is_empty(), "nothing is left");
-    }
-
-    /// A password command: it can be read but not written.
-    #[derive(Debug)]
-    struct ReadOnly;
-
-    impl SecretStore for ReadOnly {
-        fn get(&self, _: &SecretKey) -> Result<Option<SecretString>, SecretError> {
-            Ok(None)
-        }
-        fn set(&self, _: &SecretKey, _: &SecretString) -> Result<(), SecretError> {
-            Err(SecretError::ReadOnly)
-        }
-        fn delete(&self, _: &SecretKey) -> Result<(), SecretError> {
-            Err(SecretError::ReadOnly)
-        }
     }
 
     #[test]

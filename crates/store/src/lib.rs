@@ -219,32 +219,52 @@ impl Store {
     ///
     /// Returns an error when the write fails.
     pub fn save_account(&self, account: &Account) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO accounts (id, display_name, imap_host, imap_port, imap_security,
-                imap_username, smtp_host, smtp_port, smtp_security, smtp_username, auth, label)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT(id) DO UPDATE SET
-                display_name = excluded.display_name,
-                imap_host = excluded.imap_host, imap_port = excluded.imap_port,
-                imap_security = excluded.imap_security, imap_username = excluded.imap_username,
-                smtp_host = excluded.smtp_host, smtp_port = excluded.smtp_port,
-                smtp_security = excluded.smtp_security, smtp_username = excluded.smtp_username,
-                auth = excluded.auth",
-            params![
-                account.id,
-                account.display_name,
-                account.imap.host,
-                account.imap.port,
-                account.imap.security.as_str(),
-                account.imap.username,
-                account.smtp.host,
-                account.smtp.port,
-                account.smtp.security.as_str(),
-                account.smtp.username,
-                account.auth.as_str(),
-                account.label,
-            ],
+        upsert_account(&self.conn, account)
+    }
+
+    /// Adds `account`, or replaces the account with the same id entirely: its settings, its
+    /// names, which [`Store::save_account`] keeps, and its signature, or none with `None`. Its
+    /// cached mail is kept only while its mailboxes are the same ones: on the same IMAP server,
+    /// port and username. It's all or nothing: when a write fails, nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a write fails.
+    pub fn replace_account(
+        &mut self,
+        account: &Account,
+        signature: Option<&Signature>,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let mailbox_owner: Option<(String, u16, String)> = tx
+            .query_row(
+                "SELECT imap_host, imap_port, imap_username FROM accounts WHERE id = ?1",
+                [&account.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let same_mailboxes = mailbox_owner.is_none_or(|(host, port, username)| {
+            host.eq_ignore_ascii_case(&account.imap.host)
+                && port == account.imap.port
+                && username == account.imap.username
+        });
+        if !same_mailboxes {
+            // Another server's or user's mailboxes: what's cached of the old ones, down to its
+            // UIDs and UIDVALIDITY, says nothing about the new ones. Messages and bodies go with
+            // their mailbox.
+            tx.execute("DELETE FROM mailboxes WHERE account = ?1", [&account.id])?;
+            tx.execute(
+                "DELETE FROM listed_mailboxes WHERE account = ?1",
+                [&account.id],
+            )?;
+        }
+        upsert_account(&tx, account)?;
+        tx.execute(
+            "UPDATE accounts SET label = ?2, display_name = ?3 WHERE id = ?1",
+            params![account.id, account.label, account.display_name],
         )?;
+        write_signature(&tx, &account.id, signature)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -312,29 +332,7 @@ impl Store {
     /// is written in that case.
     pub fn save_signature(&mut self, account: &str, signature: Option<&Signature>) -> Result<()> {
         let tx = self.conn.transaction()?;
-        // Its images go with it.
-        tx.execute("DELETE FROM signatures WHERE account = ?1", [account])?;
-        if let Some(signature) = signature {
-            tx.execute(
-                "INSERT INTO signatures (account, html, source) VALUES (?1, ?2, ?3)",
-                params![account, signature.html, signature.source],
-            )?;
-            let mut insert = tx.prepare(
-                "INSERT INTO signature_images (account, position, cid, name, mime, data)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            )?;
-            for (position, image) in signature.images.iter().enumerate() {
-                let position = i64::try_from(position).unwrap_or(i64::MAX);
-                insert.execute(params![
-                    account,
-                    position,
-                    image.cid,
-                    image.name,
-                    image.mime,
-                    &*image.data
-                ])?;
-            }
-        }
+        write_signature(&tx, account, signature)?;
         tx.commit()?;
         Ok(())
     }
@@ -906,13 +904,88 @@ impl Store {
     ///
     /// Returns an error when the write fails.
     pub fn set_setting(&self, name: &str, value: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO settings (name, value) VALUES (?1, ?2)
-             ON CONFLICT (name) DO UPDATE SET value = excluded.value",
-            [name, value],
-        )?;
+        self.set_settings(&[(name, value)])
+    }
+
+    /// Sets each setting, by name, to its value, all or nothing: when a write fails, none is
+    /// changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a write fails.
+    pub fn set_settings(&self, settings: &[(&str, &str)]) -> Result<()> {
+        // Unchecked: `&self` can't rule out a transaction already open, but none ever is, as
+        // every other one is opened and committed within a single call.
+        let tx = self.conn.unchecked_transaction()?;
+        for (name, value) in settings {
+            tx.execute(
+                "INSERT INTO settings (name, value) VALUES (?1, ?2)
+                 ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+                [name, value],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
+}
+
+/// Adds `account` or replaces its settings, keeping its label. See [`Store::save_account`].
+fn upsert_account(conn: &Connection, account: &Account) -> Result<()> {
+    conn.execute(
+        "INSERT INTO accounts (id, display_name, imap_host, imap_port, imap_security,
+            imap_username, smtp_host, smtp_port, smtp_security, smtp_username, auth, label)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(id) DO UPDATE SET
+            display_name = excluded.display_name,
+            imap_host = excluded.imap_host, imap_port = excluded.imap_port,
+            imap_security = excluded.imap_security, imap_username = excluded.imap_username,
+            smtp_host = excluded.smtp_host, smtp_port = excluded.smtp_port,
+            smtp_security = excluded.smtp_security, smtp_username = excluded.smtp_username,
+            auth = excluded.auth",
+        params![
+            account.id,
+            account.display_name,
+            account.imap.host,
+            account.imap.port,
+            account.imap.security.as_str(),
+            account.imap.username,
+            account.smtp.host,
+            account.smtp.port,
+            account.smtp.security.as_str(),
+            account.smtp.username,
+            account.auth.as_str(),
+            account.label,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Replaces the account's signature, or removes it with `None`. See [`Store::save_signature`].
+fn write_signature(tx: &Connection, account: &str, signature: Option<&Signature>) -> Result<()> {
+    // Its images go with it.
+    tx.execute("DELETE FROM signatures WHERE account = ?1", [account])?;
+    if let Some(signature) = signature {
+        tx.execute(
+            "INSERT INTO signatures (account, html, source) VALUES (?1, ?2, ?3)",
+            params![account, signature.html, signature.source],
+        )?;
+        let mut insert = tx.prepare(
+            "INSERT INTO signature_images (account, position, cid, name, mime, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for (position, image) in signature.images.iter().enumerate() {
+            let position = i64::try_from(position).unwrap_or(i64::MAX);
+            insert.execute(params![
+                account,
+                position,
+                image.cid,
+                image.name,
+                image.mime,
+                &*image.data
+            ])?;
+        }
+    }
+    Ok(())
 }
 
 fn message_from_row(row: &Row<'_>) -> rusqlite::Result<StoredMessage> {
@@ -1147,6 +1220,84 @@ mod tests {
             mime: "image/png".into(),
             data: data.into(),
         }
+    }
+
+    #[test]
+    fn replacing_an_account_keeps_its_mail_only_on_the_same_mailboxes() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mine = account("me@example.com");
+        store.save_account(&mine).unwrap();
+        let cache = |store: &mut Store| {
+            store
+                .save_messages(&mine.id, "INBOX", Role::Inbox, 1, &[envelope(1, 10)])
+                .unwrap();
+            store
+                .save_body(&mine.id, "INBOX", 1, &Body::default())
+                .unwrap();
+        };
+        cache(&mut store);
+
+        let mut renamed = mine.clone();
+        renamed.label = Some("Renamed".into());
+        renamed.smtp.host = "smtp.elsewhere.example".into();
+        renamed.imap.host = renamed.imap.host.to_uppercase();
+        store.replace_account(&renamed, None).unwrap();
+        assert!(
+            store.message(&mine.id, "INBOX", 1).unwrap().is_some(),
+            "same mailboxes"
+        );
+        assert!(store.body(&mine.id, "INBOX", 1).unwrap().is_some());
+
+        for change in [
+            |a: &mut Account| a.imap.host = "imap.elsewhere.example".into(),
+            |a: &mut Account| a.imap.port += 1,
+            |a: &mut Account| a.imap.username = "someone-else".into(),
+        ] {
+            cache(&mut store);
+            let mut moved = mine.clone();
+            change(&mut moved);
+            store.replace_account(&moved, None).unwrap();
+            assert_eq!(
+                store.message(&mine.id, "INBOX", 1).unwrap(),
+                None,
+                "{moved:?}"
+            );
+            assert_eq!(store.body(&mine.id, "INBOX", 1).unwrap(), None);
+            assert_eq!(store.mailbox_state(&mine.id, "INBOX").unwrap(), None);
+            store.replace_account(&mine, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn replacing_an_account_is_all_or_nothing() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut mine = account("me@example.com");
+        mine.label = Some("Mine".into());
+        store.save_account(&mine).unwrap();
+        let old = Signature {
+            html: "<p>old</p>".into(),
+            source: false,
+            images: Vec::new(),
+        };
+        store.save_signature(&mine.id, Some(&old)).unwrap();
+
+        let mut theirs = account("me@example.com");
+        theirs.label = Some("Theirs".into());
+        theirs.display_name = None;
+        theirs.imap.host = "imap.elsewhere.example".into();
+        // Two images with one Content-ID: the second can't be written.
+        let broken = Signature {
+            html: "<p>new</p>".into(),
+            source: false,
+            images: vec![image("logo", &[1]), image("logo", &[2])],
+        };
+        assert!(store.replace_account(&theirs, Some(&broken)).is_err());
+        assert_eq!(store.account(&mine.id).unwrap(), Some(mine.clone()));
+        assert_eq!(store.signature(&mine.id).unwrap(), Some(old));
+
+        store.replace_account(&theirs, None).unwrap();
+        assert_eq!(store.account(&mine.id).unwrap(), Some(theirs), "names too");
+        assert_eq!(store.signature(&mine.id).unwrap(), None);
     }
 
     #[test]
@@ -1682,6 +1833,31 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         assert_eq!(store.setting("theme").unwrap(), None);
         store.set_setting("theme", "dark").unwrap();
+        store.set_setting("theme", "light").unwrap();
+        assert_eq!(store.setting("theme").unwrap().as_deref(), Some("light"));
+    }
+
+    #[test]
+    fn settings_are_saved_all_or_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_settings(&[("theme", "dark"), ("poll", "60")])
+            .unwrap();
+        // A setting the database refuses, as a full disk would.
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER refuse BEFORE UPDATE ON settings WHEN NEW.name = 'poll'
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+        let refused = store.set_settings(&[("theme", "light"), ("poll", "300")]);
+        assert!(refused.is_err());
+        assert_eq!(
+            store.setting("theme").unwrap().as_deref(),
+            Some("dark"),
+            "the first one isn't changed either"
+        );
         store.set_setting("theme", "light").unwrap();
         assert_eq!(store.setting("theme").unwrap().as_deref(), Some("light"));
     }

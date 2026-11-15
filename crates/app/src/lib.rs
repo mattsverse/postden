@@ -9,6 +9,8 @@
 //!   messages ahead when asked to, and sending mail.
 //! - [`Draft`]: a message being written, blank or as a reply.
 //! - [`signature`]: what each account adds below the mail it sends, images included.
+//! - [`Profile`]: every account and setting in one passphrase-locked file, to move Postden to
+//!   another computer.
 //! - [`Settings`]: the app's preferences, such as its [`Theme`] and whether to check for updates.
 //! - [`format_date`] and [`recipients`]: dates and recipients as a mail list shows them.
 //! - [`eml_file_name`]: what to call a message exported as an `.eml` file.
@@ -18,8 +20,11 @@ mod accounts;
 mod compose;
 mod google;
 mod mailroom;
+mod profile;
 mod settings;
 pub mod signature;
+#[cfg(test)]
+mod testing;
 
 use std::path::PathBuf;
 
@@ -33,6 +38,9 @@ use jiff::{Timestamp, Zoned};
 pub use mailroom::{Mailroom, Update};
 use postden_core::message::Envelope;
 use postden_secrets::Backend;
+pub use profile::{
+    ImportOptions, Imported, MIN_PASSPHRASE, Profile, ProfileAccount, ProfileSettings, is_sealed,
+};
 pub use settings::{POLL_INTERVALS, PREFETCH_COUNTS, Settings, Theme};
 
 /// Why a Postden operation failed, phrased for the user.
@@ -53,6 +61,8 @@ pub enum Error {
     NoPassword(String),
     #[error("{0} isn't signed in to Google; sign in with Google again")]
     NotSignedIn(String),
+    #[error("that's not the passphrase this profile was exported with")]
+    WrongPassphrase,
     #[error("{0}")]
     Invalid(String),
 }

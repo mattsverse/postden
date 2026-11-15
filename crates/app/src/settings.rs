@@ -19,7 +19,8 @@ const CHECK_UPDATES: &str = "check_updates";
 const SKIPPED_UPDATE: &str = "skipped_update";
 
 /// Whether the window is light, dark, or follows the system.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Theme {
     #[default]
     System,
@@ -154,23 +155,25 @@ impl Settings {
         })
     }
 
-    /// Saves every setting to `store`.
+    /// Saves every setting to `store`, all or nothing.
     ///
     /// # Errors
     ///
-    /// Returns an error when the store can't be written.
+    /// Returns an error, having changed nothing, when the store can't be written.
     pub fn save(&self, store: &Store) -> Result<()> {
-        store.set_setting(THEME, self.theme.key())?;
-        store.set_setting(POLL_INTERVAL, &self.poll_interval.as_secs().to_string())?;
-        store.set_setting(PREFETCH, &self.prefetch.to_string())?;
-        store.set_setting(NOTIFY_NEW_MAIL, &self.notify_new_mail.to_string())?;
-        store.set_setting(KEEP_RUNNING, &self.keep_running.to_string())?;
-        store.set_setting(CHECK_UPDATES, &self.check_updates.to_string())?;
         let skipped = self
             .skipped_update
             .map(|v| v.to_string())
             .unwrap_or_default();
-        store.set_setting(SKIPPED_UPDATE, &skipped)?;
+        store.set_settings(&[
+            (THEME, self.theme.key()),
+            (POLL_INTERVAL, &self.poll_interval.as_secs().to_string()),
+            (PREFETCH, &self.prefetch.to_string()),
+            (NOTIFY_NEW_MAIL, &self.notify_new_mail.to_string()),
+            (KEEP_RUNNING, &self.keep_running.to_string()),
+            (CHECK_UPDATES, &self.check_updates.to_string()),
+            (SKIPPED_UPDATE, &skipped),
+        ])?;
         Ok(())
     }
 }

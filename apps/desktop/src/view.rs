@@ -25,6 +25,7 @@ use crate::form::{AccountForm, SECURITY, Step, security_index};
 use crate::rich::RichEditor;
 use crate::search::{SERVER_PAGE, ServerSearch};
 use crate::state::{INBOX as INBOX_NAME, Mail, MailboxMenu, MessageMenu, Reader, Showing};
+use crate::transfer::{self as moving, Transfer};
 use crate::update::{self, Phase};
 
 static INBOX: Icon = Icon {
@@ -1532,17 +1533,6 @@ fn settings(s: &Mail, k: &Kit) -> El {
     })
     .build(k)
     .key("poll-interval");
-    let mut accounts = col().w_full().gap(8.0);
-    if s.accounts.is_empty() {
-        accounts = accounts.child(
-            text("No accounts yet.")
-                .font(k.ty.small)
-                .color(k.c.text_muted),
-        );
-    }
-    for account in &s.accounts {
-        accounts = accounts.child(settings_account(s, account, k));
-    }
     let page = col()
         .key("settings")
         .w_full()
@@ -1583,7 +1573,13 @@ fn settings(s: &Mail, k: &Kit) -> El {
                 .build(k)
                 .key("keep-running"),
         ))
-        .child(setting_section(k, "Accounts", None, accounts))
+        .child(setting_section(
+            k,
+            "Accounts",
+            None,
+            settings_accounts(s, k),
+        ))
+        .child(transfer(&s.transfer, k))
         .child(setting_section(
             k,
             "Updates",
@@ -1602,6 +1598,22 @@ fn settings(s: &Mail, k: &Kit) -> El {
         })
         .grow(1.0)
         .min_h(0.0)
+}
+
+/// Every account set up, with buttons to edit or remove it.
+fn settings_accounts(s: &Mail, k: &Kit) -> El {
+    let mut accounts = col().w_full().gap(8.0);
+    if s.accounts.is_empty() {
+        accounts = accounts.child(
+            text("No accounts yet.")
+                .font(k.ty.small)
+                .color(k.c.text_muted),
+        );
+    }
+    for account in &s.accounts {
+        accounts = accounts.child(settings_account(s, account, k));
+    }
+    accounts
 }
 
 /// How many of each inbox's newest messages are downloaded ahead of their opening.
@@ -2057,6 +2069,239 @@ fn signature_view(c: &ComposeForm, k: &Kit) -> Option<El> {
         );
     }
     Some(view)
+}
+
+/// What moving Postden to another computer takes along, and leaves.
+const TRANSFER_ABOUT: &str = "Export every account, with its password or Google sign-in and its \
+     signature, and these settings to a file locked with a passphrase, then import it in Postden \
+     on the other computer. Mail isn't in the file: the other computer fetches it again.";
+
+/// The settings' section for moving to another computer.
+fn transfer(t: &Transfer, k: &Kit) -> El {
+    setting_section(
+        k,
+        "Moving to another computer",
+        Some(TRANSFER_ABOUT),
+        transfer_step(t, k),
+    )
+}
+
+/// Exporting or importing every account and setting: two buttons, or the step under way.
+fn transfer_step(t: &Transfer, k: &Kit) -> El {
+    let section = match t.step {
+        moving::Step::Idle => {
+            return row()
+                .gap(8.0)
+                .child(
+                    Button::new("Export…")
+                        .on_press(Mail::start_export)
+                        .build(k)
+                        .key("export-profile"),
+                )
+                .child(
+                    Button::new("Import…")
+                        .on_press_tx(|_: &mut Mail, tx| Mail::pick_profile(tx))
+                        .build(k)
+                        .key("import-profile"),
+                );
+        }
+        moving::Step::Export => export_form(t, k),
+        moving::Step::Unlock => unlock_form(t, k),
+        moving::Step::Review => review(t, k),
+    };
+    match &t.error {
+        Some(error) => section.child(
+            text(error.clone())
+                .key("transfer-error")
+                .font(k.ty.small)
+                .color(k.c.danger.fg)
+                .wrap(),
+        ),
+        None => section,
+    }
+}
+
+/// A passphrase field of the export or import, which `submit` presses on Return.
+fn passphrase_input(
+    t: &Transfer,
+    label: &str,
+    edit: &TextEdit,
+    get: fn(&mut Mail) -> &mut TextEdit,
+    submit: fn(&mut Mail, &mut Tx),
+) -> TextInput {
+    TextInput::new(edit)
+        .label(label)
+        .secure()
+        .width(None)
+        .disabled(t.busy)
+        .on_edit(get)
+        .on_submit(submit)
+}
+
+/// The step's buttons: `go`, which does it, and Cancel.
+fn transfer_actions(t: &Transfer, k: &Kit, go: El) -> El {
+    row().gap(8.0).child(go).child(
+        Button::new("Cancel")
+            .variant(ButtonVariant::Ghost)
+            .disabled(t.busy)
+            .on_press(Mail::cancel_transfer)
+            .build(k)
+            .key("cancel-transfer"),
+    )
+}
+
+/// Typing the passphrase to lock an export with, twice, then picking where to save it.
+fn export_form(t: &Transfer, k: &Kit) -> El {
+    let (label, variant) = if t.busy {
+        ("Encrypting…", ButtonVariant::Loading)
+    } else {
+        ("Export…", ButtonVariant::Contrast)
+    };
+    let go = Button::new(label)
+        .variant(variant)
+        .disabled(t.busy)
+        .on_press_tx(Mail::export_profile)
+        .build(k)
+        .key("export-save");
+    col()
+        .w_full()
+        .gap(10.0)
+        .child(
+            row()
+                .gap(12.0)
+                .child(field(
+                    k,
+                    "Passphrase",
+                    passphrase_input(
+                        t,
+                        "Passphrase",
+                        &t.passphrase,
+                        |s| &mut s.transfer.passphrase,
+                        Mail::export_profile,
+                    )
+                    .build(k)
+                    .key("transfer-passphrase"),
+                ))
+                .child(field(
+                    k,
+                    "The passphrase again",
+                    passphrase_input(
+                        t,
+                        "The passphrase again",
+                        &t.confirm,
+                        |s| &mut s.transfer.confirm,
+                        Mail::export_profile,
+                    )
+                    .build(k)
+                    .key("transfer-confirm"),
+                )),
+        )
+        .child(
+            text(format!(
+                "At least {} characters. Without it the file can't be opened, and anyone with \
+                 both can read your passwords.",
+                postden_app::MIN_PASSPHRASE
+            ))
+            .font(k.ty.small)
+            .color(k.c.text_muted)
+            .wrap(),
+        )
+        .child(transfer_actions(t, k, go))
+}
+
+/// Typing the passphrase a picked profile was exported with.
+fn unlock_form(t: &Transfer, k: &Kit) -> El {
+    let name = t.file.as_ref().map_or("", |(name, _)| name.as_str());
+    let (label, variant) = if t.busy {
+        ("Unlocking…", ButtonVariant::Loading)
+    } else {
+        ("Unlock", ButtonVariant::Contrast)
+    };
+    let go = Button::new(label)
+        .variant(variant)
+        .disabled(t.busy)
+        .on_press(Mail::unlock_profile)
+        .build(k)
+        .key("unlock-profile");
+    col()
+        .w_full()
+        .gap(10.0)
+        .child(field(
+            k,
+            &format!("The passphrase {name} was exported with"),
+            passphrase_input(
+                t,
+                "Passphrase",
+                &t.passphrase,
+                |s| &mut s.transfer.passphrase,
+                |s, _| s.unlock_profile(),
+            )
+            .build(k)
+            .key("transfer-passphrase"),
+        ))
+        .child(transfer_actions(t, k, go))
+}
+
+/// What an unlocked profile holds, what to do with accounts set up already and its settings,
+/// and the Import button.
+fn review(t: &Transfer, k: &Kit) -> El {
+    let Some(profile) = &t.profile else {
+        return col();
+    };
+    let mut accounts = col().w_full().gap(6.0);
+    for account in &profile.accounts {
+        let mut line = row().gap(8.0).center_y().child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .child(
+                    text(account.name().to_owned())
+                        .font(k.ty.ui_medium)
+                        .color(k.c.text_base),
+                )
+                .child(
+                    text(account.id.clone())
+                        .font(k.ty.small)
+                        .color(k.c.text_muted),
+                ),
+        );
+        if t.existing.contains(&account.id) {
+            line = line.child(
+                text("Set up already".to_owned())
+                    .font(k.ty.small)
+                    .color(k.c.text_muted),
+            );
+        }
+        accounts = accounts.child(line);
+    }
+    let mut section = col().w_full().gap(10.0).child(accounts);
+    if !t.existing.is_empty() {
+        section = section.child(
+            Switch::new(t.options.replace_accounts)
+                .label("Replace the accounts set up already")
+                .on_toggle(|s: &mut Mail| {
+                    s.transfer.options.replace_accounts = !s.transfer.options.replace_accounts;
+                })
+                .build(k)
+                .key("replace-accounts"),
+        );
+    }
+    let go = Button::new("Import")
+        .variant(ButtonVariant::Contrast)
+        .on_press(Mail::import_profile)
+        .build(k)
+        .key("import-confirm");
+    section
+        .child(
+            Switch::new(t.options.settings)
+                .label("Use its settings")
+                .on_toggle(|s: &mut Mail| {
+                    s.transfer.options.settings = !s.transfer.options.settings;
+                })
+                .build(k)
+                .key("import-settings"),
+        )
+        .child(transfer_actions(t, k, go))
 }
 
 /// The running version, whether updates are checked for, a button to check now, and how the
