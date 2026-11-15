@@ -76,6 +76,21 @@ impl MessageMenu {
     }
 }
 
+/// The menu of a mailbox in the sidebar, opened by right-clicking it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MailboxMenu {
+    pub(crate) mailbox: MailboxKey,
+    /// Where it was right-clicked, which the menu opens at.
+    pub(crate) point: PointerPress,
+}
+
+impl MailboxMenu {
+    pub(crate) fn is(&self, account: &str, mailbox: &str) -> bool {
+        let (a, b) = &self.mailbox;
+        a == account && b == mailbox
+    }
+}
+
 fn is_message(m: &StoredMessage, account: &str, mailbox: &str, uid: u32) -> bool {
     m.account == account && m.mailbox == mailbox && m.envelope.uid == uid
 }
@@ -191,6 +206,8 @@ pub(crate) struct Mail {
     pub(crate) actions_open: bool,
     /// The menu of a message in the list, while it's open.
     pub(crate) message_menu: Option<MessageMenu>,
+    /// The menu of a mailbox in the sidebar, while it's open.
+    pub(crate) mailbox_menu: Option<MailboxMenu>,
     /// A reply asked for before its message was downloaded: the message, and whether to everyone.
     /// It starts once the message opens.
     pending_reply: Option<(MessageKey, bool)>,
@@ -243,6 +260,7 @@ impl Mail {
             compose: ComposeForm::default(),
             actions_open: false,
             message_menu: None,
+            mailbox_menu: None,
             pending_reply: None,
             moving: HashSet::new(),
             collapsed: HashSet::new(),
@@ -499,11 +517,12 @@ impl Mail {
                 mailbox,
                 uid,
                 error,
-            } => {
-                self.search.settle(&account, &mailbox, uid, None);
-                self.notify(format!("{account}: {error}"));
-                self.reload();
-            }
+            } => self.seen_failed(&account, &mailbox, uid, &error),
+            Update::AllSeen {
+                account,
+                mailbox,
+                result,
+            } => self.all_seen(&account, &mailbox, result),
             Update::Moved {
                 account,
                 mailbox,
@@ -543,6 +562,38 @@ impl Mail {
         }
         // Make room for what came, as it's older than everything listed.
         self.list_limit = self.list_limit.max(self.messages.len() + count);
+        self.reload();
+    }
+
+    /// The server refused to mark a message read or unread, which shows as the store says again.
+    fn seen_failed(&mut self, account: &str, mailbox: &str, uid: u32, error: &str) {
+        self.search.settle(account, mailbox, uid, None);
+        self.notify(format!("{account}: {error}"));
+        self.reload();
+    }
+
+    /// The server marked a whole mailbox read, as asked with [`Mail::mark_all_seen`], or refused to.
+    /// Every message below `up_to` was marked; with `None`, the mailbox started over meanwhile, so
+    /// nothing listed was.
+    fn all_seen(&mut self, account: &str, mailbox: &str, result: Result<Option<u32>, String>) {
+        match result {
+            Ok(None) => {}
+            Ok(Some(up_to)) => {
+                self.search.set_mailbox_seen(account, mailbox, up_to);
+                if let Some(reader) = &mut self.reader
+                    && reader.message.account == account
+                    && reader.message.mailbox == mailbox
+                    && reader.message.envelope.uid < up_to
+                {
+                    reader.message.envelope.seen = true;
+                }
+            }
+            Err(error) => {
+                let label = self.label(account).to_owned();
+                let name = self.mailbox_label(account, mailbox);
+                self.notify(format!("{label}: couldn't mark {name} as read: {error}"));
+            }
+        }
         self.reload();
     }
 
@@ -955,6 +1006,31 @@ impl Mail {
     pub(crate) const fn toggle_move_menu(&mut self) {
         if let Some(menu) = &mut self.message_menu {
             menu.move_open = !menu.move_open;
+        }
+    }
+
+    /// Opens the menu of a mailbox in the sidebar at `point`, where it was right-clicked.
+    pub(crate) fn open_mailbox_menu(&mut self, account: &str, mailbox: &str, point: PointerPress) {
+        self.mailbox_menu = Some(MailboxMenu {
+            mailbox: (account.to_owned(), mailbox.to_owned()),
+            point,
+        });
+    }
+
+    pub(crate) fn close_mailbox_menu(&mut self) {
+        self.mailbox_menu = None;
+    }
+
+    /// Marks every message in one of an account's mailboxes read, on the server too. It shows once
+    /// the server agrees.
+    pub(crate) fn mark_all_seen(&mut self, account: &str, mailbox: &str) {
+        let Ok(services) = &self.services else { return };
+        if let Err(e) = services
+            .mailroom
+            .mark_all_seen(&services.store, account, mailbox)
+        {
+            let label = self.label(account).to_owned();
+            self.notify(format!("{label}: couldn't mark the mailbox as read: {e}"));
         }
     }
 

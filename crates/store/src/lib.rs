@@ -593,6 +593,20 @@ impl Store {
         )? > 0)
     }
 
+    /// Marks every cached message in a mailbox with a UID below `up_to` read. Returns how many
+    /// were unread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub fn set_all_seen(&self, account: &str, mailbox: &str, up_to: u32) -> Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE messages SET seen = 1
+             WHERE account = ?1 AND mailbox = ?2 AND uid < ?3 AND NOT seen",
+            params![account, mailbox, up_to],
+        )?)
+    }
+
     /// Drops a cached message, such as one moved to another mailbox. Returns whether it was cached.
     ///
     /// # Errors
@@ -1212,6 +1226,31 @@ mod tests {
             Some(false)
         );
         assert_eq!(store.seen("me@example.com", "INBOX", 2).unwrap(), None);
+    }
+
+    #[test]
+    fn a_whole_mailbox_is_marked_read_up_to_a_uid() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account("me@example.com")).unwrap();
+        let envelopes = [envelope(1, 10), envelope(2, 20), envelope(3, 30)];
+        store
+            .save_messages("me@example.com", "INBOX", Role::Inbox, 1, &envelopes)
+            .unwrap();
+        store.set_seen("me@example.com", "INBOX", 1, true).unwrap();
+        let seen = |uid| store.seen("me@example.com", "INBOX", uid).unwrap();
+
+        assert_eq!(
+            store.set_all_seen("me@example.com", "INBOX", 3).unwrap(),
+            1,
+            "only the unread ones below the UID count"
+        );
+        assert_eq!(seen(1), Some(true));
+        assert_eq!(seen(2), Some(true));
+        assert_eq!(seen(3), Some(false), "arrived after it was marked");
+        assert_eq!(
+            store.unread_counts().unwrap().get("me@example.com"),
+            Some(&1)
+        );
     }
 
     #[test]
