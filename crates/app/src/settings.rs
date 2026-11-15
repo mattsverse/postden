@@ -1,5 +1,5 @@
-//! The app's preferences: its theme, how often mail is checked and whether updates are, kept in
-//! the [`Store`].
+//! The app's preferences: its theme, how often mail is checked, whether the app keeps running
+//! with its window closed and whether updates are checked for, kept in the [`Store`].
 
 use std::time::Duration;
 
@@ -10,6 +10,7 @@ use crate::Result;
 
 const THEME: &str = "theme";
 const POLL_INTERVAL: &str = "poll_interval_secs";
+const KEEP_RUNNING: &str = "keep_running";
 const CHECK_UPDATES: &str = "check_updates";
 const SKIPPED_UPDATE: &str = "skipped_update";
 
@@ -72,6 +73,8 @@ pub struct Settings {
     pub theme: Theme,
     /// How often to check for new mail when the server doesn't push it (IMAP IDLE).
     pub poll_interval: Duration,
+    /// Whether closing the window leaves the app running, to bring back from the tray or Dock.
+    pub keep_running: bool,
     /// Whether to look for a new release on GitHub at start and once a day.
     pub check_updates: bool,
     /// A release the user chose to skip: automatic checks don't announce it, only newer ones.
@@ -83,6 +86,7 @@ impl Default for Settings {
         Self {
             theme: Theme::default(),
             poll_interval: Duration::from_mins(1),
+            keep_running: true,
             check_updates: true,
             skipped_update: None,
         }
@@ -107,6 +111,10 @@ impl Settings {
             .and_then(|s| s.parse().ok())
             .filter(|&secs| secs > 0)
             .map_or(default.poll_interval, Duration::from_secs);
+        let keep_running = store
+            .setting(KEEP_RUNNING)?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default.keep_running);
         let check_updates = store
             .setting(CHECK_UPDATES)?
             .and_then(|s| s.parse().ok())
@@ -115,6 +123,7 @@ impl Settings {
         Ok(Self {
             theme,
             poll_interval,
+            keep_running,
             check_updates,
             skipped_update,
         })
@@ -128,6 +137,7 @@ impl Settings {
     pub fn save(&self, store: &Store) -> Result<()> {
         store.set_setting(THEME, self.theme.key())?;
         store.set_setting(POLL_INTERVAL, &self.poll_interval.as_secs().to_string())?;
+        store.set_setting(KEEP_RUNNING, &self.keep_running.to_string())?;
         store.set_setting(CHECK_UPDATES, &self.check_updates.to_string())?;
         let skipped = self
             .skipped_update
@@ -149,6 +159,7 @@ mod tests {
         let settings = Settings {
             theme: Theme::Dark,
             poll_interval: Duration::from_mins(5),
+            keep_running: false,
             check_updates: false,
             skipped_update: Some("0.2.0".parse().unwrap()),
         };
@@ -161,6 +172,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.set_setting(THEME, "sepia").unwrap();
         store.set_setting(POLL_INTERVAL, "0").unwrap();
+        store.set_setting(KEEP_RUNNING, "sometimes").unwrap();
         store.set_setting(CHECK_UPDATES, "maybe").unwrap();
         store.set_setting(SKIPPED_UPDATE, "").unwrap();
         assert_eq!(Settings::load(&store).unwrap(), Settings::default());

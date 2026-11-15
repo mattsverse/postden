@@ -21,7 +21,11 @@ rune = { workspace = true, features = ["native-file-dialog"] }
 # `markdown` draws HTML mail, converted to Markdown.
 rune-kit = { workspace = true, features = ["markdown"] }
 jiff.workspace = true
+png.workspace = true
 tokio.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
 
 [lints]
 workspace = true
