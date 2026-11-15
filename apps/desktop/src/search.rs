@@ -12,7 +12,7 @@ use rune_kit::search::Fold;
 pub(crate) type MailboxKey = (String, String);
 
 /// A message, by account id, mailbox name and UID.
-type MessageKey = (String, String, u32);
+pub(crate) type MessageKey = (String, String, u32);
 
 /// How the search on the server is going, for the query as it is now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +60,9 @@ pub(crate) struct Search {
     /// new search may bring the message back as it was before the change; and once answered,
     /// kept while a search that may have seen it before then is still out.
     unconfirmed: HashMap<MessageKey, Unconfirmed>,
+    /// Messages moved out of their mailbox while a search was still out, which may bring them
+    /// back as they were before. Kept until every search out came back.
+    moved: HashSet<MessageKey>,
     /// What the server found, cached or not.
     pub(crate) found: Vec<StoredMessage>,
     /// A mailbox had more matches on the server than it sent.
@@ -77,6 +80,7 @@ impl Default for Search {
             searched: HashSet::new(),
             failed: HashSet::new(),
             unconfirmed: HashMap::new(),
+            moved: HashSet::new(),
             found: Vec::new(),
             more: false,
         }
@@ -119,6 +123,7 @@ impl Search {
         self.pending.clear();
         self.searched.clear();
         self.failed.clear();
+        self.moved.clear();
         self.found.clear();
         self.more = false;
     }
@@ -139,8 +144,13 @@ impl Search {
         match result {
             Ok((found, more)) => {
                 self.more |= more;
-                // A message changed before this search came back shows the change still awaited.
-                self.found.extend(found.into_iter().map(|mut m| {
+                // A message changed before this search came back shows the change still awaited,
+                // and one moved away meanwhile isn't there anymore.
+                let moved = &self.moved;
+                let found = found.into_iter().filter(|m| {
+                    !moved.contains(&(m.account.clone(), m.mailbox.clone(), m.envelope.uid))
+                });
+                self.found.extend(found.map(|mut m| {
                     let key = (m.account.clone(), m.mailbox.clone(), m.envelope.uid);
                     if let Some(change) = self.unconfirmed.get(&key) {
                         m.envelope.seen = change.shown;
@@ -157,6 +167,7 @@ impl Search {
             // Every search out came back, so none can still bring a message as it was before a
             // change the server answered.
             drop_answered(&mut self.unconfirmed);
+            self.moved.clear();
         }
         true
     }
@@ -244,6 +255,18 @@ impl Search {
             if m.account == account && m.mailbox == mailbox && m.envelope.uid == uid {
                 m.envelope.seen = confirmed;
             }
+        }
+    }
+
+    /// Drops a message moved out of the mailbox it was found in, now and from what searches
+    /// still out bring back.
+    pub(crate) fn forget_message(&mut self, account: &str, mailbox: &str, uid: u32) {
+        self.found
+            .retain(|m| !(m.account == account && m.mailbox == mailbox && m.envelope.uid == uid));
+        let key = (account.to_owned(), mailbox.to_owned(), uid);
+        self.unconfirmed.remove(&key);
+        if !self.pending.is_empty() {
+            self.moved.insert(key);
         }
     }
 
@@ -432,6 +455,28 @@ mod tests {
         search.settle("a", "INBOX", 1, None);
         search.settle("a", "INBOX", 1, None);
         assert!(seen(&search, 1), "both refused: read, as before");
+    }
+
+    #[test]
+    fn a_message_moved_while_a_search_is_out_stays_gone() {
+        let mut search = Search {
+            asked: Some("invoice".into()),
+            pending: [("a", "INBOX"), ("a", "Receipts")]
+                .map(|(a, m)| (a.to_owned(), m.to_owned()))
+                .into(),
+            ..Search::default()
+        };
+        search.forget_message("a", "INBOX", 1);
+        // Searched before the move, answered after it.
+        let found = vec![stored("a", 1, Some(10)), stored("a", 2, Some(20))];
+        assert!(search.answered("a", "INBOX", Ok((found, false))));
+        let uids: Vec<u32> = search.found.iter().map(|m| m.envelope.uid).collect();
+        assert_eq!(uids, [2], "the moved message isn't brought back");
+        assert!(search.answered("a", "Receipts", Ok((Vec::new(), false))));
+        assert!(
+            search.moved.is_empty(),
+            "forgotten once every search came back"
+        );
     }
 
     #[test]

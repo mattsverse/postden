@@ -7,6 +7,7 @@ use postden_core::account::{Account, Security};
 use postden_core::message::{Address, Mailbox, Role};
 use postden_html::compat::{self, Client, Provider};
 use postden_mail::imap::Status;
+use postden_store::StoredMessage;
 use rune::{
     Block, Color, Cx, El, Icon, Mark, ScrollSpec, TextEdit, TextStyle, Transition, Tx, col, el,
     row, text,
@@ -14,8 +15,8 @@ use rune::{
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow, SplitView, Toolbar};
 use rune_kit::{
     Button, ButtonVariant, Dialog, Divider, IconButton, IconButtonVariant, Kit, Markdown,
-    MarkdownStyle, Menu, MenuItem, Placement, SegmentedControl, Spinner, Switch, TextArea,
-    TextInput, Toast, ToastRegion, glyphs, root,
+    MarkdownStyle, Menu, MenuEntry, MenuItem, Placement, SegmentedControl, Spinner, Switch,
+    TextArea, TextInput, Toast, ToastRegion, context_menu, glyphs, root,
 };
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
@@ -23,7 +24,7 @@ use crate::compose::{ComposeForm, Mode, Preview};
 use crate::form::{AccountForm, SECURITY, Step, security_index};
 use crate::rich::RichEditor;
 use crate::search::{SERVER_PAGE, ServerSearch};
-use crate::state::{INBOX as INBOX_NAME, Mail, Reader, Showing};
+use crate::state::{INBOX as INBOX_NAME, Mail, MessageMenu, Reader, Showing};
 use crate::update::{self, Phase};
 
 static INBOX: Icon = Icon {
@@ -76,6 +77,7 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
     if let Err(error) = &s.services {
         return unavailable(error, &k);
     }
+    let mut layer = Vec::new();
     let main = if s.settings_open && s.account_settings.open {
         account_page(s, &s.account_settings, &k)
     } else if s.settings_open {
@@ -87,11 +89,10 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
     } else if let Some(reader) = &s.reader {
         message(reader, &k)
     } else {
-        inbox(s, &k)
+        inbox(s, &k, &mut layer)
     };
     let mut toolbar = Toolbar::new().title(title(s));
     let mut trailing = row().gap(12.0).center_y();
-    let mut layer = Vec::new();
     if let Some(notice) = &s.notice {
         layer.push(
             ToastRegion::new()
@@ -442,8 +443,8 @@ fn avatar(name: &str, k: &Kit) -> El {
 }
 
 /// The message list, under the search bar once there's an account.
-fn inbox(s: &Mail, k: &Kit) -> El {
-    let list = message_list(s, k);
+fn inbox(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
+    let list = message_list(s, k, layer);
     if s.accounts.is_empty() {
         return list;
     }
@@ -582,7 +583,7 @@ fn empty_list(s: &Mail, k: &Kit) -> El {
     empty
 }
 
-fn message_list(s: &Mail, k: &Kit) -> El {
+fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     if s.shown().next().is_none() {
         return empty_list(s, k);
     }
@@ -596,9 +597,13 @@ fn message_list(s: &Mail, k: &Kit) -> El {
         let e = &m.envelope;
         let strong = if e.seen { k.ty.ui } else { k.ty.ui_medium };
         let (account, mailbox, uid) = (m.account.clone(), m.mailbox.clone(), e.uid);
+        let (menu_account, menu_mailbox) = (account.clone(), mailbox.clone());
         let mut line = row()
             .key(format!("msg-{}-{}-{}", m.account, m.mailbox, e.uid))
             .on_press(move |s: &mut Mail| s.open_message(&account, &mailbox, uid))
+            .on_secondary_press(move |s: &mut Mail, point, _| {
+                s.open_message_menu(&menu_account, &menu_mailbox, uid, point);
+            })
             .w_full()
             .h(40.0)
             .px(20.0)
@@ -643,15 +648,19 @@ fn message_list(s: &Mail, k: &Kit) -> El {
                     .w(140.0),
             );
         }
-        list = list.child(
-            line.child(
-                row().w(64.0).justify_end().child(
-                    text(postden_app::format_date(e.date, &now))
-                        .font(k.ty.small)
-                        .color(k.c.text_muted),
-                ),
+        let line = line.child(
+            row().w(64.0).justify_end().child(
+                text(postden_app::format_date(e.date, &now))
+                    .font(k.ty.small)
+                    .color(k.c.text_muted),
             ),
         );
+        list = list.child(match &s.message_menu {
+            Some(menu) if menu.is(&m.account, &m.mailbox, e.uid) => {
+                message_menu(s, m, menu, line, k, layer)
+            }
+            _ => line,
+        });
     }
     if s.has_older() {
         list = list.child(older(s, k));
@@ -664,6 +673,91 @@ fn message_list(s: &Mail, k: &Kit) -> El {
     })
     .grow(1.0)
     .min_h(0.0)
+}
+
+/// A message's menu, open at where it was right-clicked: marking it read or unread, replying,
+/// and moving it to another of its account's mailboxes.
+fn message_menu(
+    s: &Mail,
+    m: &StoredMessage,
+    menu: &MessageMenu,
+    line: El,
+    k: &Kit,
+    layer: &mut Vec<El>,
+) -> El {
+    let (account, mailbox, uid) = (m.account.as_str(), m.mailbox.as_str(), m.envelope.uid);
+    // What each item does to this message, closing the menu first.
+    let act = |f: fn(&mut Mail, &str, &str, u32)| {
+        let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
+        move |s: &mut Mail| {
+            s.close_message_menu();
+            f(s, &account, &mailbox, uid);
+        }
+    };
+    let move_to = |to: &str| {
+        let (account, mailbox, to) = (account.to_owned(), mailbox.to_owned(), to.to_owned());
+        move |s: &mut Mail| {
+            s.close_message_menu();
+            s.move_message(&account, &mailbox, uid, &to);
+        }
+    };
+    let seen = m.envelope.seen;
+    let mut items = context_menu(
+        format!("message-{account}-{mailbox}-{uid}"),
+        line,
+        Some(menu.point),
+    )
+    .min_width(200.0)
+    .on_close(Mail::close_message_menu)
+    .item(
+        MenuItem::new(if seen {
+            "Mark as unread"
+        } else {
+            "Mark as read"
+        })
+        .on_select(act(if seen {
+            |s, a, b, uid| s.set_seen(a, b, uid, false)
+        } else {
+            |s, a, b, uid| s.set_seen(a, b, uid, true)
+        })),
+    )
+    .separator()
+    .item(MenuItem::new("Reply").on_select(act(|s, a, b, uid| s.reply_to(a, b, uid, false))))
+    .item(MenuItem::new("Reply all").on_select(act(|s, a, b, uid| s.reply_to(a, b, uid, true))));
+    let elsewhere = |role| {
+        s.mailbox_with_role(account, role)
+            .filter(|b| b.name != mailbox)
+    };
+    let archive = elsewhere(Role::Archive);
+    let destinations: Vec<MenuEntry> = s
+        .mailboxes
+        .get(account)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter(|b| b.name != mailbox)
+        .map(|b| MenuEntry::item(MenuItem::new(b.label()).on_select(move_to(&b.name))))
+        .collect();
+    if archive.is_some() || !destinations.is_empty() {
+        items = items.separator();
+    }
+    if let Some(archive) = archive {
+        items = items.item(MenuItem::new("Archive").on_select(move_to(&archive.name)));
+    }
+    if !destinations.is_empty() {
+        items = items.item(
+            MenuItem::new("Move to")
+                .submenu(destinations, menu.move_open)
+                .on_select(Mail::toggle_move_menu),
+        );
+    }
+    if let Some(trash) = elsewhere(Role::Trash) {
+        items = items.separator().item(
+            MenuItem::new("Delete")
+                .danger(true)
+                .on_select(move_to(&trash.name)),
+        );
+    }
+    items.build(k, layer).w_full()
 }
 
 /// The list's end, which loads older mail as it comes on screen, and spins while it's fetched.

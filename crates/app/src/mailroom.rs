@@ -1,6 +1,6 @@
 //! Watching every account's inbox in the background, refreshing its other mailboxes on a timer,
-//! and saving what arrives; and opening, flagging and sending messages on the same background
-//! runtime.
+//! and saving what arrives; and opening, flagging, moving and sending messages on the same
+//! background runtime.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -11,8 +11,8 @@ use postden_core::account::{Account, Server};
 use postden_core::message::{Body, Envelope, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
-    Event, Found, Older, Status, WatchConfig, fetch_older, open_message, refresh, save_sent_copy,
-    search, set_seen, watch,
+    Event, Found, Older, Status, WatchConfig, fetch_older, move_message, open_message, refresh,
+    save_sent_copy, search, set_seen, watch,
 };
 use postden_mail::{Credentials, smtp};
 use postden_store::Store;
@@ -88,6 +88,18 @@ pub enum Update {
         uid: u32,
         error: String,
     },
+    /// A message asked for with [`Mailroom::move_message`] was moved to the account's mailbox `to`
+    /// and dropped from the store, to be cached in `to` once that mailbox syncs; or it wasn't, and
+    /// the store still holds it where it was. Moved, it says whether `uid` still named it when
+    /// the move was answered: not if `mailbox` started over meanwhile, as its UIDs name other
+    /// messages now.
+    Moved {
+        account: String,
+        mailbox: String,
+        uid: u32,
+        to: String,
+        result: Result<bool, String>,
+    },
     /// A message handed to [`Mailroom::send`] was accepted by the account's SMTP server, or wasn't.
     /// On success, it's the `Message-ID` it was sent with.
     Sent {
@@ -115,6 +127,7 @@ enum Job {
         seen: bool,
         result: Result<(), String>,
     },
+    Moved(Moving, Result<(), String>),
     Sent {
         account: String,
         result: Result<String, String>,
@@ -136,6 +149,17 @@ enum Job {
         uid_validity: u32,
         result: Result<Found, String>,
     },
+}
+
+/// A message being moved, as asked of [`Mailroom::move_message`].
+#[derive(Debug)]
+struct Moving {
+    account: String,
+    mailbox: String,
+    /// The mailbox's UIDVALIDITY the move was made under.
+    uid_validity: u32,
+    uid: u32,
+    to: String,
 }
 
 impl From<Event> for Job {
@@ -363,6 +387,44 @@ impl Mailroom {
                 seen,
                 result,
             });
+        });
+        Ok(())
+    }
+
+    /// Moves a message to the account's mailbox `to` in the background, then syncs the mailboxes so
+    /// it's listed there. The result arrives as [`Update::Moved`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Mailroom::open`].
+    pub fn move_message(
+        &self,
+        store: &Store,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        to: &str,
+    ) -> Result<()> {
+        let (server, credentials, uid_validity) = self.target(store, account, mailbox)?;
+        let nudge = Arc::clone(&self.watched(account)?.nudge);
+        let (account, mailbox, to) = (account.to_owned(), mailbox.to_owned(), to.to_owned());
+        let jobs = self.jobs.clone();
+        self.handle.spawn(async move {
+            let result = move_message(&server, &credentials, &mailbox, uid_validity, uid, &to)
+                .await
+                .map_err(|e| e.to_string());
+            // The inbox's watcher sees mail moved there on its own; the refresher syncs the rest.
+            if result.is_ok() {
+                nudge.notify_one();
+            }
+            let moving = Moving {
+                account,
+                mailbox,
+                uid_validity,
+                uid,
+                to,
+            };
+            let _ignored = jobs.send(Job::Moved(moving, result));
         });
         Ok(())
     }
@@ -601,6 +663,7 @@ fn save(store: &mut Store, job: Job) -> Vec<Update> {
                 },
             }]
         }
+        Job::Moved(moving, result) => vec![moved(store, moving, result)],
         Job::Sent { account, result } => vec![Update::Sent { account, result }],
         Job::CopyFailed { account, error } => vec![Update::CopyFailed { account, error }],
         Job::Older {
@@ -616,6 +679,39 @@ fn save(store: &mut Store, job: Job) -> Vec<Update> {
             uid_validity,
             result,
         } => vec![searched(store, id, account, mailbox, uid_validity, result)],
+    }
+}
+
+/// A message was moved on the server, or wasn't: once it was, it leaves the store. If its
+/// mailbox started over since the move was made, its UIDs name other messages and it was
+/// refetched without this one, so nothing is dropped.
+fn moved(store: &mut Store, moving: Moving, result: Result<(), String>) -> Update {
+    let Moving {
+        account,
+        mailbox,
+        uid_validity,
+        uid,
+        to,
+    } = moving;
+    let result = result.and_then(|()| {
+        let current = store
+            .mailbox_state(&account, &mailbox)
+            .map_err(|e| e.to_string())?
+            .map(|s| s.uid_validity);
+        if current != Some(uid_validity) {
+            return Ok(false);
+        }
+        store
+            .remove_message(&account, &mailbox, uid)
+            .map(|_| true)
+            .map_err(|e| e.to_string())
+    });
+    Update::Moved {
+        account,
+        mailbox,
+        uid,
+        to,
+        result,
     }
 }
 
@@ -951,5 +1047,56 @@ mod tests {
             [Update::Seen { seen: false, .. }]
         ));
         assert!(!seen(&store));
+    }
+
+    #[test]
+    fn a_moved_message_leaves_the_store_only_once_the_server_moved_it() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        save(&mut store, messages(1, &[1]));
+        let job = |result| {
+            let moving = Moving {
+                account: "me@example.com".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                uid: 1,
+                to: "Archive".into(),
+            };
+            Job::Moved(moving, result)
+        };
+        let cached = |store: &Store| store.recent_messages(Role::Inbox, 10).unwrap().len();
+
+        let failed = save(&mut store, job(Err("offline".into())));
+        assert!(
+            matches!(failed.as_slice(), [Update::Moved { result: Err(_), .. }]),
+            "got {failed:?}"
+        );
+        assert_eq!(cached(&store), 1, "still where it was");
+        let moved = save(&mut store, job(Ok(())));
+        assert!(
+            matches!(
+                moved.as_slice(),
+                [Update::Moved { to, result: Ok(true), .. }] if to == "Archive"
+            ),
+            "got {moved:?}"
+        );
+        assert_eq!(cached(&store), 0);
+
+        // The mailbox started over before the move was answered: UID 1 is another message now.
+        save(&mut store, messages(2, &[1]));
+        let stale = save(&mut store, job(Ok(())));
+        assert!(
+            matches!(
+                stale.as_slice(),
+                [Update::Moved {
+                    result: Ok(false),
+                    ..
+                }]
+            ),
+            "it went through, but UID 1 no longer names it: {stale:?}"
+        );
+        assert_eq!(cached(&store), 1, "the message now at UID 1 stays");
+        save(&mut store, messages(2, &[1]));
+        assert_eq!(cached(&store), 1, "and later syncs don't skip it");
     }
 }
