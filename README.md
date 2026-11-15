@@ -8,6 +8,7 @@
 - google oauth: connect your gmail account
 - search: as you type, through the subject, sender and recipients of the mail on your device, in the mailbox shown or every inbox; press Return to search the server too, which finds older mail and words in message text
 - html mail: read it safely (no remote images, no scripts) and write it in a visual editor or as source, with a score for how well Gmail, Outlook, Apple Mail, Yahoo and Thunderbird support the markup
+- export: save any message as an `.eml` file, every header, part and attachment as the server holds it
 - optional ai email classification
 - optional ai autoreplier
 

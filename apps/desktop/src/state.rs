@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use jiff::Zoned;
 use postden_app::{
-    Draft, Login, Mailroom, Passwords, Settings, Theme, Update, check_logins,
+    Draft, Login, Mailroom, Passwords, Settings, Theme, Update, check_logins, eml_file_name,
     finish_google_sign_in, password_key, remove_account, save_account, signature,
     smtp_password_key, start_google_sign_in,
 };
@@ -484,12 +484,7 @@ impl Mail {
                 };
                 self.inbox_mail(target, count, first_sync, &unread);
             }
-            Update::CopyFailed { account, error } => {
-                let label = self.label(&account).to_owned();
-                self.notify(format!(
-                    "{label}: sent, but couldn't file it in Sent: {error}"
-                ));
-            }
+            Update::CopyFailed { account, error } => self.copy_failed(&account, &error),
             Update::SaveFailed { account, error } => {
                 self.notify(format!("{account}: couldn't save new mail: {error}"));
             }
@@ -544,6 +539,11 @@ impl Mail {
                 to,
                 result,
             } => self.moved(&account, &mailbox, uid, &to, result),
+            Update::Exported {
+                account,
+                path,
+                result,
+            } => self.exported(&account, &path, result),
             Update::Sent { account, result } => self.sent(&account, result),
             Update::Searched {
                 id,
@@ -908,6 +908,13 @@ impl Mail {
         }
     }
 
+    fn copy_failed(&mut self, account: &str, error: &str) {
+        let label = self.label(account).to_owned();
+        self.notify(format!(
+            "{label}: sent, but couldn't file it in Sent: {error}"
+        ));
+    }
+
     pub(crate) fn discard(&mut self) {
         if self.compose.is_sending() {
             self.notify("Still sending; you'll be told how it went".into());
@@ -974,6 +981,51 @@ impl Mail {
     pub(crate) fn close_reader(&mut self) {
         self.reader = None;
         self.pending_reply = None;
+    }
+
+    /// Asks where to save a message as an `.eml` file, offering a name made of its subject, then
+    /// downloads it there. It stays read or unread, as it was.
+    pub(crate) fn export_message(tx: &mut Tx, message: &StoredMessage) {
+        let options = FileDialogOptions {
+            title: "Export the message".into(),
+            file_name: Some(eml_file_name(message.envelope.subject.as_deref())),
+            ..FileDialogOptions::default()
+        }
+        .filter("Email message", &["eml"]);
+        let (account, mailbox, uid) = (
+            message.account.clone(),
+            message.mailbox.clone(),
+            message.envelope.uid,
+        );
+        tx.save_file(options, move |s: &mut Self, result, _| match result {
+            Ok(Some(path)) => s.export_to(&account, &mailbox, uid, path),
+            Ok(None) => {}
+            Err(e) => s.notify(format!("Couldn't open the file picker: {e}")),
+        });
+    }
+
+    /// Downloads a message and saves it to `path` as an `.eml` file. A notice says how it went.
+    fn export_to(&mut self, account: &str, mailbox: &str, uid: u32, path: PathBuf) {
+        let Ok(services) = &self.services else { return };
+        if let Err(e) = services
+            .mailroom
+            .export(&services.store, account, mailbox, uid, path)
+        {
+            let label = self.label(account).to_owned();
+            self.notify(format!("{label}: couldn't export the message: {e}"));
+        }
+    }
+
+    fn exported(&mut self, account: &str, path: &std::path::Path, result: Result<(), String>) {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let label = self.label(account).to_owned();
+        self.notify(match result {
+            Ok(()) => format!("Exported {name}"),
+            Err(e) => format!("{label}: couldn't export {name}: {e}"),
+        });
     }
 
     /// Flips the open message between read and unread.

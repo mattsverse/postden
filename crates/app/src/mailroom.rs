@@ -1,9 +1,10 @@
 //! Watching every account's inbox in the background, refreshing its other mailboxes on a timer,
 //! and saving what arrives; downloading the inbox's newest messages ahead of their opening, when
-//! asked to; and opening, flagging, moving and sending messages on the same background runtime.
+//! asked to; and opening, exporting, flagging, moving and sending messages on the same background
+//! runtime.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -12,8 +13,9 @@ use postden_core::account::{Account, Server};
 use postden_core::message::{Body, Envelope, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
-    Event, Found, Older, Prefetched, Status, WatchConfig, fetch_older, mark_all_seen, move_message,
-    open_message, prefetch_messages, refresh, save_sent_copy, search, set_seen, watch,
+    Event, Found, Older, Prefetched, Status, WatchConfig, download_message, fetch_older,
+    mark_all_seen, move_message, open_message, prefetch_messages, refresh, save_sent_copy, search,
+    set_seen, watch,
 };
 use postden_mail::{Credentials, smtp};
 use postden_store::Store;
@@ -89,6 +91,13 @@ pub enum Update {
         mailbox: String,
         uid: u32,
         body: Result<Body, String>,
+    },
+    /// A message asked for with [`Mailroom::export`] was saved to `path` as an `.eml` file, or
+    /// couldn't be.
+    Exported {
+        account: String,
+        path: PathBuf,
+        result: Result<(), String>,
     },
     /// A message was marked read or unread, on the server and in the store.
     Seen {
@@ -191,14 +200,9 @@ enum Job {
         result: Result<u32, String>,
     },
     Moved(Moving, Result<(), String>),
-    Sent {
-        account: String,
-        result: Result<String, String>,
-    },
-    CopyFailed {
-        account: String,
-        error: String,
-    },
+    /// Work with nothing to save, such as sending or exporting a message: its update goes to the
+    /// UI as it is, in turn with the others.
+    Done(Update),
     Older {
         account: String,
         mailbox: String,
@@ -505,6 +509,45 @@ impl Mailroom {
         Ok(None)
     }
 
+    /// Downloads a message whole in the background and writes it to `path` as an `.eml` file,
+    /// replacing what's there. It stays read or unread, as it was. The result arrives as
+    /// [`Update::Exported`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Mailroom::open`].
+    pub fn export(
+        &self,
+        store: &Store,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        path: PathBuf,
+    ) -> Result<()> {
+        let (server, credentials, uid_validity) = self.target(store, account, mailbox)?;
+        let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
+        let jobs = self.jobs.clone();
+        self.handle.spawn(async move {
+            let result =
+                match download_message(&server, &credentials, &mailbox, uid_validity, uid).await {
+                    Ok(raw) => {
+                        let to = path.clone();
+                        tokio::task::spawn_blocking(move || std::fs::write(to, raw))
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|written| written.map_err(|e| e.to_string()))
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+            let _ignored = jobs.send(Job::Done(Update::Exported {
+                account,
+                path,
+                result,
+            }));
+        });
+        Ok(())
+    }
+
     /// Marks a message read or unread in the background. The result arrives as [`Update::Seen`] or
     /// [`Update::SeenFailed`].
     ///
@@ -691,25 +734,25 @@ impl Mailroom {
             let sent = match smtp::send(&smtp, &smtp_credentials, &message).await {
                 Ok(sent) => sent,
                 Err(e) => {
-                    let _ignored = jobs.send(Job::Sent {
+                    let _ignored = jobs.send(Job::Done(Update::Sent {
                         account,
                         result: Err(e.to_string()),
-                    });
+                    }));
                     return;
                 }
             };
-            let _ignored = jobs.send(Job::Sent {
+            let _ignored = jobs.send(Job::Done(Update::Sent {
                 account: account.clone(),
                 result: Ok(sent.message_id.clone()),
-            });
+            }));
             match save_sent_copy(&imap, &credentials, &sent.message_id, &sent.copy).await {
                 // Fetch it from Sent now, so it's listed there right away.
                 Ok(()) => nudge.notify_one(),
                 Err(e) => {
-                    let _ignored = jobs.send(Job::CopyFailed {
+                    let _ignored = jobs.send(Job::Done(Update::CopyFailed {
                         account,
                         error: e.to_string(),
-                    });
+                    }));
                 }
             }
         });
@@ -1031,8 +1074,7 @@ fn save(store: &mut Store, job: Job) -> Vec<Update> {
             result,
         } => vec![all_seen(store, account, mailbox, uid_validity, result)],
         Job::Moved(moving, result) => vec![moved(store, moving, result)],
-        Job::Sent { account, result } => vec![Update::Sent { account, result }],
-        Job::CopyFailed { account, error } => vec![Update::CopyFailed { account, error }],
+        Job::Done(update) => vec![update],
         Job::Older {
             account,
             mailbox,

@@ -1,4 +1,5 @@
-//! Opening one message, setting whether it's been read, and moving it to another mailbox.
+//! Opening one message, downloading it whole, setting whether it's been read, and moving it to
+//! another mailbox.
 //!
 //! Each call opens a connection of its own, so it never waits behind a watcher's IDLE.
 
@@ -30,25 +31,36 @@ pub async fn open_message(
     let result = async {
         select(&mut session, mailbox, uid_validity).await?;
         // PEEK, then an explicit STORE: a plain BODY[] marks the message read only on some servers.
-        let fetches: Vec<_> = with_timeout(async {
-            session
-                .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
-                .await?
-                .try_collect()
-                .await
-        })
-        .await?;
-        let raw = fetches
-            .iter()
-            .find(|f| f.uid == Some(uid))
-            .and_then(|f| f.body())
-            .ok_or(Error::MessageGone)?;
-        let body = parse_body(raw);
+        let body = parse_body(&fetch_raw(&mut session, uid).await?);
         store_seen(&mut session, uid, true).await?;
         Ok(body)
     }
     .await;
     // The work is done or failed already; a failed goodbye doesn't change that.
+    let _ignored = session.logout().await;
+    result
+}
+
+/// Downloads message `uid` from `mailbox` as the server holds it, every header and part, as
+/// RFC 5322 bytes: what an `.eml` file holds. It's left read or unread, as it was. See
+/// [`open_message`] for `uid_validity`.
+///
+/// # Errors
+///
+/// Returns an error when the connection fails, the mailbox changed, or the message is gone.
+pub async fn download_message(
+    server: &Server,
+    credentials: &Credentials,
+    mailbox: &str,
+    uid_validity: u32,
+    uid: u32,
+) -> Result<Vec<u8>> {
+    let mut session = connect(server, credentials).await?;
+    let result = async {
+        select(&mut session, mailbox, uid_validity).await?;
+        fetch_raw(&mut session, uid).await
+    }
+    .await;
     let _ignored = session.logout().await;
     result
 }
@@ -134,6 +146,24 @@ fn uid_set(uids: &[u32]) -> String {
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Fetches message `uid` of the selected mailbox whole, without marking it read.
+async fn fetch_raw(session: &mut Session, uid: u32) -> Result<Vec<u8>> {
+    let fetches: Vec<_> = with_timeout(async {
+        session
+            .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
+            .await?
+            .try_collect()
+            .await
+    })
+    .await?;
+    fetches
+        .iter()
+        .find(|f| f.uid == Some(uid))
+        .and_then(|f| f.body())
+        .map(<[u8]>::to_vec)
+        .ok_or(Error::MessageGone)
 }
 
 /// Marks message `uid` in `mailbox` read or unread. See [`open_message`] for `uid_validity`.

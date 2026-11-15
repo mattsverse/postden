@@ -217,6 +217,14 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
                         s.actions_open = false;
                         s.toggle_seen();
                     }),
+            )
+            .item(
+                MenuItem::new("Export as .eml…").on_select_tx(|s: &mut Mail, tx| {
+                    s.actions_open = false;
+                    if let Some(reader) = &s.reader {
+                        Mail::export_message(tx, &reader.message);
+                    }
+                }),
             );
     }
     menu.build(k, layer)
@@ -724,7 +732,7 @@ fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
 }
 
 /// A message's menu, open at where it was right-clicked: marking it read or unread, replying,
-/// and moving it to another of its account's mailboxes.
+/// exporting it as an `.eml` file, and moving it to another of its account's mailboxes.
 fn message_menu(
     s: &Mail,
     m: &StoredMessage,
@@ -771,7 +779,15 @@ fn message_menu(
     )
     .separator()
     .item(MenuItem::new("Reply").on_select(act(|s, a, b, uid| s.reply_to(a, b, uid, false))))
-    .item(MenuItem::new("Reply all").on_select(act(|s, a, b, uid| s.reply_to(a, b, uid, true))));
+    .item(MenuItem::new("Reply all").on_select(act(|s, a, b, uid| s.reply_to(a, b, uid, true))))
+    .separator()
+    .item(MenuItem::new("Export as .eml…").on_select_tx({
+        let message = m.clone();
+        move |s: &mut Mail, tx| {
+            s.close_message_menu();
+            Mail::export_message(tx, &message);
+        }
+    }));
     let elsewhere = |role| {
         s.mailbox_with_role(account, role)
             .filter(|b| b.name != mailbox)

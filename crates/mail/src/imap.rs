@@ -1,5 +1,6 @@
 //! IMAP: connecting, fetching message headers, watching the inbox for new mail, refreshing the
-//! other mailboxes on a timer, opening, flagging and moving single messages, and filing sent mail.
+//! other mailboxes on a timer, opening, downloading, flagging and moving single messages, and
+//! filing sent mail.
 //!
 //! Messages can be downloaded ahead of their opening, so they open without waiting.
 //! Mail older than what a sync fetched is fetched on demand, as the list is scrolled to its end.
@@ -17,7 +18,8 @@ mod watch;
 
 pub use connection::{Session, check_login, connect};
 pub use message::{
-    Prefetched, mark_all_seen, move_message, open_message, prefetch_messages, set_seen,
+    Prefetched, download_message, mark_all_seen, move_message, open_message, prefetch_messages,
+    set_seen,
 };
 pub use older::{Older, fetch_older};
 pub use refresh::refresh;
