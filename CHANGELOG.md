@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/mattsverse/postden/compare/v0.1.0...v0.2.0) (2026-11-15)
+
+
+### Features
+
+* search mail locally and on the server ([0222bf1](https://github.com/mattsverse/postden/commit/0222bf194bd37ec9d43b8855ca1014c156ec8423))
+
 ## 0.1.0 (2026-11-15)
 
 
