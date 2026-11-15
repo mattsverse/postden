@@ -28,12 +28,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # `os` names the check; `runner` is the Blacksmith label.
-        include:
-          - { os: ubuntu-26.04, runner: blacksmith-4vcpu-ubuntu-2604 }
-          - { os: macos-15, runner: blacksmith-6vcpu-macos-15 }
-          - { os: windows-2025, runner: blacksmith-4vcpu-windows-2025 }
-    runs-on: ${{ matrix.runner }}
+        os: [ubuntu-26.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

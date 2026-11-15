@@ -34,7 +34,7 @@ defaults:
 
 jobs:
   formula:
-    runs-on: blacksmith-2vcpu-ubuntu-2604
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - name: Require tap credentials
