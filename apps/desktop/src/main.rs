@@ -2,12 +2,13 @@
 //!
 //! One window: accounts and their connection status on the left, every inbox's mail on the right,
 //! updated as it arrives. Accounts are added, and mail written, from forms in the window.
-//! Closing the window keeps the app running in the tray (the Dock on macOS), and the app's icon
-//! shows how much mail is unread.
+//! Closing the window keeps the app running in the tray (the Dock on macOS), the app's icon
+//! shows how much mail is unread, and new mail is announced with a system notification.
 
 mod account_settings;
 mod compose;
 mod form;
+mod notifications;
 mod rich;
 mod search;
 mod state;
@@ -35,6 +36,10 @@ fn main() {
     if !headless && !rune::single_instance(APP_ID) {
         return;
     }
+    #[cfg(target_os = "windows")]
+    if !headless {
+        notifications::register();
+    }
     // Content runs under a transparent titlebar; the traffic lights sit centred on the toolbar,
     // which the shell frames 8 points down (as rune-kit's shell example sets it up).
     let chrome = Chrome {
@@ -52,6 +57,7 @@ fn main() {
     // the tray icon, or the Dock icon on macOS, brings it back.
     .keep_running()
     .on_close(Mail::window_closed)
+    .on_focus(Mail::focus_changed)
     .on_reopen(on_reopen);
     let handle = app.handle();
     let window = handle.clone();
@@ -62,6 +68,7 @@ fn main() {
     .init(move || {
         if !headless {
             tray::spawn(handle.clone());
+            notifications::listen(handle.clone());
         }
         Mail::start(handle)
     })

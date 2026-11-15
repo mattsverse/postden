@@ -1544,6 +1544,19 @@ fn settings(s: &Mail, k: &Kit) -> El {
         ))
         .child(setting_section(
             k,
+            "Notifications",
+            Some(
+                "Postden tells you about new mail in your inboxes while its window isn't in \
+                 front: who sent it and its subject, or how many messages came.",
+            ),
+            Switch::new(s.settings.notify_new_mail)
+                .label("Notify me of new mail")
+                .on_toggle(|s: &mut Mail| s.set_notify_new_mail(!s.settings.notify_new_mail))
+                .build(k)
+                .key("notify-new-mail"),
+        ))
+        .child(setting_section(
+            k,
             "Closing the window",
             Some(CLOSING_ABOUT),
             Switch::new(s.settings.keep_running)

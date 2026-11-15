@@ -10,6 +10,7 @@
 //! - [`signature`]: what each account adds below the mail it sends, images included.
 //! - [`Settings`]: the app's preferences, such as its [`Theme`] and whether to check for updates.
 //! - [`format_date`] and [`recipients`]: dates and recipients as a mail list shows them.
+//! - [`mail_notice`] and [`new_mail_alert`]: what to tell the user when mail arrives.
 
 mod accounts;
 mod compose;
@@ -28,6 +29,7 @@ pub use compose::{Draft, Quote};
 pub use google::{finish_google_sign_in, google_account, start_google_sign_in};
 use jiff::{Timestamp, Zoned};
 pub use mailroom::{Mailroom, Update};
+use postden_core::message::Envelope;
 use postden_secrets::Backend;
 pub use settings::{POLL_INTERVALS, Settings, Theme};
 
@@ -102,6 +104,49 @@ pub fn mail_notice(label: &str, count: usize, first_sync: bool, now: &Zoned) -> 
     }
 }
 
+/// A system notification's title and body for mail that arrived unread in the account `label`.
+///
+/// One message shows its sender and subject; several, how many came and from whom. `None` when
+/// nothing did.
+#[must_use]
+pub fn new_mail_alert(label: &str, unread: &[Envelope]) -> Option<(String, String)> {
+    match unread {
+        [] => None,
+        [only] => {
+            let from = only.from.label();
+            let title = if from.is_empty() {
+                "Unknown sender"
+            } else {
+                from
+            };
+            let subject = only.subject.as_deref().map(str::trim).unwrap_or_default();
+            let body = if subject.is_empty() {
+                "(no subject)"
+            } else {
+                subject
+            };
+            Some((title.to_owned(), body.to_owned()))
+        }
+        several => {
+            let mut senders: Vec<&str> = Vec::new();
+            for m in several {
+                let from = m.from.label();
+                if !from.is_empty() && !senders.contains(&from) {
+                    senders.push(from);
+                }
+            }
+            let title = format!("{} new messages in {label}", several.len());
+            let body = match senders.as_slice() {
+                [] => String::new(),
+                [one] => format!("From {one}"),
+                [one, two] => format!("From {one} and {two}"),
+                [one, two, rest @ ..] => format!("From {one}, {two} and {} more", rest.len()),
+            };
+            Some((title, body))
+        }
+    }
+}
+
 /// Who a message went to, short enough for a mail list: the first recipient, and how many more.
 #[must_use]
 pub fn recipients(to: &[postden_core::message::Address]) -> String {
@@ -149,6 +194,54 @@ mod tests {
         assert_eq!(
             mail_notice("Me", 2, false, &now),
             "Me: 2 new messages at 09:30"
+        );
+    }
+
+    #[test]
+    fn alerts_name_one_message_or_sum_up_several() {
+        use postden_core::message::Address;
+        let from = |name: Option<&str>, subject: Option<&str>| Envelope {
+            uid: 1,
+            message_id: None,
+            from: Address {
+                name: name.map(str::to_owned),
+                email: None,
+            },
+            to: Vec::new(),
+            subject: subject.map(str::to_owned),
+            date: None,
+            seen: false,
+        };
+        let alert = |unread: &[Envelope]| new_mail_alert("Work", unread);
+        let pair = |title: &str, body: &str| Some((title.to_owned(), body.to_owned()));
+        assert_eq!(alert(&[]), None);
+        assert_eq!(
+            alert(&[from(Some("Ada"), Some(" Lunch? "))]),
+            pair("Ada", "Lunch?")
+        );
+        assert_eq!(
+            alert(&[from(None, None)]),
+            pair("Unknown sender", "(no subject)")
+        );
+        assert_eq!(
+            alert(&[from(Some("Ada"), None), from(Some("Ada"), None)]),
+            pair("2 new messages in Work", "From Ada")
+        );
+        assert_eq!(
+            alert(&[
+                from(Some("Ada"), None),
+                from(None, None),
+                from(Some("Bob"), None)
+            ]),
+            pair("3 new messages in Work", "From Ada and Bob")
+        );
+        let many: Vec<_> = ["Ada", "Bob", "Cy", "Di"]
+            .into_iter()
+            .map(|n| from(Some(n), None))
+            .collect();
+        assert_eq!(
+            alert(&many),
+            pair("4 new messages in Work", "From Ada, Bob and 2 more")
         );
     }
 
