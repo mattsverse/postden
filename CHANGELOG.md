@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.5.0](https://github.com/mattsverse/postden/compare/v0.4.0...v0.5.0) (2026-11-16)
+
+
+### Features
+
+* download the newest inbox messages ahead of opening them ([896cef5](https://github.com/mattsverse/postden/commit/896cef565fc9acfd39f570707a7047f815170dcd))
+* export a message as an .eml file ([62234c4](https://github.com/mattsverse/postden/commit/62234c4ece646677004ba11c22eedfe1fb4e861f))
+* move accounts and settings to another computer with a passphrase-locked file ([69d73f1](https://github.com/mattsverse/postden/commit/69d73f153104ad3314c8b093af4f21b9b769b42e))
+* send accounts and settings straight to another computer with a short code ([80c58ea](https://github.com/mattsverse/postden/commit/80c58ea8bbfebdfbc8fa2a5fac033c934982d62c))
+* show when marking a mailbox read is running and when it finishes ([b6362e5](https://github.com/mattsverse/postden/commit/b6362e575ae5c92c7b2d701dbd0df008895f3477))
+
 ## [0.4.0](https://github.com/mattsverse/postden/compare/v0.3.0...v0.4.0) (2026-11-15)
 
 
