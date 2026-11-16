@@ -9,16 +9,22 @@
 //!   messages ahead when asked to, and sending mail.
 //! - [`Draft`]: a message being written, blank or as a reply.
 //! - [`signature`]: what each account adds below the mail it sends, images included.
+//! - [`Profile`]: every account and setting in one passphrase-locked file, to move Postden to
+//!   another computer.
 //! - [`Settings`]: the app's preferences, such as its [`Theme`] and whether to check for updates.
 //! - [`format_date`] and [`recipients`]: dates and recipients as a mail list shows them.
+//! - [`eml_file_name`]: what to call a message exported as an `.eml` file.
 //! - [`mail_notice`] and [`new_mail_alert`]: what to tell the user when mail arrives.
 
 mod accounts;
 mod compose;
 mod google;
 mod mailroom;
+mod profile;
 mod settings;
 pub mod signature;
+#[cfg(test)]
+mod testing;
 
 use std::path::PathBuf;
 
@@ -32,6 +38,9 @@ use jiff::{Timestamp, Zoned};
 pub use mailroom::{Mailroom, Update};
 use postden_core::message::Envelope;
 use postden_secrets::Backend;
+pub use profile::{
+    ImportOptions, Imported, MIN_PASSPHRASE, Profile, ProfileAccount, ProfileSettings, is_sealed,
+};
 pub use settings::{POLL_INTERVALS, PREFETCH_COUNTS, Settings, Theme};
 
 /// Why a Postden operation failed, phrased for the user.
@@ -52,6 +61,8 @@ pub enum Error {
     NoPassword(String),
     #[error("{0} isn't signed in to Google; sign in with Google again")]
     NotSignedIn(String),
+    #[error("that's not the passphrase this profile was exported with")]
+    WrongPassphrase,
     #[error("{0}")]
     Invalid(String),
 }
@@ -146,6 +157,65 @@ pub fn new_mail_alert(label: &str, unread: &[Envelope]) -> Option<(String, Strin
             Some((title, body))
         }
     }
+}
+
+/// What to call a message exported as an `.eml` file: its subject, or "message" without one.
+///
+/// What file systems refuse in a name is left out, and the subject is cut to 80 characters and
+/// 120 bytes, well within the 255 bytes a name may take.
+#[must_use]
+pub fn eml_file_name(subject: Option<&str>) -> String {
+    const MAX_CHARS: usize = 80;
+    const MAX_BYTES: usize = 120;
+    let cleaned: String = subject
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let words = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    // A leading dot hides the file; a trailing one is dropped on Windows.
+    let mut name = String::new();
+    for c in words.trim_matches('.').trim().chars().take(MAX_CHARS) {
+        if name.len() + c.len_utf8() > MAX_BYTES {
+            break;
+        }
+        name.push(c);
+    }
+    let name = name.trim_end_matches(['.', ' ']);
+    if name.is_empty() {
+        "message.eml".to_owned()
+    } else if is_windows_device(name) {
+        format!("_{name}.eml")
+    } else {
+        format!("{name}.eml")
+    }
+}
+
+/// Whether Windows takes a file named `name` for a device, such as `CON` or `nul.txt`: it goes
+/// by what's before the first dot, whatever the case.
+fn is_windows_device(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default().trim_end();
+    let numbered = |prefix: &str| {
+        stem.get(..3)
+            .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+            && stem.get(3..).is_some_and(|n| {
+                matches!(
+                    n,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+    };
+    ["CON", "PRN", "AUX", "NUL"]
+        .iter()
+        .any(|d| stem.eq_ignore_ascii_case(d))
+        || numbered("COM")
+        || numbered("LPT")
 }
 
 /// Who a message went to, short enough for a mail list: the first recipient, and how many more.
@@ -243,6 +313,44 @@ mod tests {
         assert_eq!(
             alert(&many),
             pair("4 new messages in Work", "From Ada, Bob and 2 more")
+        );
+    }
+
+    #[test]
+    fn exported_mail_is_named_after_its_subject() {
+        assert_eq!(eml_file_name(Some("Lunch?")), "Lunch.eml");
+        assert_eq!(
+            eml_file_name(Some("Re: Q3 / Q4 \"plans\"\r\n  draft")),
+            "Re Q3 Q4 plans draft.eml"
+        );
+        assert_eq!(eml_file_name(Some("..hidden.")), "hidden.eml");
+        assert_eq!(eml_file_name(Some(" ?? ")), "message.eml");
+        assert_eq!(eml_file_name(None), "message.eml");
+        assert_eq!(eml_file_name(Some("CON")), "_CON.eml", "a Windows device");
+        assert_eq!(eml_file_name(Some("nul.txt")), "_nul.txt.eml");
+        assert_eq!(eml_file_name(Some("Com7")), "_Com7.eml");
+        assert_eq!(eml_file_name(Some("LPT²")), "_LPT².eml");
+        assert_eq!(eml_file_name(Some("Console")), "Console.eml");
+        assert_eq!(eml_file_name(Some("COM10")), "COM10.eml");
+        let long = "a".repeat(100);
+        assert_eq!(
+            eml_file_name(Some(&long)),
+            format!("{}.eml", "a".repeat(80)),
+            "80 characters"
+        );
+        let long = "é".repeat(100);
+        assert_eq!(
+            eml_file_name(Some(&long)),
+            format!("{}.eml", "é".repeat(60)),
+            "120 bytes of two-byte characters"
+        );
+        let emoji = "☕🙂".repeat(40);
+        let name = eml_file_name(Some(&emoji));
+        assert!(name.len() <= 124, "{} bytes", name.len());
+        assert_eq!(
+            name,
+            format!("{}.eml", "☕🙂".repeat(17)),
+            "whole characters only"
         );
     }
 

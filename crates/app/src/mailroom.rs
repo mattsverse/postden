@@ -1,9 +1,10 @@
 //! Watching every account's inbox in the background, refreshing its other mailboxes on a timer,
 //! and saving what arrives; downloading the inbox's newest messages ahead of their opening, when
-//! asked to; and opening, flagging, moving and sending messages on the same background runtime.
+//! asked to; and opening, exporting, flagging, moving and sending messages on the same background
+//! runtime.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -12,8 +13,9 @@ use postden_core::account::{Account, Server};
 use postden_core::message::{Body, Envelope, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
-    Event, Found, Older, Prefetched, Status, WatchConfig, fetch_older, mark_all_seen, move_message,
-    open_message, prefetch_messages, refresh, save_sent_copy, search, set_seen, watch,
+    Event, Found, Older, Prefetched, Status, WatchConfig, download_message, fetch_older,
+    mark_all_seen, move_message, open_message, prefetch_messages, refresh, save_sent_copy, search,
+    set_seen, watch,
 };
 use postden_mail::{Credentials, smtp};
 use postden_store::Store;
@@ -89,6 +91,13 @@ pub enum Update {
         mailbox: String,
         uid: u32,
         body: Result<Body, String>,
+    },
+    /// A message asked for with [`Mailroom::export`] was saved to `path` as an `.eml` file, or
+    /// couldn't be.
+    Exported {
+        account: String,
+        path: PathBuf,
+        result: Result<(), String>,
     },
     /// A message was marked read or unread, on the server and in the store.
     Seen {
@@ -168,6 +177,21 @@ fn all_seen(
 #[derive(Debug)]
 enum Job {
     Watched(Event),
+    /// What the watchers of one [`Mailroom::watch`] report, numbered as that watch: saved only
+    /// while it's the account's current one. Work a replaced or stopped watcher queued, before
+    /// it was stopped, is dropped, as it's about mailboxes the account may no longer have.
+    Watching {
+        watch: u64,
+        event: Event,
+    },
+    /// What came of something asked of the server, such as opening or moving a message,
+    /// numbered as the watch whose server it was asked of. Under a watch that's no longer the
+    /// account's current one, it's taken as failed, and nothing of it saved: the account may
+    /// have other mailboxes now.
+    Asked {
+        watch: u64,
+        job: Box<Self>,
+    },
     Opened {
         account: String,
         mailbox: String,
@@ -191,14 +215,9 @@ enum Job {
         result: Result<u32, String>,
     },
     Moved(Moving, Result<(), String>),
-    Sent {
-        account: String,
-        result: Result<String, String>,
-    },
-    CopyFailed {
-        account: String,
-        error: String,
-    },
+    /// Work with nothing to save, such as sending or exporting a message: its update goes to the
+    /// UI as it is, in turn with the others.
+    Done(Update),
     Older {
         account: String,
         mailbox: String,
@@ -220,6 +239,8 @@ enum Job {
     /// Messages asked for by [`Job::Prefetch`] were downloaded, or couldn't be.
     Prefetched {
         account: String,
+        /// The account's watch they were asked for under: see [`Job::Watching`].
+        watch: u64,
         uid_validity: u32,
         /// Every message asked for, downloaded or not.
         uids: Vec<u32>,
@@ -238,6 +259,104 @@ struct Moving {
     to: String,
 }
 
+/// Whose watch an event is from.
+fn event_account(event: &Event) -> &str {
+    match event {
+        Event::Status { account, .. }
+        | Event::Messages { account, .. }
+        | Event::Mailboxes { account, .. } => account,
+    }
+}
+
+/// What a request asked of an account's server ends as when the account was replaced meanwhile.
+fn replaced<T>() -> Result<T, String> {
+    Err("the account was replaced while this was under way".to_owned())
+}
+
+impl Job {
+    /// The account something asked of the server was about.
+    fn account(&self) -> Option<&str> {
+        match self {
+            Self::Opened { account, .. }
+            | Self::Seen { account, .. }
+            | Self::AllSeen { account, .. }
+            | Self::Older { account, .. }
+            | Self::Searched { account, .. } => Some(account),
+            Self::Moved(moving, _) => Some(&moving.account),
+            _ => None,
+        }
+    }
+
+    /// This, failed, as its account was replaced while it was asked: nothing of it is saved.
+    fn superseded(self) -> Self {
+        match self {
+            Self::Opened {
+                account,
+                mailbox,
+                uid_validity,
+                uid,
+                ..
+            } => Self::Opened {
+                account,
+                mailbox,
+                uid_validity,
+                uid,
+                body: replaced(),
+            },
+            Self::Seen {
+                account,
+                mailbox,
+                uid,
+                seen,
+                ..
+            } => Self::Seen {
+                account,
+                mailbox,
+                uid,
+                seen,
+                result: replaced(),
+            },
+            Self::AllSeen {
+                account,
+                mailbox,
+                uid_validity,
+                ..
+            } => Self::AllSeen {
+                account,
+                mailbox,
+                uid_validity,
+                result: replaced(),
+            },
+            Self::Moved(moving, _) => Self::Moved(moving, replaced()),
+            Self::Older {
+                account,
+                mailbox,
+                uid_validity,
+                ..
+            } => Self::Older {
+                account,
+                mailbox,
+                uid_validity,
+                result: replaced(),
+            },
+            Self::Searched {
+                id,
+                account,
+                mailbox,
+                uid_validity,
+                ..
+            } => Self::Searched {
+                id,
+                account,
+                mailbox,
+                uid_validity,
+                result: replaced(),
+            },
+            job => job,
+        }
+    }
+}
+
 impl From<Event> for Job {
     fn from(event: Event) -> Self {
         Self::Watched(event)
@@ -251,10 +370,31 @@ struct Watched {
     credentials: Credentials,
     smtp: Server,
     smtp_credentials: Credentials,
-    /// The inbox's watcher and the other mailboxes' refresher.
-    tasks: [AbortHandle; 2],
+    /// The inbox's watcher, the other mailboxes' refresher, and what numbers what they report.
+    tasks: [AbortHandle; 3],
     /// Wakes the refresher.
     nudge: Arc<Notify>,
+    /// Which watch of the account this is: see [`Job::Watching`].
+    number: u64,
+}
+
+/// The store thread's queue, for the result of something asked of one watch's server: see
+/// [`Job::Asked`].
+struct Asking {
+    jobs: UnboundedSender<Job>,
+    watch: u64,
+}
+
+impl Asking {
+    /// Whether it was sent: not only as the app quits.
+    fn send(&self, job: Job) -> bool {
+        self.jobs
+            .send(Job::Asked {
+                watch: self.watch,
+                job: Box::new(job),
+            })
+            .is_ok()
+    }
 }
 
 /// Runs a watcher for each account's inbox and a refresher for its other mailboxes on a background
@@ -272,11 +412,18 @@ pub struct Mailroom {
     config: WatchConfig,
     /// How many of each inbox's newest messages to download ahead.
     prefetch: Arc<AtomicUsize>,
-    /// Each watched account's IMAP server and credentials, for downloading ahead.
+    /// Each watched account's IMAP server and credentials, for downloading ahead, with the
+    /// watch they're for: one lookup gets both, so a download is never numbered as a watch
+    /// on other servers.
     logins: Logins,
+    /// Each watched account's current watch: see [`Job::Watching`].
+    watches: Watches,
+    /// The number of the last watch started.
+    last_watch: u64,
 }
 
-type Logins = Arc<Mutex<HashMap<String, (Server, Credentials)>>>;
+type Logins = Arc<Mutex<HashMap<String, (Server, Credentials, u64)>>>;
+type Watches = Arc<Mutex<HashMap<String, u64>>>;
 
 impl Mailroom {
     /// Starts the background runtime and the thread that saves mail into the database at `database`.
@@ -301,10 +448,12 @@ impl Mailroom {
         let (jobs, mut received) = unbounded_channel();
         let prefetch = Arc::new(AtomicUsize::new(prefetch));
         let logins = Logins::default();
+        let watches = Watches::default();
         let mut prefetcher = Prefetcher {
             handle: runtime.handle().clone(),
             jobs: jobs.downgrade(),
             logins: Arc::clone(&logins),
+            watches: Arc::clone(&watches),
             count: Arc::clone(&prefetch),
             busy: HashSet::new(),
             skipped: HashSet::new(),
@@ -326,6 +475,8 @@ impl Mailroom {
             config,
             prefetch,
             logins,
+            watches,
+            last_watch: 0,
         })
     }
 
@@ -415,13 +566,34 @@ impl Mailroom {
         let mut cached = store.mailbox_states(&account.id)?;
         let inbox = cached.remove("INBOX");
         self.unwatch(&account.id);
+        self.last_watch += 1;
+        let number = self.last_watch;
+        self.watches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(account.id.clone(), number);
+        let (events, mut reported) = unbounded_channel::<Event>();
+        let jobs = self.jobs.clone();
+        let numberer = self.handle.spawn(async move {
+            while let Some(event) = reported.recv().await {
+                if jobs
+                    .send(Job::Watching {
+                        watch: number,
+                        event,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let nudge = Arc::new(Notify::new());
         let watcher = self.handle.spawn(watch(
             account.clone(),
             imap_credentials.clone(),
             inbox,
             self.config.clone(),
-            self.jobs.clone(),
+            events.clone(),
         ));
         let refresher = self.handle.spawn(refresh(
             account.clone(),
@@ -429,7 +601,7 @@ impl Mailroom {
             cached,
             self.config.clone(),
             Arc::clone(&nudge),
-            self.jobs.clone(),
+            events,
         ));
         self.watchers.insert(
             account.id.clone(),
@@ -438,14 +610,22 @@ impl Mailroom {
                 credentials: imap_credentials.clone(),
                 smtp: account.smtp.clone(),
                 smtp_credentials,
-                tasks: [watcher.abort_handle(), refresher.abort_handle()],
+                tasks: [
+                    watcher.abort_handle(),
+                    refresher.abort_handle(),
+                    numberer.abort_handle(),
+                ],
                 nudge,
+                number,
             },
         );
         self.logins
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(account.id.clone(), (account.imap.clone(), imap_credentials));
+            .insert(
+                account.id.clone(),
+                (account.imap.clone(), imap_credentials, number),
+            );
         // What's cached may already be all there is: no new mail would ask for it.
         self.prefetch_for(&account.id);
         Ok(())
@@ -454,6 +634,12 @@ impl Mailroom {
     /// Stops watching an account. Returns whether it was being watched.
     pub fn unwatch(&mut self, account: &str) -> bool {
         self.logins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(account);
+        // What its watchers queued already is dropped: see `Job::Watching`. This waits for
+        // anything of theirs being written, so none is once it returns.
+        self.watches
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(account);
@@ -486,9 +672,8 @@ impl Mailroom {
             }
             return Ok(Some(body));
         }
-        let (server, credentials, uid_validity) = self.target(store, account, mailbox)?;
+        let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
         let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
-        let jobs = self.jobs.clone();
         self.handle.spawn(async move {
             let body = open_message(&server, &credentials, &mailbox, uid_validity, uid)
                 .await
@@ -505,6 +690,44 @@ impl Mailroom {
         Ok(None)
     }
 
+    /// Downloads a message whole in the background and writes it to `path` as an `.eml` file,
+    /// replacing what's there. It stays read or unread, as it was. The result arrives as
+    /// [`Update::Exported`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Mailroom::open`].
+    pub fn export(
+        &self,
+        store: &Store,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        path: PathBuf,
+    ) -> Result<()> {
+        let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
+        let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
+        self.handle.spawn(async move {
+            let result =
+                match download_message(&server, &credentials, &mailbox, uid_validity, uid).await {
+                    Ok(raw) => {
+                        let to = path.clone();
+                        tokio::task::spawn_blocking(move || std::fs::write(to, raw))
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|written| written.map_err(|e| e.to_string()))
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+            let _ignored = jobs.send(Job::Done(Update::Exported {
+                account,
+                path,
+                result,
+            }));
+        });
+        Ok(())
+    }
+
     /// Marks a message read or unread in the background. The result arrives as [`Update::Seen`] or
     /// [`Update::SeenFailed`].
     ///
@@ -519,9 +742,8 @@ impl Mailroom {
         uid: u32,
         seen: bool,
     ) -> Result<()> {
-        let (server, credentials, uid_validity) = self.target(store, account, mailbox)?;
+        let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
         let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
-        let jobs = self.jobs.clone();
         self.handle.spawn(async move {
             let result = set_seen(&server, &credentials, &mailbox, uid_validity, uid, seen)
                 .await
@@ -544,9 +766,8 @@ impl Mailroom {
     ///
     /// As [`Mailroom::open`].
     pub fn mark_all_seen(&self, store: &Store, account: &str, mailbox: &str) -> Result<()> {
-        let (server, credentials, uid_validity) = self.target(store, account, mailbox)?;
+        let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
         let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
-        let jobs = self.jobs.clone();
         self.handle.spawn(async move {
             let result = mark_all_seen(&server, &credentials, &mailbox, uid_validity)
                 .await
@@ -575,10 +796,9 @@ impl Mailroom {
         uid: u32,
         to: &str,
     ) -> Result<()> {
-        let (server, credentials, uid_validity) = self.target(store, account, mailbox)?;
+        let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
         let nudge = Arc::clone(&self.watched(account)?.nudge);
         let (account, mailbox, to) = (account.to_owned(), mailbox.to_owned(), to.to_owned());
-        let jobs = self.jobs.clone();
         self.handle.spawn(async move {
             let result = move_message(&server, &credentials, &mailbox, uid_validity, uid, &to)
                 .await
@@ -612,13 +832,12 @@ impl Mailroom {
         mailbox: &str,
         count: usize,
     ) -> Result<()> {
-        let (server, credentials, uid_validity) = self.target(store, account, mailbox)?;
+        let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
         // With nothing cached, the next sync fetches the newest; there's no "older" yet.
         let Some(before) = store.oldest_uid(account, mailbox)? else {
             return Err(Error::Invalid(format!("{mailbox} has nothing cached yet")));
         };
         let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
-        let jobs = self.jobs.clone();
         self.handle.spawn(async move {
             let result = fetch_older(&server, &credentials, &mailbox, uid_validity, before, count)
                 .await
@@ -648,9 +867,8 @@ impl Mailroom {
         id: u64,
         count: usize,
     ) -> Result<()> {
-        let (server, credentials, uid_validity) = self.target(store, account, mailbox)?;
+        let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
         let (account, mailbox, query) = (account.to_owned(), mailbox.to_owned(), query.to_owned());
-        let jobs = self.jobs.clone();
         self.handle.spawn(async move {
             let result = search(&server, &credentials, &mailbox, uid_validity, &query, count)
                 .await
@@ -691,25 +909,25 @@ impl Mailroom {
             let sent = match smtp::send(&smtp, &smtp_credentials, &message).await {
                 Ok(sent) => sent,
                 Err(e) => {
-                    let _ignored = jobs.send(Job::Sent {
+                    let _ignored = jobs.send(Job::Done(Update::Sent {
                         account,
                         result: Err(e.to_string()),
-                    });
+                    }));
                     return;
                 }
             };
-            let _ignored = jobs.send(Job::Sent {
+            let _ignored = jobs.send(Job::Done(Update::Sent {
                 account: account.clone(),
                 result: Ok(sent.message_id.clone()),
-            });
+            }));
             match save_sent_copy(&imap, &credentials, &sent.message_id, &sent.copy).await {
                 // Fetch it from Sent now, so it's listed there right away.
                 Ok(()) => nudge.notify_one(),
                 Err(e) => {
-                    let _ignored = jobs.send(Job::CopyFailed {
+                    let _ignored = jobs.send(Job::Done(Update::CopyFailed {
                         account,
                         error: e.to_string(),
-                    });
+                    }));
                 }
             }
         });
@@ -722,13 +940,14 @@ impl Mailroom {
             .ok_or_else(|| Error::Invalid(format!("{account} isn't connected")))
     }
 
-    /// Where a message lives: its account's server and credentials, and the mailbox's UIDVALIDITY.
+    /// Where a message lives: its account's server and credentials, and the mailbox's
+    /// UIDVALIDITY; and where to send what comes of asking that server.
     fn target(
         &self,
         store: &Store,
         account: &str,
         mailbox: &str,
-    ) -> Result<(Server, Credentials, u32)> {
+    ) -> Result<(Server, Credentials, u32, Asking)> {
         let watched = self.watched(account)?;
         let state = store
             .mailbox_state(account, mailbox)?
@@ -737,6 +956,10 @@ impl Mailroom {
             watched.server.clone(),
             watched.credentials.clone(),
             state.uid_validity,
+            Asking {
+                jobs: self.jobs.clone(),
+                watch: watched.number,
+            },
         ))
     }
 
@@ -763,35 +986,62 @@ struct Prefetcher {
     /// Weak, as the store thread it lives on ends only once every sender is dropped.
     jobs: WeakUnboundedSender<Job>,
     logins: Logins,
+    watches: Watches,
     count: Arc<AtomicUsize>,
     /// The accounts with a batch being downloaded ahead: one at a time each, so only one
     /// connection per account downloads ahead, and nothing is asked for twice.
     busy: HashSet<String>,
-    /// Messages a download ahead left out, by account, UIDVALIDITY and UID, not to be asked for
-    /// again: those too large, and those no longer on the server, whose envelopes stay cached
-    /// as the watcher only fetches newer mail.
-    skipped: HashSet<(String, u32, u32)>,
+    /// Messages a download ahead left out, by account, watch, UIDVALIDITY and UID, not to be
+    /// asked for again: those too large, and those no longer on the server, whose envelopes
+    /// stay cached as the watcher only fetches newer mail. By watch, as a replaced account's
+    /// UIDs name another server's messages: they're checked again once watched anew.
+    skipped: HashSet<(String, u64, u32, u32)>,
 }
 
 impl Prefetcher {
     /// Saves what a job brought and says what the UI should show, then downloads ahead what
     /// the account's inbox lacks if the job may have changed that.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "a watch's number is held until what it brought is written"
+    )]
     fn save(&mut self, store: &mut Store, job: Job) -> Vec<Update> {
+        // Held from checking a watch's number until what it brought is written: unwatching
+        // waits for it, so once `Mailroom::unwatch` returns, nothing of that watch is written.
+        let watches = Arc::clone(&self.watches);
+        let current = watches.lock().unwrap_or_else(PoisonError::into_inner);
+        let is_current = |account: &str, watch| current.get(account) == Some(&watch);
+        let job = match job {
+            Job::Asked { watch, job } if job.account().is_some_and(|a| !is_current(a, watch)) => {
+                job.superseded()
+            }
+            Job::Asked { job, .. } => *job,
+            Job::Watching { watch, event } if !is_current(event_account(&event), watch) => {
+                return Vec::new();
+            }
+            Job::Watching { event, .. } => Job::Watched(event),
+            job => job,
+        };
         let (account, updates) = match job {
             Job::Prefetch { account } => (account, Vec::new()),
             Job::Prefetched {
                 account,
+                watch,
                 uid_validity,
                 uids,
                 result,
             } => {
                 self.busy.remove(&account);
-                // Failing, it's tried again with the next new mail or at the next start.
+                // Failing, it's tried again with the next new mail or at the next start. Asked
+                // of mailboxes the account no longer has, it's for no one.
                 let Ok(prefetched) = result else {
                     return Vec::new();
                 };
+                if current.get(&account) != Some(&watch) {
+                    return Vec::new();
+                }
                 let updates =
-                    self.save_prefetched(store, &account, uid_validity, &uids, &prefetched);
+                    self.save_prefetched(store, &account, watch, uid_validity, &uids, &prefetched);
                 (account, updates)
             }
             Job::Watched(Event::Messages {
@@ -850,6 +1100,7 @@ impl Prefetcher {
         &mut self,
         store: &Store,
         account: &str,
+        watch: u64,
         uid_validity: u32,
         asked: &[u32],
         prefetched: &Prefetched,
@@ -870,7 +1121,7 @@ impl Prefetcher {
                 asked
                     .iter()
                     .filter(|uid| !downloaded.contains(uid))
-                    .map(|&uid| (account.to_owned(), uid_validity, uid)),
+                    .map(|&uid| (account.to_owned(), watch, uid_validity, uid)),
             );
             Ok(())
         })();
@@ -895,7 +1146,7 @@ impl Prefetcher {
         let Some(state) = store.mailbox_state(account, INBOX)? else {
             return Ok(());
         };
-        let Some((server, credentials)) = self
+        let Some((server, credentials, watch)) = self
             .logins
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -911,7 +1162,7 @@ impl Prefetcher {
             .filter(|&uid| {
                 !self
                     .skipped
-                    .contains(&(account.to_owned(), uid_validity, uid))
+                    .contains(&(account.to_owned(), watch, uid_validity, uid))
             })
             .take(PREFETCH_BATCH)
             .collect();
@@ -937,6 +1188,7 @@ impl Prefetcher {
             .map_err(|e| e.to_string());
             let _ignored = jobs.send(Job::Prefetched {
                 account,
+                watch,
                 uid_validity,
                 uids,
                 result,
@@ -1031,8 +1283,7 @@ fn save(store: &mut Store, job: Job) -> Vec<Update> {
             result,
         } => vec![all_seen(store, account, mailbox, uid_validity, result)],
         Job::Moved(moving, result) => vec![moved(store, moving, result)],
-        Job::Sent { account, result } => vec![Update::Sent { account, result }],
-        Job::CopyFailed { account, error } => vec![Update::CopyFailed { account, error }],
+        Job::Done(update) => vec![update],
         Job::Older {
             account,
             mailbox,
@@ -1046,8 +1297,8 @@ fn save(store: &mut Store, job: Job) -> Vec<Update> {
             uid_validity,
             result,
         } => vec![searched(store, id, account, mailbox, uid_validity, result)],
-        // The prefetcher handles these before they get here.
-        Job::Prefetch { .. } | Job::Prefetched { .. } => Vec::new(),
+        // Numbered and downloading-ahead jobs, which `Prefetcher::save` handles first.
+        _ => Vec::new(),
     }
 }
 
@@ -1396,6 +1647,10 @@ mod tests {
             handle: runtime.handle().clone(),
             jobs: jobs.downgrade(),
             logins: Logins::default(),
+            watches: Arc::new(Mutex::new(HashMap::from([(
+                "me@example.com".to_owned(),
+                1,
+            )]))),
             count: Arc::new(AtomicUsize::new(count)),
             busy: HashSet::new(),
             skipped: HashSet::new(),
@@ -1406,6 +1661,7 @@ mod tests {
     fn prefetched(uid_validity: u32, uids: &[u32], too_big: &[u32]) -> Job {
         Job::Prefetched {
             account: "me@example.com".into(),
+            watch: 1,
             uid_validity,
             uids: uids.iter().chain(too_big).copied().collect(),
             result: Ok(Prefetched {
@@ -1413,6 +1669,66 @@ mod tests {
                 too_big: too_big.to_vec(),
             }),
         }
+    }
+
+    #[test]
+    fn only_the_current_watch_of_an_account_is_saved() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        let (_runtime, mut prefetcher) = prefetcher(0);
+        let watching = |watch, uid| match messages(1, &[uid]) {
+            Job::Watched(event) => Job::Watching { watch, event },
+            other => other,
+        };
+        let saved = |store: &Store, uid| {
+            store
+                .message("me@example.com", "INBOX", uid)
+                .unwrap()
+                .is_some()
+        };
+
+        // Not watched (any more): what its watchers queued is dropped.
+        prefetcher.watches.lock().unwrap().clear();
+        prefetcher.save(&mut store, watching(1, 1));
+        assert!(!saved(&store, 1), "stopped");
+
+        prefetcher
+            .watches
+            .lock()
+            .unwrap()
+            .insert("me@example.com".to_owned(), 2);
+        prefetcher.save(&mut store, watching(1, 1));
+        assert!(!saved(&store, 1), "replaced: another server's mailboxes");
+        prefetcher.save(&mut store, watching(2, 2));
+        assert!(saved(&store, 2), "the current watch");
+
+        // Asked of the old server: failed, and nothing of it saved.
+        let seen = |watch| Job::Asked {
+            watch,
+            job: Box::new(Job::Seen {
+                account: "me@example.com".into(),
+                mailbox: "INBOX".into(),
+                uid: 2,
+                seen: true,
+                result: Ok(()),
+            }),
+        };
+        let is_seen = |store: &Store| store.seen("me@example.com", "INBOX", 2).unwrap();
+        let updates = prefetcher.save(&mut store, seen(1));
+        assert!(
+            matches!(&updates[..], [Update::SeenFailed { error, .. }] if error.contains("replaced")),
+            "got {updates:?}"
+        );
+        assert_eq!(is_seen(&store), Some(false));
+        prefetcher.save(&mut store, seen(2));
+        assert_eq!(is_seen(&store), Some(true), "asked of the current watch");
+
+        let mut old = prefetched(1, &[2], &[]);
+        if let Job::Prefetched { watch, .. } = &mut old {
+            *watch = 1;
+        }
+        prefetcher.save(&mut store, old);
+        assert_eq!(store.body("me@example.com", "INBOX", 2).unwrap(), None);
     }
 
     #[test]
@@ -1433,7 +1749,7 @@ mod tests {
         assert!(
             prefetcher
                 .skipped
-                .contains(&("me@example.com".to_owned(), 1, 3)),
+                .contains(&("me@example.com".to_owned(), 1, 1, 3)),
             "too large, not asked for again"
         );
 
@@ -1457,6 +1773,7 @@ mod tests {
             (
                 account().imap,
                 Credentials::Password(String::from("secret").into()),
+                1,
             ),
         );
         let uids: Vec<u32> = (1..=50).collect();
@@ -1492,6 +1809,7 @@ mod tests {
         prefetcher.save(&mut store, messages(1, &[1, 2]));
         // UID 2 was asked for, but expunged: the server returned only UID 1.
         let job = Job::Prefetched {
+            watch: 1,
             account: "me@example.com".into(),
             uid_validity: 1,
             uids: vec![1, 2],
@@ -1504,10 +1822,11 @@ mod tests {
         assert!(
             prefetcher
                 .skipped
-                .contains(&("me@example.com".to_owned(), 1, 2)),
+                .contains(&("me@example.com".to_owned(), 1, 1, 2)),
             "skipped, not retried in a loop"
         );
         let failed = Job::Prefetched {
+            watch: 1,
             account: "me@example.com".into(),
             uid_validity: 1,
             uids: vec![3],
@@ -1517,7 +1836,7 @@ mod tests {
         assert!(
             !prefetcher
                 .skipped
-                .contains(&("me@example.com".to_owned(), 1, 3)),
+                .contains(&("me@example.com".to_owned(), 1, 1, 3)),
             "a failure is tried again later"
         );
     }

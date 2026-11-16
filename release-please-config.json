@@ -19,7 +19,7 @@
         {
           "type": "toml",
           "path": "Cargo.lock",
-          "jsonpath": "$.package[?(@.name.value == 'postden' || @.name.value == 'postden-core' || @.name.value == 'postden-mail' || @.name.value == 'postden-store' || @.name.value == 'postden-ai' || @.name.value == 'postden-secrets' || @.name.value == 'postden-app' || @.name.value == 'postden-html' || @.name.value == 'postden-update')].version"
+          "jsonpath": "$.package[?(@.name.value == 'postden' || @.name.value == 'postden-core' || @.name.value == 'postden-mail' || @.name.value == 'postden-store' || @.name.value == 'postden-ai' || @.name.value == 'postden-secrets' || @.name.value == 'postden-app' || @.name.value == 'postden-html' || @.name.value == 'postden-update' || @.name.value == 'postden-transfer')].version"
         }
       ]
     }

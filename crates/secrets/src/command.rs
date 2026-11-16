@@ -70,6 +70,10 @@ impl SecretStore for CommandStore {
     fn delete(&self, _: &SecretKey) -> Result<(), SecretError> {
         Err(SecretError::ReadOnly)
     }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use jiff::Zoned;
 use postden_app::{
-    Draft, Login, Mailroom, Passwords, Settings, Theme, Update, check_logins,
-    finish_google_sign_in, password_key, remove_account, save_account, signature,
-    smtp_password_key, start_google_sign_in,
+    Draft, Imported, Login, Mailroom, Passwords, Profile, Settings, Theme, Update, check_logins,
+    eml_file_name, finish_google_sign_in, is_sealed, password_key, remove_account, save_account,
+    signature, smtp_password_key, start_google_sign_in,
 };
 use postden_core::account::{Account, Signature};
 use postden_core::message::{Body, Envelope, Mailbox, Role};
@@ -18,8 +18,10 @@ use postden_core::secrets::{SecretStore, SecretString};
 use postden_mail::imap::{Status, WatchConfig};
 use postden_secrets::Backend;
 use postden_store::{Scope, Store, StoredMessage};
+use postden_transfer::{Code, Offer};
 use rune::{
-    AppHandle, FileDialogOptions, ImageCache, PointerPress, Taskbar, Tray, Tx, WindowHandle,
+    AppHandle, FileDialogOptions, ImageCache, PointerPress, Taskbar, TextEdit, Tray, Tx,
+    WindowHandle,
 };
 use rune_kit::shell::PaneState;
 
@@ -28,6 +30,7 @@ use crate::compose::{ComposeForm, Mode};
 use crate::form::{AccountForm, GoogleSignIn, Step};
 use crate::notifications::{self, Alert, Target};
 use crate::search::{self, MailboxKey, MessageKey, SERVER_PAGE, Search};
+use crate::transfer::{self, Transfer};
 use crate::update::{self, Phase, Updater};
 
 /// How many messages the list shows at first.
@@ -98,6 +101,46 @@ fn markdown(body: &Body) -> Option<String> {
         .as_deref()
         .map(postden_html::to_markdown)
         .filter(|md| !md.trim().is_empty())
+}
+
+/// Whose mailboxes an account reads: the same IMAP server and user is the same mailboxes, with
+/// the same UIDs.
+fn imap_owner(account: &Account) -> (String, u16, String) {
+    (
+        account.imap.host.to_ascii_lowercase(),
+        account.imap.port,
+        account.imap.username.clone(),
+    )
+}
+
+/// What importing a profile did, in a sentence.
+fn imported_notice(imported: &Imported) -> String {
+    let count = |n: usize| format!("{n} account{}", if n == 1 { "" } else { "s" });
+    let mut said = Vec::new();
+    if !imported.added.is_empty() {
+        said.push(format!("added {}", count(imported.added.len())));
+    }
+    if !imported.replaced.is_empty() {
+        said.push(format!("replaced {}", count(imported.replaced.len())));
+    }
+    if !imported.kept.is_empty() {
+        said.push(format!("kept {} as set up", count(imported.kept.len())));
+    }
+    let mut notice = if said.is_empty() {
+        "Imported the settings".to_owned()
+    } else {
+        let said = said.join(", ");
+        format!("Imported: {said}")
+    };
+    if !imported.without_secrets.is_empty() {
+        notice.push_str("; their passwords come from the password command");
+    }
+    let failed = imported
+        .failed
+        .iter()
+        .map(|(id, error)| format!("; couldn't import {id}: {error}"));
+    notice.extend(failed);
+    notice
 }
 
 fn is_message(m: &StoredMessage, account: &str, mailbox: &str, uid: u32) -> bool {
@@ -237,6 +280,8 @@ pub(crate) struct Mail {
     pub(crate) images: Option<ImageCache>,
     /// Checking for, announcing and installing new releases.
     pub(crate) updater: Updater,
+    /// Exporting or importing every account and setting, in the settings.
+    pub(crate) transfer: Transfer,
 }
 
 impl Mail {
@@ -282,6 +327,7 @@ impl Mail {
             account_settings: AccountSettings::default(),
             images: None,
             updater: Updater::default(),
+            transfer: Transfer::default(),
         }
     }
 
@@ -484,12 +530,7 @@ impl Mail {
                 };
                 self.inbox_mail(target, count, first_sync, &unread);
             }
-            Update::CopyFailed { account, error } => {
-                let label = self.label(&account).to_owned();
-                self.notify(format!(
-                    "{label}: sent, but couldn't file it in Sent: {error}"
-                ));
-            }
+            Update::CopyFailed { account, error } => self.copy_failed(&account, &error),
             Update::SaveFailed { account, error } => {
                 self.notify(format!("{account}: couldn't save new mail: {error}"));
             }
@@ -544,6 +585,11 @@ impl Mail {
                 to,
                 result,
             } => self.moved(&account, &mailbox, uid, &to, result),
+            Update::Exported {
+                account,
+                path,
+                result,
+            } => self.exported(&account, &path, result),
             Update::Sent { account, result } => self.sent(&account, result),
             Update::Searched {
                 id,
@@ -908,6 +954,13 @@ impl Mail {
         }
     }
 
+    fn copy_failed(&mut self, account: &str, error: &str) {
+        let label = self.label(account).to_owned();
+        self.notify(format!(
+            "{label}: sent, but couldn't file it in Sent: {error}"
+        ));
+    }
+
     pub(crate) fn discard(&mut self) {
         if self.compose.is_sending() {
             self.notify("Still sending; you'll be told how it went".into());
@@ -974,6 +1027,51 @@ impl Mail {
     pub(crate) fn close_reader(&mut self) {
         self.reader = None;
         self.pending_reply = None;
+    }
+
+    /// Asks where to save a message as an `.eml` file, offering a name made of its subject, then
+    /// downloads it there. It stays read or unread, as it was.
+    pub(crate) fn export_message(tx: &mut Tx, message: &StoredMessage) {
+        let options = FileDialogOptions {
+            title: "Export the message".into(),
+            file_name: Some(eml_file_name(message.envelope.subject.as_deref())),
+            ..FileDialogOptions::default()
+        }
+        .filter("Email message", &["eml"]);
+        let (account, mailbox, uid) = (
+            message.account.clone(),
+            message.mailbox.clone(),
+            message.envelope.uid,
+        );
+        tx.save_file(options, move |s: &mut Self, result, _| match result {
+            Ok(Some(path)) => s.export_to(&account, &mailbox, uid, path),
+            Ok(None) => {}
+            Err(e) => s.notify(format!("Couldn't open the file picker: {e}")),
+        });
+    }
+
+    /// Downloads a message and saves it to `path` as an `.eml` file. A notice says how it went.
+    fn export_to(&mut self, account: &str, mailbox: &str, uid: u32, path: PathBuf) {
+        let Ok(services) = &self.services else { return };
+        if let Err(e) = services
+            .mailroom
+            .export(&services.store, account, mailbox, uid, path)
+        {
+            let label = self.label(account).to_owned();
+            self.notify(format!("{label}: couldn't export the message: {e}"));
+        }
+    }
+
+    fn exported(&mut self, account: &str, path: &std::path::Path, result: Result<(), String>) {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let label = self.label(account).to_owned();
+        self.notify(match result {
+            Ok(()) => format!("Exported {name}"),
+            Err(e) => format!("{label}: couldn't export {name}: {e}"),
+        });
     }
 
     /// Flips the open message between read and unread.
@@ -1568,6 +1666,392 @@ impl Mail {
     pub(crate) fn close_settings(&mut self) {
         self.settings_open = false;
         self.confirm_remove = None;
+        self.cancel_transfer();
+    }
+
+    /// Starts exporting every account and setting: the settings ask for a passphrase.
+    pub(crate) fn start_export(&mut self) {
+        self.transfer = Transfer::export();
+    }
+
+    /// Stops exporting or importing, forgetting the passphrase typed. Work under way still
+    /// finishes, and says how it went.
+    pub(crate) fn cancel_transfer(&mut self) {
+        if self.transfer.can_cancel() {
+            self.transfer = Transfer::default();
+        }
+    }
+
+    /// Starts sending every account and setting to another computer: the settings ask for a
+    /// passphrase.
+    pub(crate) fn start_send(&mut self) {
+        self.transfer = Transfer::send();
+    }
+
+    /// Starts receiving accounts and settings from another computer: the settings ask for the
+    /// code it shows.
+    pub(crate) fn start_receive(&mut self) {
+        self.transfer = Transfer::receive();
+    }
+
+    /// Locks every account and setting with the passphrase typed, then goes online to offer
+    /// them to another computer, in the background: the settings show the code it types.
+    pub(crate) fn send_profile(&mut self) {
+        let (Ok(services), Some(handle)) = (&self.services, &self.handle) else {
+            return;
+        };
+        if self.transfer.busy {
+            return;
+        }
+        let passphrase = match self.transfer.new_passphrase() {
+            Ok(passphrase) => passphrase,
+            Err(e) => {
+                self.transfer.error = Some(e);
+                return;
+            }
+        };
+        let profile = match Profile::collect(&services.store, services.secrets.as_ref()) {
+            Ok(profile) => profile,
+            Err(e) => {
+                self.transfer.error = Some(format!("Couldn't send: {e}"));
+                return;
+            }
+        };
+        let count = profile.accounts.len();
+        let handle = handle.clone();
+        let task = services.mailroom.handle().spawn(async move {
+            let task = tokio::task::id();
+            let sealed = tokio::task::spawn_blocking(move || profile.seal(&passphrase)).await;
+            let offer = match sealed {
+                Ok(Ok(file)) => Offer::new(file).await.map_err(|e| e.to_string()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            let delivered = match offer {
+                Ok(offer) => {
+                    let code = offer.code().to_string();
+                    handle.update(move |s: &mut Self, _| s.offering(task, code));
+                    offer.deliver().await.map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e),
+            };
+            handle.update(move |s: &mut Self, _| s.profile_sent(task, delivered, count));
+        });
+        let t = &mut self.transfer;
+        t.busy = true;
+        t.error = None;
+        t.online = Some(transfer::Online::new(task.abort_handle()));
+    }
+
+    /// The profile is locked and offered under `code`: the settings show it.
+    fn offering(&mut self, task: tokio::task::Id, code: String) {
+        let t = &mut self.transfer;
+        if !t.is_online(task) {
+            return;
+        }
+        let (transfer::Step::Send, Some(online)) = (t.step, &mut t.online) else {
+            return;
+        };
+        online.code = Some(code);
+        t.step = transfer::Step::Offering;
+        t.busy = false;
+        t.passphrase = TextEdit::default();
+        t.confirm = TextEdit::default();
+    }
+
+    /// The other computer took the profile, or sending it failed.
+    fn profile_sent(&mut self, task: tokio::task::Id, delivered: Result<(), String>, count: usize) {
+        if !self.transfer.is_online(task) {
+            return;
+        }
+        match delivered {
+            Ok(()) => {
+                self.transfer = Transfer::default();
+                let s = if count == 1 { "" } else { "s" };
+                self.notify(format!("Sent {count} account{s} to the other computer"));
+            }
+            Err(e) => {
+                self.transfer = Transfer {
+                    error: Some(format!("Couldn't send: {e}")),
+                    ..Transfer::send()
+                };
+            }
+        }
+    }
+
+    /// Dials the computer showing the code typed and downloads its profile, in the background,
+    /// then asks for its passphrase.
+    pub(crate) fn receive_profile(&mut self) {
+        let (Ok(services), Some(handle)) = (&self.services, &self.handle) else {
+            return;
+        };
+        let t = &mut self.transfer;
+        if t.busy {
+            return;
+        }
+        let code: Code = match t.code.text.parse() {
+            Ok(code) => code,
+            Err(e) => {
+                t.error = Some(format!("{e}"));
+                return;
+            }
+        };
+        let handle = handle.clone();
+        let task = services.mailroom.handle().spawn(async move {
+            let task = tokio::task::id();
+            let received = postden_transfer::receive(&code)
+                .await
+                .map_err(|e| e.to_string());
+            handle.update(move |s: &mut Self, _| s.profile_received(task, received));
+        });
+        t.busy = true;
+        t.error = None;
+        t.online = Some(transfer::Online::new(task.abort_handle()));
+    }
+
+    fn profile_received(&mut self, task: tokio::task::Id, received: Result<Vec<u8>, String>) {
+        let t = &mut self.transfer;
+        if t.step != transfer::Step::Receive || !t.is_online(task) {
+            return;
+        }
+        t.online = None;
+        t.busy = false;
+        match received {
+            Ok(file) if is_sealed(&file) => {
+                self.transfer = Transfer::unlock("the profile sent".into(), file);
+            }
+            Ok(_) => t.error = Some("the other computer didn't send a Postden profile".into()),
+            Err(e) => t.error = Some(format!("Couldn't receive: {e}")),
+        }
+    }
+
+    /// Asks where to save every account and setting, locked with the passphrase typed, then
+    /// encrypts and writes them there in the background.
+    pub(crate) fn export_profile(&mut self, tx: &mut Tx) {
+        if self.transfer.busy {
+            return;
+        }
+        let passphrase = match self.transfer.new_passphrase() {
+            Ok(passphrase) => passphrase,
+            Err(e) => {
+                self.transfer.error = Some(e);
+                return;
+            }
+        };
+        let options = FileDialogOptions {
+            title: "Export accounts and settings".into(),
+            file_name: Some(format!(
+                "Postden {}.{}",
+                Zoned::now().strftime("%Y-%m-%d"),
+                transfer::EXTENSION
+            )),
+            ..FileDialogOptions::default()
+        }
+        .filter("Postden profile", &[transfer::EXTENSION]);
+        tx.save_file(options, move |s: &mut Self, result, _| match result {
+            Ok(Some(path)) => s.write_profile(path, passphrase),
+            Ok(None) => {}
+            Err(e) => s.transfer.error = Some(format!("Couldn't open the file picker: {e}")),
+        });
+    }
+
+    /// Gathers every account and setting, then encrypts them with `passphrase` and writes them
+    /// to `path` in the background: encrypting takes a second on purpose, to slow down guessing.
+    fn write_profile(&mut self, path: PathBuf, passphrase: SecretString) {
+        let (Ok(services), Some(handle)) = (&self.services, &self.handle) else {
+            return;
+        };
+        let profile = match Profile::collect(&services.store, services.secrets.as_ref()) {
+            Ok(profile) => profile,
+            Err(e) => {
+                self.transfer.error = Some(format!("Couldn't export: {e}"));
+                return;
+            }
+        };
+        self.transfer.busy = true;
+        self.transfer.error = None;
+        let handle = handle.clone();
+        services.mailroom.handle().spawn_blocking(move || {
+            let written = profile
+                .save(&path, &passphrase)
+                .map(|()| profile.accounts.len())
+                .map_err(|e| e.to_string());
+            handle.update(move |s: &mut Self, _| s.profile_written(&path, written));
+        });
+    }
+
+    fn profile_written(&mut self, path: &std::path::Path, written: Result<usize, String>) {
+        self.transfer.busy = false;
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        match written {
+            Ok(count) => {
+                self.transfer = Transfer::default();
+                let s = if count == 1 { "" } else { "s" };
+                self.notify(format!("Exported {count} account{s} to {name}"));
+            }
+            Err(e) => self.transfer.error = Some(format!("Couldn't export to {name}: {e}")),
+        }
+    }
+
+    /// Asks for a profile file to import, then for its passphrase.
+    pub(crate) fn pick_profile(tx: &mut Tx) {
+        let options = FileDialogOptions {
+            title: "Import accounts and settings".into(),
+            ..FileDialogOptions::default()
+        }
+        .filter("Postden profile", &[transfer::EXTENSION]);
+        tx.open_file(options, |s: &mut Self, result, _| match result {
+            Ok(Some(path)) => s.read_profile(&path),
+            Ok(None) => {}
+            Err(e) => s.notify(format!("Couldn't open the file picker: {e}")),
+        });
+    }
+
+    /// Reads a profile file, to unlock with its passphrase.
+    fn read_profile(&mut self, path: &std::path::Path) {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        match std::fs::read(path) {
+            Ok(file) if is_sealed(&file) => self.transfer = Transfer::unlock(name, file),
+            Ok(_) => self.notify(format!("{name} isn't a Postden profile")),
+            Err(e) => self.notify(format!("Couldn't read {name}: {e}")),
+        }
+    }
+
+    /// Decrypts the picked profile with the passphrase typed, in the background, then shows
+    /// what it holds.
+    pub(crate) fn unlock_profile(&mut self) {
+        let (Ok(services), Some(handle)) = (&self.services, &self.handle) else {
+            return;
+        };
+        let t = &mut self.transfer;
+        let (Some((_, file)), false) = (&t.file, t.busy) else {
+            return;
+        };
+        let Some(passphrase) = t.typed_passphrase() else {
+            t.error = Some("type the passphrase the profile was exported with".into());
+            return;
+        };
+        let (file, handle) = (file.clone(), handle.clone());
+        t.busy = true;
+        t.error = None;
+        services.mailroom.handle().spawn_blocking(move || {
+            let opened = Profile::open(&file, &passphrase).map_err(|e| e.to_string());
+            handle.update(move |s: &mut Self, _| s.profile_opened(opened));
+        });
+    }
+
+    fn profile_opened(&mut self, opened: Result<Profile, String>) {
+        self.transfer.busy = false;
+        if self.transfer.step != transfer::Step::Unlock {
+            return;
+        }
+        let Ok(services) = &self.services else { return };
+        match opened.and_then(|p| {
+            let existing = p.existing(&services.store).map_err(|e| e.to_string())?;
+            Ok((p, existing))
+        }) {
+            Ok((profile, existing)) => self.transfer = Transfer::review(profile, existing),
+            Err(e) => self.transfer.error = Some(e),
+        }
+    }
+
+    /// Sets up the reviewed profile's accounts and, if chosen, its settings, then connects the
+    /// accounts it set up.
+    pub(crate) fn import_profile(&mut self) {
+        let Ok(services) = &mut self.services else {
+            return;
+        };
+        let Some(profile) = &self.transfer.profile else {
+            return;
+        };
+        let options = self.transfer.options;
+        // Where each account's mailboxes were, to tell which ones a replaced account left.
+        let mailboxes_before: HashMap<String, (String, u16, String)> = self
+            .accounts
+            .iter()
+            .map(|a| (a.id.clone(), imap_owner(a)))
+            .collect();
+        // Stopped before anything's replaced, so their syncs can't write what they fetched from
+        // the old servers over the new ones' mailboxes; started again below.
+        let replacing: Vec<String> = profile
+            .accounts
+            .iter()
+            .map(|a| a.id.clone())
+            .filter(|id| options.replace_accounts && mailboxes_before.contains_key(id))
+            .collect();
+        for id in &replacing {
+            services.mailroom.unwatch(id);
+        }
+        let imported = profile.import(&mut services.store, services.secrets.as_ref(), options);
+        let mut restart: Vec<String> = replacing;
+        if let Ok(imported) = &imported {
+            restart.extend(imported.added.iter().cloned());
+        }
+        let mut moved = Vec::new();
+        for id in &restart {
+            // A replaced account may have new servers: if it can't reconnect, it mustn't keep
+            // checking and sending mail with the old ones.
+            let watched = services
+                .store
+                .account(id)
+                .map_err(postden_app::Error::from)
+                .and_then(|a| {
+                    let a =
+                        a.ok_or_else(|| postden_app::Error::Invalid(format!("{id} is gone")))?;
+                    if mailboxes_before
+                        .get(id)
+                        .is_some_and(|before| *before != imap_owner(&a))
+                    {
+                        moved.push(id.clone());
+                    }
+                    services
+                        .mailroom
+                        .watch(&a, &services.store, services.secrets.as_ref())
+                });
+            let status = watched
+                .map(|()| Status::Connecting)
+                .map_err(|e| e.to_string());
+            self.statuses.insert(id.clone(), status);
+        }
+        let imported = match imported {
+            Ok(imported) => imported,
+            Err(e) => {
+                // Nothing was imported: the profile can be imported again as it is.
+                self.transfer.error = Some(format!("Couldn't import: {e}"));
+                return;
+            }
+        };
+        let settings = options
+            .settings
+            .then(|| Settings::load(&services.store))
+            .transpose();
+        self.transfer = Transfer::default();
+        for id in &moved {
+            self.forget_mail_of(id);
+        }
+        self.reload();
+        match settings {
+            Ok(Some(settings)) => self.use_settings(settings),
+            Ok(None) => {}
+            Err(e) => self.notify(format!("Couldn't read the imported settings: {e}")),
+        }
+        self.notify(imported_notice(&imported));
+    }
+
+    /// Switches to `settings`, as imported, doing what changing each by hand does.
+    fn use_settings(&mut self, settings: Settings) {
+        self.set_theme(settings.theme);
+        self.set_poll_interval(settings.poll_interval);
+        self.set_prefetch(settings.prefetch);
+        self.set_notify_new_mail(settings.notify_new_mail);
+        self.set_keep_running(settings.keep_running);
+        self.set_check_updates(settings.check_updates);
     }
 
     /// Shows an account's settings: what it's called, the name its mail goes under, and its
@@ -1968,11 +2452,19 @@ impl Mail {
         if self.account_settings.account == id {
             self.account_settings = AccountSettings::default();
         }
+        self.forget_mail_of(id);
+        self.reload();
+    }
+
+    /// Stops showing account `id`'s mail, removed or now on another server or user, whose UIDs
+    /// name other messages: its open message and menus, and what a server search found.
+    fn forget_mail_of(&mut self, id: &str) {
         if self.showing.account() == Some(id) {
             self.showing = Showing::All(Role::Inbox);
         }
         // What the server found may be its mail.
         self.search.forget_server();
+        self.search.forget_gone(|account, _| account == id);
         if self
             .reader
             .as_ref()
@@ -1980,6 +2472,19 @@ impl Mail {
         {
             self.reader = None;
         }
-        self.reload();
+        if self
+            .message_menu
+            .as_ref()
+            .is_some_and(|m| m.message.0 == id)
+        {
+            self.message_menu = None;
+        }
+        if self
+            .mailbox_menu
+            .as_ref()
+            .is_some_and(|m| m.mailbox.0 == id)
+        {
+            self.mailbox_menu = None;
+        }
     }
 }

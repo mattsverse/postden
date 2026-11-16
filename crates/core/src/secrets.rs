@@ -83,4 +83,10 @@ pub trait SecretStore: Send + Sync + std::fmt::Debug {
     ///
     /// Returns [`SecretError::ReadOnly`] for read-only backends, or an error when the delete fails.
     fn delete(&self, key: &SecretKey) -> Result<(), SecretError>;
+
+    /// Whether this store can only read, as a password command: writes return
+    /// [`SecretError::ReadOnly`], and a failed read may just mean there's no such secret.
+    fn is_read_only(&self) -> bool {
+        false
+    }
 }

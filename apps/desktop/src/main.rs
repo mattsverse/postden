@@ -12,6 +12,7 @@ mod notifications;
 mod rich;
 mod search;
 mod state;
+mod transfer;
 mod tray;
 mod update;
 mod view;
