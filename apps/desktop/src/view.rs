@@ -9,17 +9,18 @@ use postden_html::compat::{self, Client, Provider};
 use postden_mail::imap::Status;
 use postden_store::StoredMessage;
 use rune::{
-    Block, Color, Cx, El, Icon, Mark, ScrollSpec, TextEdit, TextStyle, Transition, Tx, col, el,
-    row, text,
+    Block, Color, Cx, El, GrowthSpec, Icon, Mark, ScrollSpec, TextEdit, TextStyle, Transition, Tx,
+    col, el, row, text,
 };
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow, SplitView, Toolbar};
 use rune_kit::{
-    Button, ButtonVariant, Dialog, Divider, IconButton, IconButtonVariant, Kit, Markdown,
+    Button, ButtonVariant, Dialog, Divider, IconButton, IconButtonVariant, Keybind, Kit, Markdown,
     MarkdownStyle, Menu, MenuEntry, MenuItem, Placement, SegmentedControl, Spinner, State, Switch,
     TextArea, TextInput, Toast, ToastRegion, context_menu, glyphs, root,
 };
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
+use crate::commands::{Command, Entry};
 use crate::compose::{ComposeForm, Mode, Preview};
 use crate::form::{AccountForm, SECURITY, Step, security_index};
 use crate::rich::RichEditor;
@@ -133,7 +134,7 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
             trailing = trailing.child(
                 Button::new("Reply")
                     .variant(ButtonVariant::Ghost)
-                    .shortcut("⌘R")
+                    .shortcut(Command::Reply.hint())
                     .on_press(|s: &mut Mail| s.reply(false))
                     .build(&k)
                     .key("reply"),
@@ -145,6 +146,7 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
     }
     let toolbar = toolbar.trailing(trailing);
     update_dialog(s, &k, &mut layer);
+    palette(s, &k, &mut layer);
     let window = SplitView::new(main)
         .sidebar(
             &s.sidebar,
@@ -180,7 +182,7 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
         .on_close(close)
         .item(
             MenuItem::new("New message")
-                .shortcut("⌘N")
+                .shortcut(Command::Compose.hint())
                 .on_select(|s: &mut Mail| {
                     s.actions_open = false;
                     s.compose();
@@ -206,7 +208,7 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
             .separator()
             .item(
                 MenuItem::new("Reply all")
-                    .shortcut("⇧⌘R")
+                    .shortcut(Command::ReplyAll.hint())
                     .disabled(!downloaded)
                     .on_select(|s: &mut Mail| {
                         s.actions_open = false;
@@ -215,7 +217,7 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
             )
             .item(
                 MenuItem::new(seen)
-                    .shortcut("⇧⌘U")
+                    .shortcut(Command::ToggleSeen.hint())
                     .on_select(|s: &mut Mail| {
                         s.actions_open = false;
                         s.toggle_seen();
@@ -2618,6 +2620,183 @@ fn update_dialog(s: &Mail, k: &Kit, layer: &mut Vec<El>) {
     .child(footer.child(update_actions(s, k)))
     .open(true)
     .build(k, layer);
+}
+
+/// The command palette (⌘K), over everything: a field, and the commands that match what's typed
+/// in it, each with its shortcut. ↑ and ↓ move the highlight, and Return runs the highlighted one.
+fn palette(s: &Mail, k: &Kit, layer: &mut Vec<El>) {
+    let p = &s.palette;
+    if !p.open {
+        return;
+    }
+    let shown = p.shown(s);
+    let active = p.active_row(&shown);
+    let input = TextInput::new(&p.query)
+        .label("Command")
+        .placeholder("Type a command")
+        .leading_icon(&glyphs::SEARCH)
+        .width(None)
+        // A screen reader reads the highlighted row, while the field keeps the focus.
+        .active_descendant(shown.get(active).map(|e| e.command.key()))
+        .on_edit(|s: &mut Mail| &mut s.palette.query)
+        .on_change(|s: &mut Mail, tx| {
+            s.palette_changed();
+            if let Some(first) = s.palette.shown(s).first() {
+                tx.scroll_into_view(first.command.key());
+            }
+        })
+        .on_submit(|s: &mut Mail, tx| s.run_palette(None, tx))
+        .on_key(|s: &mut Mail, ev: &rune::KeyEvent, tx| {
+            let by = match ev.key {
+                rune::Key::Up => -1,
+                rune::Key::Down => 1,
+                _ => return false,
+            };
+            s.move_palette(by);
+            if let Some(command) = &s.palette.active {
+                tx.scroll_into_view(command.key());
+            }
+            true
+        });
+    let list = palette_list(&shown, active, k);
+    let mut panel = col()
+        .key("palette")
+        .role("dialog")
+        .label("Command palette")
+        .w_full()
+        .max_w(560.0)
+        .shrink()
+        .min_h(0.0)
+        .radius(8.0)
+        .fill(k.c.layer_01)
+        .preserve_focus_on_press(true)
+        .child(
+            row()
+                .w_full()
+                .padding(10.0)
+                .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+                .child(row().grow(1.0).min_w(0.0).child(input.build(k))),
+        )
+        .child(list)
+        .token_motion(k.motion.overlay)
+        .modal(true, Mail::close_palette);
+    for shadow in k.shadow_layers(&k.elevation.overlay) {
+        panel = panel.box_shadow(shadow);
+    }
+    layer.push(
+        el().key("palette-scrim")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .fill(k.c.scrim)
+            .token_motion(k.motion.overlay)
+            .a11y_hidden(),
+    );
+    layer.push(
+        col()
+            .key("palette-layer")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .padding(16.0)
+            .pt(96.0)
+            .items_center()
+            .child(panel),
+    );
+}
+
+/// The palette's rows, or a word that nothing matches, in a list that scrolls.
+fn palette_list(shown: &[Entry], active: usize, k: &Kit) -> El {
+    // Virtual, so the highlighted row is revealed whenever the highlight moves to another one.
+    // Rows coming in above it are followed where mail updates arrive, in `Mail::try_start`.
+    let mut rows = col()
+        .key("palette-rows")
+        .w_full()
+        .growth(GrowthSpec::default())
+        .virtualize(32.0)
+        .reveal_selected(true);
+    for (i, entry) in shown.iter().enumerate() {
+        rows = rows.child(palette_row(entry, i == active, k));
+    }
+    let list = if shown.is_empty() {
+        el().key("palette-empty")
+            .w_full()
+            .h(32.0)
+            .px(10.0)
+            .center_y()
+            .child(
+                text("No matching command")
+                    .font(k.ty.ui)
+                    .color(k.c.text_muted),
+            )
+    } else {
+        rows
+    };
+    col()
+        .key("palette-scroll")
+        .role("listbox")
+        .label("Commands")
+        .w_full()
+        .padding(6.0)
+        .child(list)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .max_h(360.0)
+        // A short window shrinks the list, not the field, so the panel stays inside it.
+        .shrink()
+        .min_h(0.0)
+}
+
+/// One command in the palette: what it's called, what it applies to, and its shortcut. `on` when
+/// it's highlighted.
+fn palette_row(entry: &Entry, on: bool, k: &Kit) -> El {
+    let (hovered, pressed) = (entry.command.clone(), entry.command.clone());
+    let mut item = row()
+        .key(entry.command.key())
+        .role("option")
+        .label(&entry.title)
+        .description(entry.detail.clone().unwrap_or_default())
+        .focus_selected(on)
+        .w_full()
+        .h(32.0)
+        .px(10.0)
+        .gap(8.0)
+        .center_y()
+        .radius(4.0)
+        .fill(if on { k.c.hover } else { Color::TRANSPARENT })
+        // The pointer moves the highlight, so just one row shows as the one Return runs. Only
+        // when it moves: a row that appears under a resting pointer keeps the best match.
+        .on_pointer_move_local(move |s: &mut Mail, _, tx| {
+            if s.palette.active.as_ref() == Some(&hovered) {
+                tx.live_only();
+            } else {
+                s.palette.active = Some(hovered.clone());
+            }
+        })
+        .on_press_tx(move |s: &mut Mail, tx| s.run_palette(Some(pressed.clone()), tx))
+        .child(
+            text(&entry.title)
+                .font(k.ty.ui)
+                .color(k.c.text_base)
+                .shrink()
+                .truncate()
+                .a11y_hidden(),
+        );
+    let detail = entry.detail.as_deref().map_or_else(el, |d| {
+        text(d)
+            .font(k.ty.ui)
+            .color(k.c.text_muted)
+            .truncate()
+            .a11y_hidden()
+    });
+    item = item.child(detail.grow(1.0).shrink());
+    if let Some(shortcut) = entry.command.shortcut() {
+        item = item
+            .shortcut_hint(shortcut.label())
+            .child(Keybind::new(&[shortcut.label()]).build(k).a11y_hidden());
+    }
+    item
 }
 
 /// The announcement's buttons: Skip this version, Later, and Update, Restart now, or, for a

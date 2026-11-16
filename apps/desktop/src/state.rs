@@ -26,6 +26,7 @@ use rune::{
 use rune_kit::shell::PaneState;
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
+use crate::commands::{self, Command, Palette};
 use crate::compose::{ComposeForm, Mode};
 use crate::form::{AccountForm, GoogleSignIn, Step};
 use crate::notifications::{self, Alert, Target};
@@ -174,7 +175,7 @@ impl SettingsSection {
 }
 
 /// What the message list shows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Showing {
     /// Every account's mailbox with this role: all inboxes, or all Sent mailboxes.
     All(Role),
@@ -314,6 +315,8 @@ pub(crate) struct Mail {
     pub(crate) updater: Updater,
     /// Exporting or importing every account and setting, in the settings.
     pub(crate) transfer: Transfer,
+    /// The command palette (⌘K).
+    pub(crate) palette: Palette,
 }
 
 impl Mail {
@@ -362,6 +365,7 @@ impl Mail {
             images: None,
             updater: Updater::default(),
             transfer: Transfer::default(),
+            palette: Palette::default(),
         }
     }
 
@@ -447,7 +451,17 @@ impl Mail {
         };
         let notify = handle.clone();
         let mailroom = Mailroom::start(&database, config, settings.prefetch, move |update| {
-            notify.update(move |s: &mut Self, tx| s.apply(update, tx));
+            notify.update(move |s: &mut Self, tx| {
+                // Mail coming in can add rows above the palette's highlight (Reply, once a
+                // message downloads), which the list's scroll anchor doesn't follow.
+                let before = s.palette_highlight();
+                s.apply(update, tx);
+                if let (Some((was, _)), Some((row, key))) = (before, s.palette_highlight())
+                    && was != row
+                {
+                    tx.scroll_into_view(key);
+                }
+            });
         })
         .map_err(|e| e.to_string())?;
         let services = Services {
@@ -839,6 +853,81 @@ impl Mail {
     pub(crate) fn focus_search(&mut self) {
         self.reader = None;
         self.search.query.focused = true;
+    }
+
+    /// Opens the palette afresh, with nothing typed, or closes it.
+    pub(crate) fn toggle_palette(&mut self) {
+        if self.palette.open {
+            self.close_palette();
+            return;
+        }
+        // Menus left open would sit over it.
+        self.actions_open = false;
+        self.message_menu = None;
+        self.mailbox_menu = None;
+        self.palette = Palette {
+            open: true,
+            query: TextEdit::new(""),
+            active: None,
+        };
+        self.palette.query.focused = true;
+    }
+
+    pub(crate) const fn close_palette(&mut self) {
+        self.palette.open = false;
+    }
+
+    /// What's typed in the palette changed: the best match is highlighted.
+    pub(crate) fn palette_changed(&mut self) {
+        self.palette.active = None;
+    }
+
+    /// Moves the highlight `by` rows, wrapping around the ends. Returns the row it's on.
+    pub(crate) fn move_palette(&mut self, by: isize) -> usize {
+        let shown = self.palette.shown(self);
+        if shown.is_empty() {
+            return 0;
+        }
+        let at = self.palette.active_row(&shown).cast_signed() + by;
+        let row = at.rem_euclid(shown.len().cast_signed()).cast_unsigned();
+        self.palette.active = shown.into_iter().nth(row).map(|e| e.command);
+        row
+    }
+
+    /// The palette's highlighted row and its key, while it's open with rows.
+    fn palette_highlight(&self) -> Option<(usize, String)> {
+        if !self.palette.open {
+            return None;
+        }
+        let shown = self.palette.shown(self);
+        let row = self.palette.active_row(&shown);
+        Some((row, shown.get(row)?.command.key()))
+    }
+
+    /// Runs `command` from the palette, or the highlighted one (Return) for `None`, closing it.
+    pub(crate) fn run_palette(&mut self, command: Option<Command>, tx: &mut Tx) {
+        let shown = self.palette.shown(self);
+        let row = self.palette.active_row(&shown);
+        let entry = match command {
+            Some(c) => shown.into_iter().find(|e| e.command == c),
+            None => shown.into_iter().nth(row),
+        };
+        let Some(entry) = entry else { return };
+        self.close_palette();
+        entry.command.run(self, tx);
+    }
+
+    /// Runs the command whose shortcut `ev` is, if one applies here.
+    pub(crate) fn run_shortcut(&mut self, ev: &rune::KeyEvent, tx: &mut Tx) -> bool {
+        let Some(command) = commands::available(self)
+            .into_iter()
+            .find(|c| c.shortcut().is_some_and(|k| k.matches(ev)))
+        else {
+            return false;
+        };
+        self.close_palette();
+        command.run(self, tx);
+        true
     }
 
     /// Asks the server of each mailbox searched for what matches, beyond what's cached and in the
@@ -1364,7 +1453,7 @@ impl Mail {
     }
 
     /// The name to show for one of the account's mailboxes.
-    fn mailbox_label(&self, account: &str, name: &str) -> String {
+    pub(crate) fn mailbox_label(&self, account: &str, name: &str) -> String {
         self.mailboxes
             .get(account)
             .and_then(|list| list.iter().find(|m| m.name == name))
@@ -1449,6 +1538,8 @@ impl Mail {
         if self.compose.open {
             return;
         }
+        // What the palette offered was for what the window showed, which this replaces.
+        self.close_palette();
         self.clear_search();
         let showing = if self.showing == ALL_INBOXES {
             ALL_INBOXES.clone()
@@ -2537,11 +2628,22 @@ impl Mail {
                     a.latest.version
                 ));
             }
+        } else if manual && !self.updates_shown() {
+            // Asked for, its result shows somewhere: up to date, or why it failed.
+            let status = self.updater.status();
+            self.notify(status);
         }
         // A day after the last check, whichever started it; this replaces any timer running.
         if self.settings.check_updates {
             self.schedule_update_check(UPDATE_CHECK_EVERY);
         }
+    }
+
+    /// Whether the settings' updates are on screen, where a check's result shows.
+    fn updates_shown(&self) -> bool {
+        self.settings_open
+            && !self.account_settings.open
+            && self.settings_section == SettingsSection::General
     }
 
     /// Shows the announcement of the update found, with its changelog.
@@ -2768,5 +2870,25 @@ mod tests {
         s.close_account_settings();
         assert!(s.settings_open);
         assert_eq!(s.settings_section, SettingsSection::Accounts);
+    }
+
+    #[test]
+    fn a_check_for_updates_asked_where_its_result_cant_show_says_it_in_a_notice() {
+        let mut s = Mail::not_started();
+        s.updater.phase = Phase::Checking { manual: true };
+        s.update_checked(Ok(None));
+        assert!(
+            s.notice
+                .as_deref()
+                .is_some_and(|n| n.starts_with("Postden is up to date")),
+            "got {:?}",
+            s.notice
+        );
+        // With the updates on screen, they say it themselves.
+        s.dismiss_notice();
+        s.open_settings();
+        s.updater.phase = Phase::Checking { manual: true };
+        s.update_checked(Ok(None));
+        assert_eq!(s.notice, None);
     }
 }
