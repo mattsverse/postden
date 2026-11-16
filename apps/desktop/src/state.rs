@@ -147,6 +147,30 @@ fn is_message(m: &StoredMessage, account: &str, mailbox: &str, uid: u32) -> bool
     m.account == account && m.mailbox == mailbox && m.envelope.uid == uid
 }
 
+/// A part of the settings page, picked with the tabs at its top.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum SettingsSection {
+    /// How Postden looks and behaves: its theme, notifications, closing and updates.
+    #[default]
+    General,
+    /// The accounts set up, and moving them to another computer.
+    Accounts,
+    /// How often mail is checked, and how much is downloaded ahead.
+    Advanced,
+}
+
+impl SettingsSection {
+    pub(crate) const ALL: [Self; 3] = [Self::General, Self::Accounts, Self::Advanced];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Accounts => "Accounts",
+            Self::Advanced => "Advanced",
+        }
+    }
+}
+
 /// What the message list shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Showing {
@@ -276,6 +300,8 @@ pub(crate) struct Mail {
     pub(crate) settings: Settings,
     /// The settings page is shown over everything else in the main pane.
     pub(crate) settings_open: bool,
+    /// The part of the settings page shown. It stays as picked when the page closes.
+    pub(crate) settings_section: SettingsSection,
     /// One account's settings, shown in place of the settings page while it's open.
     pub(crate) account_settings: AccountSettings,
     /// Decodes the images shown, such as a signature's. `None` before the app starts.
@@ -327,6 +353,7 @@ impl Mail {
             collapsed: HashSet::new(),
             settings: Settings::default(),
             settings_open: false,
+            settings_section: SettingsSection::default(),
             account_settings: AccountSettings::default(),
             images: None,
             updater: Updater::default(),
@@ -1685,6 +1712,23 @@ impl Mail {
         }
     }
 
+    /// Shows another part of the settings page. A Remove waiting for its second press is
+    /// forgotten. While moving to another computer is under way, the page stays on Accounts,
+    /// where it shows, so nothing goes on out of sight.
+    pub(crate) fn show_settings_section(&mut self, section: SettingsSection) {
+        if section == self.settings_section || !self.can_show_settings_section(section) {
+            return;
+        }
+        self.settings_section = section;
+        self.confirm_remove = None;
+    }
+
+    /// Whether the settings page can go to `section`: not away from Accounts while moving to
+    /// another computer is under way.
+    pub(crate) fn can_show_settings_section(&self, section: SettingsSection) -> bool {
+        section == SettingsSection::Accounts || self.transfer.step == transfer::Step::Idle
+    }
+
     pub(crate) fn close_settings(&mut self) {
         self.settings_open = false;
         self.confirm_remove = None;
@@ -1939,7 +1983,11 @@ impl Mail {
             |n| n.to_string_lossy().into_owned(),
         );
         match std::fs::read(path) {
-            Ok(file) if is_sealed(&file) => self.transfer = Transfer::unlock(name, file),
+            Ok(file) if is_sealed(&file) => {
+                self.transfer = Transfer::unlock(name, file);
+                // Another section may have been picked while the file was being chosen.
+                self.settings_section = SettingsSection::Accounts;
+            }
             Ok(_) => self.notify(format!("{name} isn't a Postden profile")),
             Err(e) => self.notify(format!("Couldn't read {name}: {e}")),
         }
@@ -2077,7 +2125,7 @@ impl Mail {
     }
 
     /// Shows an account's settings: what it's called, the name its mail goes under, and its
-    /// signature.
+    /// signature. Going back from them shows the settings' Accounts section.
     pub(crate) fn open_account_settings(&mut self, id: &str) {
         let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() else {
             return;
@@ -2090,6 +2138,7 @@ impl Mail {
         self.form.open = false;
         self.confirm_remove = None;
         self.settings_open = true;
+        self.settings_section = SettingsSection::Accounts;
     }
 
     /// Back to the settings page, dropping what wasn't saved.
@@ -2508,5 +2557,92 @@ impl Mail {
         {
             self.mailbox_menu = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switching_settings_sections_forgets_a_pending_remove() {
+        let mut s = Mail::not_started();
+        s.open_settings();
+        assert_eq!(s.settings_section, SettingsSection::General);
+        s.show_settings_section(SettingsSection::Accounts);
+        s.confirm_remove = Some("me@example.com".into());
+        s.show_settings_section(SettingsSection::Advanced);
+        assert_eq!(s.settings_section, SettingsSection::Advanced);
+        assert_eq!(s.confirm_remove, None);
+    }
+
+    #[test]
+    fn picking_the_section_shown_keeps_a_pending_remove() {
+        let mut s = Mail::not_started();
+        s.show_settings_section(SettingsSection::Accounts);
+        s.confirm_remove = Some("me@example.com".into());
+        s.show_settings_section(SettingsSection::Accounts);
+        assert_eq!(s.confirm_remove.as_deref(), Some("me@example.com"));
+    }
+
+    #[test]
+    fn moving_to_another_computer_keeps_the_accounts_section_shown() {
+        let mut s = Mail::not_started();
+        s.open_settings();
+        s.show_settings_section(SettingsSection::Accounts);
+        s.start_export();
+        s.show_settings_section(SettingsSection::General);
+        assert_eq!(s.settings_section, SettingsSection::Accounts);
+        s.cancel_transfer();
+        s.show_settings_section(SettingsSection::General);
+        assert_eq!(s.settings_section, SettingsSection::General);
+    }
+
+    #[test]
+    fn a_profile_picked_shows_the_accounts_section() {
+        let path =
+            std::env::temp_dir().join(format!("postden-test-{}.postden", std::process::id()));
+        std::fs::write(&path, b"age-encryption.org/v1\n").unwrap();
+        let mut s = Mail::not_started();
+        s.open_settings();
+        s.show_settings_section(SettingsSection::Advanced);
+        s.read_profile(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(s.transfer.step, transfer::Step::Unlock);
+        assert_eq!(s.settings_section, SettingsSection::Accounts);
+    }
+
+    #[test]
+    fn settings_reopen_on_the_section_left() {
+        let mut s = Mail::not_started();
+        s.open_settings();
+        s.show_settings_section(SettingsSection::Advanced);
+        s.close_settings();
+        s.open_settings();
+        assert_eq!(s.settings_section, SettingsSection::Advanced);
+    }
+
+    #[test]
+    fn an_accounts_settings_return_to_the_accounts_section() {
+        use postden_core::account::{Auth, Security, Server};
+        let server = Server {
+            host: "localhost".into(),
+            port: 1,
+            security: Security::None,
+            username: "me".into(),
+        };
+        let mut s = Mail::not_started();
+        s.accounts.push(Account {
+            id: "me@example.com".into(),
+            display_name: None,
+            label: None,
+            imap: server.clone(),
+            smtp: server,
+            auth: Auth::Password,
+        });
+        s.open_account_settings("me@example.com");
+        s.close_account_settings();
+        assert!(s.settings_open);
+        assert_eq!(s.settings_section, SettingsSection::Accounts);
     }
 }
