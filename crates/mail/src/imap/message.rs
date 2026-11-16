@@ -53,6 +53,89 @@ pub async fn open_message(
     result
 }
 
+/// What [`prefetch_messages`] downloaded.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Prefetched {
+    /// The messages downloaded, by UID.
+    pub bodies: Vec<(u32, Body)>,
+    /// The messages left out for being larger than asked, which only opening them downloads.
+    pub too_big: Vec<u32>,
+}
+
+/// Downloads messages `uids` from `mailbox` without marking them read, ahead of their opening.
+///
+/// Those larger than `max_size` bytes, such as ones carrying big attachments, are left out, as
+/// are those no longer on the server. See [`open_message`] for `uid_validity`.
+///
+/// # Errors
+///
+/// Returns an error when the connection fails or the mailbox changed.
+pub async fn prefetch_messages(
+    server: &Server,
+    credentials: &Credentials,
+    mailbox: &str,
+    uid_validity: u32,
+    uids: &[u32],
+    max_size: u32,
+) -> Result<Prefetched> {
+    if uids.is_empty() {
+        return Ok(Prefetched::default());
+    }
+    let mut session = connect(server, credentials).await?;
+    let result = async {
+        select(&mut session, mailbox, uid_validity).await?;
+        let set = uid_set(uids);
+        let sizes: Vec<_> = with_timeout(async {
+            session
+                .uid_fetch(&set, "(UID RFC822.SIZE)")
+                .await?
+                .try_collect()
+                .await
+        })
+        .await?;
+        let mut small = Vec::new();
+        let mut too_big = Vec::new();
+        for fetch in &sizes {
+            match (fetch.uid, fetch.size) {
+                (Some(uid), Some(size)) if size > max_size => too_big.push(uid),
+                (Some(uid), _) if uids.contains(&uid) => small.push(uid),
+                _ => {}
+            }
+        }
+        if small.is_empty() {
+            return Ok(Prefetched {
+                bodies: Vec::new(),
+                too_big,
+            });
+        }
+        let fetches: Vec<_> = with_timeout(async {
+            session
+                .uid_fetch(uid_set(&small), "(UID BODY.PEEK[])")
+                .await?
+                .try_collect()
+                .await
+        })
+        .await?;
+        let bodies = fetches
+            .iter()
+            .filter_map(|f| Some((f.uid?, parse_body(f.body()?))))
+            .filter(|(uid, _)| small.contains(uid))
+            .collect();
+        Ok(Prefetched { bodies, too_big })
+    }
+    .await;
+    let _ignored = session.logout().await;
+    result
+}
+
+/// UIDs as an IMAP sequence set, such as `3,7,12`.
+fn uid_set(uids: &[u32]) -> String {
+    uids.iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Marks message `uid` in `mailbox` read or unread. See [`open_message`] for `uid_validity`.
 ///
 /// # Errors

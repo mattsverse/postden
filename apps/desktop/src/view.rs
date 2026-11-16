@@ -2,7 +2,7 @@
 //! being written, the add-account form or the settings in the main pane.
 
 use jiff::Zoned;
-use postden_app::{POLL_INTERVALS, Theme};
+use postden_app::{POLL_INTERVALS, PREFETCH_COUNTS, Theme};
 use postden_core::account::{Account, Security};
 use postden_core::message::{Address, Mailbox, Role};
 use postden_html::compat::{self, Client, Provider};
@@ -1483,7 +1483,8 @@ fn field(k: &Kit, label: &str, input: El) -> El {
         .child(input)
 }
 
-/// The settings: the theme, how often mail is checked, and the accounts, each removable.
+/// The settings: the theme, how often mail is checked, how many messages are downloaded ahead,
+/// and the accounts, each removable.
 fn settings(s: &Mail, k: &Kit) -> El {
     let themes: Vec<&str> = Theme::ALL.iter().map(|t| t.label()).collect();
     let theme = SegmentedControl::new(
@@ -1542,6 +1543,7 @@ fn settings(s: &Mail, k: &Kit) -> El {
             ),
             row().child(interval),
         ))
+        .child(prefetch_setting(s, k))
         .child(setting_section(
             k,
             "Notifications",
@@ -1584,6 +1586,45 @@ fn settings(s: &Mail, k: &Kit) -> El {
         })
         .grow(1.0)
         .min_h(0.0)
+}
+
+/// How many of each inbox's newest messages are downloaded ahead of their opening.
+fn prefetch_setting(s: &Mail, k: &Kit) -> El {
+    let counts: Vec<String> = PREFETCH_COUNTS
+        .iter()
+        .map(|&n| {
+            if n == 0 {
+                "Off".to_owned()
+            } else {
+                n.to_string()
+            }
+        })
+        .collect();
+    let prefetch = SegmentedControl::new(
+        &counts,
+        PREFETCH_COUNTS
+            .iter()
+            .position(|&n| n == s.settings.prefetch),
+    )
+    .label("Newest messages per inbox")
+    .fit()
+    .on_pick(|s: &mut Mail, i, _| {
+        if let Some(&count) = PREFETCH_COUNTS.get(i) {
+            s.set_prefetch(count);
+        }
+    })
+    .build(k)
+    .key("prefetch");
+    setting_section(
+        k,
+        "Downloading ahead",
+        Some(
+            "Postden can download your newest messages as they arrive, so they open without \
+             waiting for the server. Off, a message is downloaded only once you open it. \
+             Messages over 5 MB are always downloaded when opened.",
+        ),
+        row().child(prefetch),
+    )
 }
 
 /// What keeping the app running does, said for where the window comes back from.

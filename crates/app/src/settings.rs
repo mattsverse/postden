@@ -1,6 +1,7 @@
-//! The app's preferences: its theme, how often mail is checked, whether new mail is announced
-//! with a system notification, whether the app keeps running with its window closed and whether
-//! updates are checked for, kept in the [`Store`].
+//! The app's preferences: its theme, how often mail is checked, how many messages are downloaded
+//! ahead of their opening, whether new mail is announced with a system notification, whether the
+//! app keeps running with its window closed and whether updates are checked for, kept in the
+//! [`Store`].
 
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use crate::Result;
 
 const THEME: &str = "theme";
 const POLL_INTERVAL: &str = "poll_interval_secs";
+const PREFETCH: &str = "prefetch";
 const NOTIFY_NEW_MAIL: &str = "notify_new_mail";
 const KEEP_RUNNING: &str = "keep_running";
 const CHECK_UPDATES: &str = "check_updates";
@@ -69,12 +71,19 @@ pub const POLL_INTERVALS: [Duration; 5] = [
     Duration::from_mins(15),
 ];
 
+/// How many of each inbox's newest messages can be downloaded ahead of their opening. The first,
+/// none, is the default: a message is downloaded only once it's opened.
+pub const PREFETCH_COUNTS: [usize; 5] = [0, 25, 50, 100, 200];
+
 /// The app's preferences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
     pub theme: Theme,
     /// How often to check for new mail when the server doesn't push it (IMAP IDLE).
     pub poll_interval: Duration,
+    /// How many of each inbox's newest messages to download ahead, so they open without waiting
+    /// for the server. None by default.
+    pub prefetch: usize,
     /// Whether mail arriving unread in an inbox shows a system notification.
     pub notify_new_mail: bool,
     /// Whether closing the window leaves the app running, to bring back from the tray or Dock.
@@ -90,6 +99,7 @@ impl Default for Settings {
         Self {
             theme: Theme::default(),
             poll_interval: Duration::from_mins(1),
+            prefetch: 0,
             notify_new_mail: true,
             keep_running: true,
             check_updates: true,
@@ -116,6 +126,10 @@ impl Settings {
             .and_then(|s| s.parse().ok())
             .filter(|&secs| secs > 0)
             .map_or(default.poll_interval, Duration::from_secs);
+        let prefetch = store
+            .setting(PREFETCH)?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default.prefetch);
         let notify_new_mail = store
             .setting(NOTIFY_NEW_MAIL)?
             .and_then(|s| s.parse().ok())
@@ -132,6 +146,7 @@ impl Settings {
         Ok(Self {
             theme,
             poll_interval,
+            prefetch,
             notify_new_mail,
             keep_running,
             check_updates,
@@ -147,6 +162,7 @@ impl Settings {
     pub fn save(&self, store: &Store) -> Result<()> {
         store.set_setting(THEME, self.theme.key())?;
         store.set_setting(POLL_INTERVAL, &self.poll_interval.as_secs().to_string())?;
+        store.set_setting(PREFETCH, &self.prefetch.to_string())?;
         store.set_setting(NOTIFY_NEW_MAIL, &self.notify_new_mail.to_string())?;
         store.set_setting(KEEP_RUNNING, &self.keep_running.to_string())?;
         store.set_setting(CHECK_UPDATES, &self.check_updates.to_string())?;
@@ -170,6 +186,7 @@ mod tests {
         let settings = Settings {
             theme: Theme::Dark,
             poll_interval: Duration::from_mins(5),
+            prefetch: 50,
             notify_new_mail: false,
             keep_running: false,
             check_updates: false,
@@ -184,6 +201,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.set_setting(THEME, "sepia").unwrap();
         store.set_setting(POLL_INTERVAL, "0").unwrap();
+        store.set_setting(PREFETCH, "lots").unwrap();
         store.set_setting(NOTIFY_NEW_MAIL, "loudly").unwrap();
         store.set_setting(KEEP_RUNNING, "sometimes").unwrap();
         store.set_setting(CHECK_UPDATES, "maybe").unwrap();
