@@ -15,7 +15,7 @@ use rune::{
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow, SplitView, Toolbar};
 use rune_kit::{
     Button, ButtonVariant, Dialog, Divider, IconButton, IconButtonVariant, Kit, Markdown,
-    MarkdownStyle, Menu, MenuEntry, MenuItem, Placement, SegmentedControl, Spinner, Switch,
+    MarkdownStyle, Menu, MenuEntry, MenuItem, Placement, SegmentedControl, Spinner, State, Switch,
     TextArea, TextInput, Toast, ToastRegion, context_menu, glyphs, root,
 };
 
@@ -24,7 +24,9 @@ use crate::compose::{ComposeForm, Mode, Preview};
 use crate::form::{AccountForm, SECURITY, Step, security_index};
 use crate::rich::RichEditor;
 use crate::search::{SERVER_PAGE, ServerSearch};
-use crate::state::{INBOX as INBOX_NAME, Mail, MailboxMenu, MessageMenu, Reader, Showing};
+use crate::state::{
+    INBOX as INBOX_NAME, Mail, MailboxMenu, MessageMenu, Reader, SettingsSection, Showing,
+};
 use crate::transfer::{self as moving, Transfer};
 use crate::update::{self, Phase};
 
@@ -1513,9 +1515,60 @@ fn field(k: &Kit, label: &str, input: El) -> El {
         .child(input)
 }
 
-/// The settings: the theme, how often mail is checked, how many messages are downloaded ahead,
-/// and the accounts, each removable.
+/// The settings, in sections picked with the tabs at the page's top: General (the theme,
+/// notifications, closing the window and updates), Accounts (each editable and removable, and
+/// moving them to another computer) and Advanced (how often mail is checked and how many
+/// messages are downloaded ahead).
 fn settings(s: &Mail, k: &Kit) -> El {
+    let labels: Vec<&str> = SettingsSection::ALL.iter().map(|t| t.label()).collect();
+    let mut tabs = SegmentedControl::new(
+        &labels,
+        SettingsSection::ALL
+            .iter()
+            .position(|t| *t == s.settings_section),
+    );
+    for (i, section) in SettingsSection::ALL.iter().enumerate() {
+        if !s.can_show_settings_section(*section) {
+            tabs = tabs.segment_state(i, State::Disabled);
+        }
+    }
+    let tabs = tabs
+        .label("Settings section")
+        .fit()
+        .on_pick(|s: &mut Mail, i, _| {
+            if let Some(section) = SettingsSection::ALL.get(i) {
+                s.show_settings_section(*section);
+            }
+        })
+        .build(k)
+        .key("settings-sections");
+    let mut page = col()
+        .key("settings")
+        .w_full()
+        .max_w(560.0)
+        .padding(24.0)
+        .gap(24.0)
+        .child(row().child(tabs));
+    page = match s.settings_section {
+        SettingsSection::General => general_settings(s, k, page),
+        SettingsSection::Accounts => page
+            .child(settings_accounts(s, k))
+            .child(transfer(&s.transfer, k)),
+        SettingsSection::Advanced => advanced_settings(s, k, page),
+    };
+    col()
+        .key("settings-scroll")
+        .w_full()
+        .child(page)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .grow(1.0)
+        .min_h(0.0)
+}
+
+/// The settings' General section: the theme, notifications, closing the window and updates.
+fn general_settings(s: &Mail, k: &Kit, page: El) -> El {
     let themes: Vec<&str> = Theme::ALL.iter().map(|t| t.label()).collect();
     let theme = SegmentedControl::new(
         &themes,
@@ -1530,39 +1583,7 @@ fn settings(s: &Mail, k: &Kit) -> El {
     })
     .build(k)
     .key("theme");
-    let intervals: Vec<String> = POLL_INTERVALS.iter().map(|d| interval_label(*d)).collect();
-    let interval = SegmentedControl::new(
-        &intervals,
-        POLL_INTERVALS
-            .iter()
-            .position(|d| *d == s.settings.poll_interval),
-    )
-    .label("Check for new mail every")
-    .fit()
-    .on_pick(|s: &mut Mail, i, _| {
-        if let Some(every) = POLL_INTERVALS.get(i) {
-            s.set_poll_interval(*every);
-        }
-    })
-    .build(k)
-    .key("poll-interval");
-    let page = col()
-        .key("settings")
-        .w_full()
-        .max_w(560.0)
-        .padding(24.0)
-        .gap(24.0)
-        .child(setting_section(k, "Appearance", None, row().child(theme)))
-        .child(setting_section(
-            k,
-            "Checking for mail",
-            Some(
-                "Only for servers that can't tell Postden about new mail as it arrives (IMAP \
-                 IDLE). Changing it reconnects every account.",
-            ),
-            row().child(interval),
-        ))
-        .child(prefetch_setting(s, k))
+    page.child(setting_section(k, "Appearance", None, row().child(theme)))
         .child(setting_section(
             k,
             "Notifications",
@@ -1588,29 +1609,44 @@ fn settings(s: &Mail, k: &Kit) -> El {
         ))
         .child(setting_section(
             k,
-            "Accounts",
-            None,
-            settings_accounts(s, k),
-        ))
-        .child(transfer(&s.transfer, k))
-        .child(setting_section(
-            k,
             "Updates",
             Some(
                 "Postden asks GitHub for new releases when it starts and once a day, and \
                  shows what changed before you update.",
             ),
             updates(s, k),
-        ));
-    col()
-        .key("settings-scroll")
-        .w_full()
-        .child(page)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .grow(1.0)
-        .min_h(0.0)
+        ))
+}
+
+/// The settings' Advanced section: how often mail is checked, and how many messages are
+/// downloaded ahead.
+fn advanced_settings(s: &Mail, k: &Kit, page: El) -> El {
+    let intervals: Vec<String> = POLL_INTERVALS.iter().map(|d| interval_label(*d)).collect();
+    let interval = SegmentedControl::new(
+        &intervals,
+        POLL_INTERVALS
+            .iter()
+            .position(|d| *d == s.settings.poll_interval),
+    )
+    .label("Check for new mail every")
+    .fit()
+    .on_pick(|s: &mut Mail, i, _| {
+        if let Some(every) = POLL_INTERVALS.get(i) {
+            s.set_poll_interval(*every);
+        }
+    })
+    .build(k)
+    .key("poll-interval");
+    page.child(setting_section(
+        k,
+        "Checking for mail",
+        Some(
+            "Only for servers that can't tell Postden about new mail as it arrives (IMAP \
+             IDLE). Changing it reconnects every account.",
+        ),
+        row().child(interval),
+    ))
+    .child(prefetch_setting(s, k))
 }
 
 /// Every account set up, with buttons to edit or remove it.
