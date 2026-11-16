@@ -382,6 +382,9 @@ fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut 
     if mailbox.role == Role::Inbox && unread > 0 {
         r = r.badge(unread.to_string());
     }
+    if s.marking_seen(account, &mailbox.name) {
+        r = r.status(RowStatus::Busy);
+    }
     let (menu_account, menu_mailbox) = (account.to_owned(), mailbox.name.clone());
     let r = r
         .build(k)
@@ -390,13 +393,17 @@ fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut 
             s.open_mailbox_menu(&menu_account, &menu_mailbox, point);
         });
     match &s.mailbox_menu {
-        Some(menu) if menu.is(account, &mailbox.name) => mailbox_menu(menu, r, k, layer),
+        Some(menu) if menu.is(account, &mailbox.name) => {
+            let marking = s.marking_seen(account, &mailbox.name);
+            mailbox_menu(menu, marking, r, k, layer)
+        }
         _ => r,
     }
 }
 
-/// A mailbox's menu, open at where it was right-clicked.
-fn mailbox_menu(menu: &MailboxMenu, row: El, k: &Kit, layer: &mut Vec<El>) -> El {
+/// A mailbox's menu, open at where it was right-clicked. While it's `marking` read, it can't be
+/// marked again.
+fn mailbox_menu(menu: &MailboxMenu, marking: bool, row: El, k: &Kit, layer: &mut Vec<El>) -> El {
     let (account, mailbox) = &menu.mailbox;
     let (a, b) = (account.clone(), mailbox.clone());
     context_menu(
@@ -407,7 +414,13 @@ fn mailbox_menu(menu: &MailboxMenu, row: El, k: &Kit, layer: &mut Vec<El>) -> El
     .min_width(200.0)
     .on_close(Mail::close_mailbox_menu)
     .item(
-        MenuItem::new("Mark all as read").on_select(move |s: &mut Mail| {
+        MenuItem::new(if marking {
+            "Marking all as read…"
+        } else {
+            "Mark all as read"
+        })
+        .disabled(marking)
+        .on_select(move |s: &mut Mail| {
             s.close_mailbox_menu();
             s.mark_all_seen(&a, &b);
         }),

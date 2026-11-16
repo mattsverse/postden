@@ -268,6 +268,8 @@ pub(crate) struct Mail {
     pending_reply: Option<(MessageKey, bool)>,
     /// Messages being moved, left out of the list until the server answers.
     moving: HashSet<MessageKey>,
+    /// Mailboxes being marked read, as asked with [`Mail::mark_all_seen`], until the server answers.
+    marking_seen: HashSet<MailboxKey>,
     /// The message being written, shown over the reader and the list.
     pub(crate) compose: ComposeForm,
     /// The app's preferences, as last saved.
@@ -321,6 +323,7 @@ impl Mail {
             mailbox_menu: None,
             pending_reply: None,
             moving: HashSet::new(),
+            marking_seen: HashSet::new(),
             collapsed: HashSet::new(),
             settings: Settings::default(),
             settings_open: false,
@@ -636,6 +639,13 @@ impl Mail {
     /// Every message below `up_to` was marked; with `None`, the mailbox started over meanwhile, so
     /// nothing listed was.
     fn all_seen(&mut self, account: &str, mailbox: &str, result: Result<Option<u32>, String>) {
+        self.marking_seen
+            .remove(&(account.to_owned(), mailbox.to_owned()));
+        let name = self.mailbox_label(account, mailbox);
+        // Started over meanwhile, the server still marked it all; the store refetches it as it is.
+        if result.is_ok() {
+            self.notify(format!("Marked {name} as read"));
+        }
         match result {
             Ok(None) => {}
             Ok(Some(up_to)) => {
@@ -650,7 +660,6 @@ impl Mail {
             }
             Err(error) => {
                 let label = self.label(account).to_owned();
-                let name = self.mailbox_label(account, mailbox);
                 self.notify(format!("{label}: couldn't mark {name} as read: {error}"));
             }
         }
@@ -1147,8 +1156,12 @@ impl Mail {
     }
 
     /// Marks every message in one of an account's mailboxes read, on the server too. It shows once
-    /// the server agrees.
+    /// the server agrees; until then the mailbox shows it's busy, and isn't marked again.
     pub(crate) fn mark_all_seen(&mut self, account: &str, mailbox: &str) {
+        let key = (account.to_owned(), mailbox.to_owned());
+        if self.marking_seen.contains(&key) {
+            return;
+        }
         let Ok(services) = &self.services else { return };
         if let Err(e) = services
             .mailroom
@@ -1156,7 +1169,16 @@ impl Mail {
         {
             let label = self.label(account).to_owned();
             self.notify(format!("{label}: couldn't mark the mailbox as read: {e}"));
+            return;
         }
+        self.marking_seen.insert(key);
+    }
+
+    /// Whether one of an account's mailboxes is being marked read, waiting on the server.
+    pub(crate) fn marking_seen(&self, account: &str, mailbox: &str) -> bool {
+        self.marking_seen
+            .iter()
+            .any(|(a, m)| a == account && m == mailbox)
     }
 
     /// Replies to a message, to its sender or everyone. It opens first, as the reply quotes it,
