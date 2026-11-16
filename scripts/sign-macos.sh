@@ -129,7 +129,9 @@ ln -s /Applications "$private_dir/image/Applications"
 dmg="$PWD/dist/Postden-$version-universal.dmg"
 rm -f "$dmg"
 # HFS+ UDZO images have been corrupt on macOS 15 runners.
-hdiutil create -volname Postden -srcfolder "$private_dir/image" -fs APFS -format UDZO "$dmg"
+# hdiutil underestimates APFS volume sizes from -srcfolder, so size it explicitly.
+size_mb=$(( $(du -sm "$private_dir/image" | cut -f1) + 50 ))
+hdiutil create -volname Postden -srcfolder "$private_dir/image" -size "${size_mb}m" -fs APFS -format UDZO "$dmg"
 hdiutil verify "$dmg"
 codesign --sign "$identity" --keychain "$keychain" --timestamp "$dmg"
 notarize "$dmg" dmg
