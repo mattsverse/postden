@@ -49,8 +49,8 @@ pub struct Envelope {
     pub seen: bool,
 }
 
-/// What a mailbox is for. Each account has one inbox and at most one Sent, Archive and Trash
-/// mailbox, though their names differ by server; every other mailbox is [`Role::Other`].
+/// What a mailbox is for. Each account has one inbox and at most one Sent, Archive, Trash and
+/// Snoozed mailbox, though their names differ by server; every other mailbox is [`Role::Other`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Role {
     /// Where mail arrives: `INBOX`.
@@ -62,6 +62,8 @@ pub enum Role {
     Archive,
     /// Where messages go when they're deleted, such as `Trash` or `Deleted Items`.
     Trash,
+    /// Where snoozed messages wait until they're due back in the inbox, such as `Snoozed`.
+    Snoozed,
     /// Any other mailbox: folders, drafts, junk.
     Other,
 }
@@ -75,6 +77,7 @@ impl Role {
             Self::Sent => "sent",
             Self::Archive => "archive",
             Self::Trash => "trash",
+            Self::Snoozed => "snoozed",
             Self::Other => "other",
         }
     }
@@ -87,6 +90,7 @@ impl Role {
             Self::Sent,
             Self::Archive,
             Self::Trash,
+            Self::Snoozed,
             Self::Other,
         ]
         .into_iter()

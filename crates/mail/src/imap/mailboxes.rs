@@ -15,9 +15,14 @@ const SENT_NAMES: [&str; 4] = ["Sent", "Sent Items", "Sent Messages", "Sent Mail
 const ARCHIVE_NAMES: [&str; 2] = ["Archive", "Archives"];
 /// What a Trash mailbox is called when the server doesn't mark one, as [`SENT_NAMES`].
 const TRASH_NAMES: [&str; 3] = ["Trash", "Deleted Items", "Deleted Messages"];
+/// What a Snoozed mailbox is called when the server doesn't mark one, as [`SENT_NAMES`], and what
+/// one is created as when there's none.
+pub const SNOOZED_NAME: &str = "Snoozed";
+/// The special use some servers mark a Snoozed mailbox with (draft-ietf-mailmaint-imap-snooze).
+const SNOOZED_ATTRIBUTE: &str = "\\Snoozed";
 
-/// Every mailbox on the account that can be opened, with the inbox, Sent, Archive and Trash
-/// mailboxes marked.
+/// Every mailbox on the account that can be opened, with the inbox, Sent, Archive, Trash and
+/// Snoozed mailboxes marked.
 ///
 /// # Errors
 ///
@@ -43,12 +48,19 @@ pub(crate) async fn list_mailboxes(session: &mut Session) -> Result<Vec<Mailbox>
                     .into_iter()
                     .filter(|(attribute, _)| attributes.contains(attribute))
                     .map(|(_, mark)| mark)
+                    .chain(attributes.iter().any(is_snoozed).then_some(Mark::Snoozed))
                     .collect(),
                 selectable: !attributes.contains(&NameAttribute::NoSelect),
             }
         })
         .collect();
     Ok(classify(&listed))
+}
+
+/// Whether a LIST attribute marks the Snoozed mailbox. The crate doesn't know `\\Snoozed`, so it
+/// comes as an extension; attributes ignore case (RFC 3501 section 9).
+fn is_snoozed(attribute: &NameAttribute<'_>) -> bool {
+    matches!(attribute, NameAttribute::Extension(a) if a.eq_ignore_ascii_case(SNOOZED_ATTRIBUTE))
 }
 
 /// The name of the account's Sent mailbox, if it has one.
@@ -65,7 +77,7 @@ pub(crate) async fn find_sent(session: &mut Session) -> Result<Option<String>> {
 }
 
 /// The selectable mailboxes, each with its role. A mailbox has one role at most: the inbox comes
-/// first, then Sent, Archive and Trash, each picked from the mailboxes not picked already.
+/// first, then Sent, Archive, Trash and Snoozed, each picked from the mailboxes not picked already.
 fn classify(listed: &[Listed]) -> Vec<Mailbox> {
     // INBOX is case-insensitive (RFC 3501 section 5.1).
     let inbox = listed
@@ -75,10 +87,11 @@ fn classify(listed: &[Listed]) -> Vec<Mailbox> {
     let mut taken: Vec<&str> = inbox.into_iter().collect();
     let mut roles = Vec::new();
     // Gmail has no Archive mailbox: archiving there moves mail to All Mail, which it marks `\All`.
-    let wanted: [(Role, &[Mark], &[&str]); 3] = [
+    let wanted: [(Role, &[Mark], &[&str]); 4] = [
         (Role::Sent, &[Mark::Sent], &SENT_NAMES),
         (Role::Archive, &[Mark::Archive, Mark::All], &ARCHIVE_NAMES),
         (Role::Trash, &[Mark::Trash], &TRASH_NAMES),
+        (Role::Snoozed, &[Mark::Snoozed], &[SNOOZED_NAME]),
     ];
     for (role, marks, names) in wanted {
         if let Some(name) = pick(listed, marks, names, &taken) {
@@ -104,7 +117,7 @@ fn classify(listed: &[Listed]) -> Vec<Mailbox> {
         .collect()
 }
 
-/// A special use the server marks a mailbox with (RFC 6154).
+/// A special use the server marks a mailbox with (RFC 6154, and `\\Snoozed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mark {
     Sent,
@@ -112,6 +125,7 @@ enum Mark {
     /// Every message on the account, as Gmail's All Mail.
     All,
     Trash,
+    Snoozed,
 }
 
 /// A mailbox as LIST reports it.
@@ -262,6 +276,29 @@ mod tests {
             listed("Archive", &[Mark::Archive]),
         ];
         assert_eq!(role_of(&both, Role::Archive).as_deref(), Some("Archive"));
+    }
+
+    #[test]
+    fn snoozed_is_found_by_mark_then_by_name() {
+        let marked = [
+            listed("INBOX", &[]),
+            listed("Snoozed", &[]),
+            listed("Later", &[Mark::Snoozed]),
+        ];
+        assert_eq!(role_of(&marked, Role::Snoozed).as_deref(), Some("Later"));
+        let named = [listed("INBOX", &[]), listed("INBOX/snoozed", &[])];
+        assert_eq!(
+            role_of(&named, Role::Snoozed).as_deref(),
+            Some("INBOX/snoozed")
+        );
+        assert_eq!(role_of(&[listed("INBOX", &[])], Role::Snoozed), None);
+    }
+
+    #[test]
+    fn the_snoozed_attribute_is_read_whatever_its_case() {
+        assert!(is_snoozed(&NameAttribute::Extension("\\snoozed".into())));
+        assert!(!is_snoozed(&NameAttribute::Extension("\\Junk".into())));
+        assert!(!is_snoozed(&NameAttribute::Archive));
     }
 
     #[test]

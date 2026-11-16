@@ -1,7 +1,8 @@
 //! Watching every account's inbox in the background, refreshing its other mailboxes on a timer,
 //! and saving what arrives; downloading the inbox's newest messages ahead of their opening, when
-//! asked to; and opening, exporting, flagging, moving and sending messages on the same background
-//! runtime.
+//! asked to; and opening, exporting, flagging, moving, snoozing and sending messages on the same
+//! background runtime. Snoozed messages come back to the inbox unread once
+//! [`Mailroom::wake_due`] finds them due.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -13,12 +14,12 @@ use postden_core::account::{Account, Server};
 use postden_core::message::{Body, Envelope, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
-    Event, Found, Older, Prefetched, Status, WatchConfig, download_message, fetch_older,
-    mark_all_seen, move_message, open_message, prefetch_messages, refresh, save_sent_copy, search,
-    set_seen, watch,
+    Event, Found, Older, Prefetched, SNOOZED_NAME, Status, WatchConfig, download_message,
+    fetch_older, mark_all_seen, move_message, open_message, prefetch_messages, refresh,
+    save_sent_copy, search, set_seen, snooze_message, wake_message, watch,
 };
 use postden_mail::{Credentials, smtp};
-use postden_store::Store;
+use postden_store::{Snooze, Store};
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender, unbounded_channel};
@@ -134,6 +135,28 @@ pub enum Update {
         to: String,
         result: Result<bool, String>,
     },
+    /// A message asked for with [`Mailroom::snooze`] was moved to the account's Snoozed mailbox
+    /// `to`, to come back at `until`, in Unix seconds; or the move failed, and it may not have
+    /// been. The snooze is kept either way: waking forgets it if the message isn't there. Moved,
+    /// it says whether `uid` still named it, as [`Update::Moved`].
+    Snoozed {
+        account: String,
+        mailbox: String,
+        uid: u32,
+        to: String,
+        until: i64,
+        result: Result<bool, String>,
+    },
+    /// A snoozed message was due and is back in the inbox, unread, or wasn't in `mailbox` any
+    /// more; either way it's no longer snoozed. It's left `mailbox`, where it had `uids`, none if
+    /// that started over since. Failing, it stays snoozed and is tried again by the next
+    /// [`Mailroom::wake_due`].
+    Woke {
+        account: String,
+        mailbox: String,
+        uids: Vec<u32>,
+        result: Result<(), String>,
+    },
     /// A message handed to [`Mailroom::send`] was accepted by the account's SMTP server, or wasn't.
     /// On success, it's the `Message-ID` it was sent with.
     Sent {
@@ -215,6 +238,9 @@ enum Job {
         result: Result<u32, String>,
     },
     Moved(Moving, Result<(), String>),
+    /// A snoozed message was brought back, or wasn't: the UIDVALIDITY of the mailbox it waited in
+    /// and the UIDs it had there, or `None` if that mailbox couldn't be opened.
+    Woke(Snooze, Result<Option<(u32, Vec<u32>)>, String>),
     /// Work with nothing to save, such as sending or exporting a message: its update goes to the
     /// UI as it is, in turn with the others.
     Done(Update),
@@ -257,6 +283,8 @@ struct Moving {
     uid_validity: u32,
     uid: u32,
     to: String,
+    /// Moved to be snoozed: when it's due back.
+    snooze: Option<i64>,
 }
 
 /// Whose watch an event is from.
@@ -283,6 +311,7 @@ impl Job {
             | Self::Older { account, .. }
             | Self::Searched { account, .. } => Some(account),
             Self::Moved(moving, _) => Some(&moving.account),
+            Self::Woke(snooze, _) => Some(&snooze.account),
             _ => None,
         }
     }
@@ -328,6 +357,7 @@ impl Job {
                 result: replaced(),
             },
             Self::Moved(moving, _) => Self::Moved(moving, replaced()),
+            Self::Woke(snooze, _) => Self::Woke(snooze, replaced()),
             Self::Older {
                 account,
                 mailbox,
@@ -420,6 +450,8 @@ pub struct Mailroom {
     watches: Watches,
     /// The number of the last watch started.
     last_watch: u64,
+    /// The accounts whose due snoozes are being brought back, not to be asked for twice at once.
+    waking: Arc<Mutex<HashSet<String>>>,
 }
 
 type Logins = Arc<Mutex<HashMap<String, (Server, Credentials, u64)>>>;
@@ -477,6 +509,7 @@ impl Mailroom {
             logins,
             watches,
             last_watch: 0,
+            waking: Arc::default(),
         })
     }
 
@@ -813,9 +846,143 @@ impl Mailroom {
                 uid_validity,
                 uid,
                 to,
+                snooze: None,
             };
             let _ignored = jobs.send(Job::Moved(moving, result));
         });
+        Ok(())
+    }
+
+    /// Snoozes a message until `until`, in Unix seconds: moves it to the account's Snoozed
+    /// mailbox in the background, creating one if there's none, as [`Mailroom::move_message`].
+    /// The result arrives as [`Update::Snoozed`]. Once due, [`Mailroom::wake_due`] brings it back.
+    ///
+    /// The message is found again by `message_id`, its Message-ID as listed. The snooze is saved
+    /// before the message is moved, and kept whatever the move's result, which may be unknown:
+    /// if the message never reached the Snoozed mailbox, waking it finds nothing there and just
+    /// forgets it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Mailroom::open`], and when the message has no Message-ID to find it by once moved, or
+    /// is snoozed already.
+    pub fn snooze(
+        &self,
+        store: &Store,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        message_id: Option<&str>,
+        until: i64,
+    ) -> Result<()> {
+        let snoozed = store
+            .mailboxes(account)?
+            .into_iter()
+            .find(|m| m.role == Role::Snoozed)
+            .map(|m| m.name);
+        if snoozed.as_deref() == Some(mailbox) {
+            return Err(Error::Invalid("the message is snoozed already".to_owned()));
+        }
+        // A Message-ID is printable ASCII (RFC 5322 section 3.6.4), so it can be searched for.
+        let message_id = message_id
+            .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_graphic()))
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                Error::Invalid("the message has no Message-ID to find it by later".to_owned())
+            })?;
+        let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
+        let nudge = Arc::clone(&self.watched(account)?.nudge);
+        let create = snoozed.is_none();
+        let to = snoozed.unwrap_or_else(|| SNOOZED_NAME.to_owned());
+        store.snooze(&Snooze {
+            account: account.to_owned(),
+            message_id,
+            mailbox: to.clone(),
+            until,
+        })?;
+        let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
+        self.handle.spawn(async move {
+            let result = snooze_message(
+                &server,
+                &credentials,
+                &mailbox,
+                uid_validity,
+                uid,
+                &to,
+                create,
+            )
+            .await
+            .map_err(|e| e.to_string());
+            if result.is_ok() {
+                nudge.notify_one();
+            }
+            let moving = Moving {
+                account,
+                mailbox,
+                uid_validity,
+                uid,
+                to,
+                snooze: Some(until),
+            };
+            let _ignored = jobs.send(Job::Moved(moving, result));
+        });
+        Ok(())
+    }
+
+    /// Brings every snooze due by `now`, in Unix seconds, back to its account's inbox in the
+    /// background, unread. Each arrives as [`Update::Woke`]. An account's are brought back one
+    /// at a time, on one connection at a time, so many due at once don't crowd the server. Those
+    /// of accounts not watched, or with snoozes being brought back already, wait for a later call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store can't be read.
+    pub fn wake_due(&self, store: &Store, now: i64) -> Result<()> {
+        let mut due: HashMap<String, Vec<Snooze>> = HashMap::new();
+        for snooze in store.due_snoozes(now)? {
+            due.entry(snooze.account.clone()).or_default().push(snooze);
+        }
+        for (account, snoozes) in due {
+            let Ok(watched) = self.watched(&account) else {
+                continue;
+            };
+            if !self
+                .waking
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(account.clone())
+            {
+                continue;
+            }
+            let (server, credentials) = (watched.server.clone(), watched.credentials.clone());
+            let jobs = Asking {
+                jobs: self.jobs.clone(),
+                watch: watched.number,
+            };
+            let nudge = Arc::clone(&watched.nudge);
+            let waking = Arc::clone(&self.waking);
+            self.handle.spawn(async move {
+                for snooze in snoozes {
+                    let result = wake_message(
+                        &server,
+                        &credentials,
+                        &snooze.mailbox,
+                        &snooze.message_id,
+                        INBOX,
+                    )
+                    .await
+                    .map_err(|e| e.to_string());
+                    if result.is_ok() {
+                        nudge.notify_one();
+                    }
+                    let _ignored = jobs.send(Job::Woke(snooze, result));
+                }
+                waking
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&account);
+            });
+        }
         Ok(())
     }
 
@@ -1283,6 +1450,7 @@ fn save(store: &mut Store, job: Job) -> Vec<Update> {
             result,
         } => vec![all_seen(store, account, mailbox, uid_validity, result)],
         Job::Moved(moving, result) => vec![moved(store, moving, result)],
+        Job::Woke(snooze, result) => vec![woke(store, &snooze, result)],
         Job::Done(update) => vec![update],
         Job::Older {
             account,
@@ -1312,6 +1480,7 @@ fn moved(store: &mut Store, moving: Moving, result: Result<(), String>) -> Updat
         uid_validity,
         uid,
         to,
+        snooze,
     } = moving;
     let result = result.and_then(|()| {
         let current = store
@@ -1326,11 +1495,56 @@ fn moved(store: &mut Store, moving: Moving, result: Result<(), String>) -> Updat
             .map(|_| true)
             .map_err(|e| e.to_string())
     });
-    Update::Moved {
+    let Some(until) = snooze else {
+        return Update::Moved {
+            account,
+            mailbox,
+            uid,
+            to,
+            result,
+        };
+    };
+    Update::Snoozed {
         account,
         mailbox,
         uid,
         to,
+        until,
+        result,
+    }
+}
+
+/// A snoozed message was brought back to the inbox, or wasn't: once it was, it's no longer
+/// snoozed, and leaves the mailbox it waited in, unless that started over since.
+fn woke(
+    store: &mut Store,
+    snooze: &Snooze,
+    result: Result<Option<(u32, Vec<u32>)>, String>,
+) -> Update {
+    let mut left = Vec::new();
+    let result = result.and_then(|found| {
+        let saved = (|| {
+            store.unsnooze(&snooze.account, &snooze.message_id, snooze.until)?;
+            let Some((uid_validity, uids)) = found else {
+                return Ok(());
+            };
+            let current = store
+                .mailbox_state(&snooze.account, &snooze.mailbox)?
+                .is_some_and(|s| s.uid_validity == uid_validity);
+            if current {
+                for uid in uids {
+                    store.remove_message(&snooze.account, &snooze.mailbox, uid)?;
+                    left.push(uid);
+                }
+            }
+            Ok::<_, postden_store::Error>(())
+        })();
+        saved.map_err(|e| e.to_string())
+    });
+    Update::Woke {
+        account: snooze.account.clone(),
+        mailbox: snooze.mailbox.clone(),
+        uids: left,
         result,
     }
 }
@@ -2035,6 +2249,7 @@ mod tests {
                 uid_validity: 1,
                 uid: 1,
                 to: "Archive".into(),
+                snooze: None,
             };
             Job::Moved(moving, result)
         };
@@ -2072,5 +2287,120 @@ mod tests {
         assert_eq!(cached(&store), 1, "the message now at UID 1 stays");
         save(&mut store, messages(2, &[1]));
         assert_eq!(cached(&store), 1, "and later syncs don't skip it");
+    }
+
+    fn snooze(until: i64) -> Snooze {
+        Snooze {
+            account: "me@example.com".into(),
+            message_id: "a@example.com".into(),
+            mailbox: "Snoozed".into(),
+            until,
+        }
+    }
+
+    #[test]
+    fn a_snooze_is_kept_whatever_came_of_its_move() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        save(&mut store, messages(1, &[1, 2]));
+        let job = |uid, result| {
+            let moving = Moving {
+                account: "me@example.com".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                uid,
+                to: "Snoozed".into(),
+                snooze: Some(100),
+            };
+            Job::Moved(moving, result)
+        };
+
+        store.snooze(&snooze(100)).unwrap();
+        let failed = save(&mut store, job(1, Err("offline".into())));
+        assert!(
+            matches!(
+                failed.as_slice(),
+                [Update::Snoozed {
+                    until: 100,
+                    result: Err(_),
+                    ..
+                }]
+            ),
+            "got {failed:?}"
+        );
+        // It may have moved all the same; if not, waking it finds nothing and forgets it.
+        assert_eq!(store.due_snoozes(100).unwrap(), vec![snooze(100)]);
+
+        let moved = save(&mut store, job(2, Ok(())));
+        assert!(
+            matches!(
+                moved.as_slice(),
+                [Update::Snoozed { to, result: Ok(true), .. }] if to == "Snoozed"
+            ),
+            "got {moved:?}"
+        );
+        assert_eq!(store.due_snoozes(100).unwrap(), vec![snooze(100)]);
+        assert_eq!(
+            store.recent_messages(Role::Inbox, 10).unwrap().len(),
+            1,
+            "it left the inbox"
+        );
+    }
+
+    #[test]
+    fn a_woken_message_is_no_longer_snoozed_or_listed_where_it_waited() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        let waiting = Job::Watched(Event::Messages {
+            account: "me@example.com".into(),
+            mailbox: "Snoozed".into(),
+            role: Role::Snoozed,
+            uid_validity: 7,
+            messages: vec![Envelope {
+                uid: 3,
+                message_id: Some("a@example.com".into()),
+                from: Address::default(),
+                to: Vec::new(),
+                subject: None,
+                date: None,
+                seen: true,
+            }],
+        });
+        save(&mut store, waiting);
+        store.snooze(&snooze(100)).unwrap();
+        let cached = |store: &Store| store.recent_messages(Role::Snoozed, 10).unwrap().len();
+
+        let failed = save(&mut store, Job::Woke(snooze(100), Err("offline".into())));
+        assert!(
+            matches!(failed.as_slice(), [Update::Woke { result: Err(_), .. }]),
+            "got {failed:?}"
+        );
+        assert_eq!(
+            store.due_snoozes(100).unwrap(),
+            vec![snooze(100)],
+            "tried again later"
+        );
+        assert_eq!(cached(&store), 1);
+
+        let woke = save(&mut store, Job::Woke(snooze(100), Ok(Some((7, vec![3])))));
+        assert!(
+            matches!(woke.as_slice(), [Update::Woke { uids, result: Ok(()), .. }] if uids == &[3]),
+            "got {woke:?}"
+        );
+        assert_eq!(store.due_snoozes(100).unwrap(), vec![]);
+        assert_eq!(cached(&store), 0, "it left the Snoozed mailbox");
+
+        // A Snoozed mailbox the server won't open, as one never created, holds nothing to wake.
+        store.snooze(&snooze(200)).unwrap();
+        let missing = save(&mut store, Job::Woke(snooze(200), Ok(None)));
+        assert!(
+            matches!(missing.as_slice(), [Update::Woke { result: Ok(()), .. }]),
+            "got {missing:?}"
+        );
+        assert_eq!(
+            store.due_snoozes(200).unwrap(),
+            vec![],
+            "forgotten, not retried"
+        );
     }
 }

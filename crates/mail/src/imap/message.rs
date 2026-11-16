@@ -1,16 +1,21 @@
-//! Opening one message, downloading it whole, setting whether it's been read, and moving it to
-//! another mailbox.
+//! Opening one message, downloading it whole, setting whether it's been read, moving it to
+//! another mailbox, and snoozing it and bringing it back.
 //!
 //! Each call opens a connection of its own, so it never waits behind a watcher's IDLE.
 
+use async_imap::types::NameAttribute;
 use futures::TryStreamExt as _;
 use mail_parser::MessageParser;
 use postden_core::account::Server;
 use postden_core::message::{Address, Body};
 
 use super::connection::{Session, connect};
+use super::search::quote;
 use super::watch::with_timeout;
 use crate::{Credentials, Error, Result};
+
+/// How long to wait for the server to answer a logout after a wake, before dropping the connection.
+const LOGOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Downloads message `uid` from `mailbox` and marks it read.
 ///
@@ -257,34 +262,158 @@ pub async fn move_message(
     let result = async {
         let capabilities = with_timeout(session.capabilities()).await?;
         select(&mut session, mailbox, uid_validity).await?;
-        let uid = uid.to_string();
-        if capabilities.has_str("MOVE") {
-            with_timeout(session.uid_mv(&uid, to)).await
-        } else if capabilities.has_str("UIDPLUS") {
-            with_timeout(session.uid_copy(&uid, to)).await?;
-            with_timeout(async {
-                session
-                    .uid_store(&uid, "+FLAGS.SILENT (\\Deleted)")
-                    .await?
-                    .try_for_each(|_fetch| async { Ok(()) })
-                    .await
-            })
-            .await?;
-            with_timeout(async {
-                session
-                    .uid_expunge(&uid)
-                    .await?
-                    .try_for_each(|_uid| async { Ok(()) })
-                    .await
-            })
-            .await
-        } else {
-            Err(Error::CantMove)
-        }
+        move_selected(&mut session, &capabilities, &uid.to_string(), to).await
     }
     .await;
     let _ignored = session.logout().await;
     result
+}
+
+/// Moves message `uid` from `mailbox` to the account's Snoozed mailbox `to`, as [`move_message`].
+///
+/// `to` is created first when `create` is set. A server saying it exists already isn't an error:
+/// the move tells whether it's there.
+///
+/// # Errors
+///
+/// As [`move_message`].
+pub async fn snooze_message(
+    server: &Server,
+    credentials: &Credentials,
+    mailbox: &str,
+    uid_validity: u32,
+    uid: u32,
+    to: &str,
+    create: bool,
+) -> Result<()> {
+    let mut session = connect(server, credentials).await?;
+    let result = async {
+        if create {
+            match with_timeout(session.create(to)).await {
+                Err(Error::Imap(async_imap::error::Error::No(_))) | Ok(()) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let capabilities = with_timeout(session.capabilities()).await?;
+        select(&mut session, mailbox, uid_validity).await?;
+        move_selected(&mut session, &capabilities, &uid.to_string(), to).await
+    }
+    .await;
+    let _ignored = session.logout().await;
+    result
+}
+
+/// Brings a snoozed message back: finds it in `mailbox` by `message_id`, marks it unread and
+/// moves it to `to`.
+///
+/// Returns the mailbox's UIDVALIDITY and the UIDs it had there, none if it was no longer there,
+/// as when moved elsewhere by hand; or `None` when the server has no `mailbox` that can hold
+/// mail, as when it was never created or was deleted, so the message can't be there.
+///
+/// # Errors
+///
+/// Returns an error when the connection fails, the server can't move messages, or it refused to.
+pub async fn wake_message(
+    server: &Server,
+    credentials: &Credentials,
+    mailbox: &str,
+    message_id: &str,
+    to: &str,
+) -> Result<Option<(u32, Vec<u32>)>> {
+    let mut session = connect(server, credentials).await?;
+    let result = async {
+        let capabilities = with_timeout(session.capabilities()).await?;
+        let selected = match with_timeout(session.select(mailbox)).await {
+            // A NO may be passing, as `[UNAVAILABLE]`: only a mailbox the server doesn't list as
+            // one that can hold mail is gone, and the snooze tried again otherwise. async-imap
+            // sends the pattern as is, so it's quoted, and matched exactly, as it may hold
+            // wildcards.
+            Err(refused @ Error::Imap(async_imap::error::Error::No(_))) => {
+                let listed: Vec<_> = with_timeout(async {
+                    session
+                        .list(Some(""), Some(&quote(mailbox)))
+                        .await?
+                        .try_collect()
+                        .await
+                })
+                .await?;
+                let holds_mail = |attribute: &NameAttribute<'_>| match attribute {
+                    NameAttribute::NoSelect => false,
+                    NameAttribute::Extension(a) => !a.eq_ignore_ascii_case("\\NonExistent"),
+                    _ => true,
+                };
+                let there = listed
+                    .iter()
+                    .any(|n| n.name() == mailbox && n.attributes().iter().all(holds_mail));
+                return if there { Err(refused) } else { Ok(None) };
+            }
+            selected => selected?,
+        };
+        let uid_validity = selected
+            .uid_validity
+            .ok_or_else(|| Error::NoUidValidity(mailbox.to_owned()))?;
+        let query = format!("HEADER Message-ID {}", quote(&format!("<{message_id}>")));
+        let mut uids: Vec<u32> = with_timeout(session.uid_search(query))
+            .await?
+            .into_iter()
+            .collect();
+        if uids.is_empty() {
+            return Ok(Some((uid_validity, uids)));
+        }
+        uids.sort_unstable();
+        let set = uid_set(&uids);
+        with_timeout(async {
+            session
+                .uid_store(&set, "-FLAGS.SILENT (\\Seen)")
+                .await?
+                .try_for_each(|_fetch| async { Ok(()) })
+                .await
+        })
+        .await?;
+        move_selected(&mut session, &capabilities, &set, to).await?;
+        Ok(Some((uid_validity, uids)))
+    }
+    .await;
+    // Bounded, as the next wake waits for this one: a server gone quiet mustn't hold it up.
+    if result.is_ok() {
+        let _ignored = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
+    }
+    result
+}
+
+/// Moves the messages `uids` (a UID set) of the selected mailbox to `to`: with MOVE (RFC 6851),
+/// or else COPY, flagging them `\Deleted` and expunging just them (UIDPLUS, RFC 4315). A server
+/// with neither is refused: a plain EXPUNGE would also remove every other message flagged
+/// `\Deleted` in the mailbox.
+async fn move_selected(
+    session: &mut Session,
+    capabilities: &async_imap::types::Capabilities,
+    uids: &str,
+    to: &str,
+) -> Result<()> {
+    if capabilities.has_str("MOVE") {
+        with_timeout(session.uid_mv(uids, to)).await
+    } else if capabilities.has_str("UIDPLUS") {
+        with_timeout(session.uid_copy(uids, to)).await?;
+        with_timeout(async {
+            session
+                .uid_store(uids, "+FLAGS.SILENT (\\Deleted)")
+                .await?
+                .try_for_each(|_fetch| async { Ok(()) })
+                .await
+        })
+        .await?;
+        with_timeout(async {
+            session
+                .uid_expunge(uids)
+                .await?
+                .try_for_each(|_uid| async { Ok(()) })
+                .await
+        })
+        .await
+    } else {
+        Err(Error::CantMove)
+    }
 }
 
 async fn select(session: &mut Session, mailbox: &str, uid_validity: u32) -> Result<()> {
