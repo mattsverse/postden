@@ -13,6 +13,7 @@
 //!   another computer.
 //! - [`Settings`]: the app's preferences, such as its [`Theme`] and whether to check for updates.
 //! - [`format_date`] and [`recipients`]: dates and recipients as a mail list shows them.
+//! - [`snooze_times`] and [`format_snooze`]: when a message can be snoozed until, and saying so.
 //! - [`eml_file_name`]: what to call a message exported as an `.eml` file.
 //! - [`mail_notice`] and [`new_mail_alert`]: what to tell the user when mail arrives.
 
@@ -246,9 +247,74 @@ pub fn format_date(unix: Option<i64>, now: &Zoned) -> String {
     at.strftime(format).to_string()
 }
 
+/// When a message can be snoozed until, as of `now`, each with its menu label: in three hours,
+/// tomorrow at 08:00, and next Monday at 08:00 (a week on, from a Monday).
+#[must_use]
+pub fn snooze_times(now: &Zoned) -> Vec<(&'static str, Timestamp)> {
+    let morning = |date: jiff::civil::Date| {
+        date.at(8, 0, 0, 0)
+            .to_zoned(now.time_zone().clone())
+            .ok()
+            .map(|z| z.timestamp())
+    };
+    let today = now.date();
+    [
+        (
+            "In 3 hours",
+            now.timestamp()
+                .checked_add(jiff::SignedDuration::from_hours(3))
+                .ok(),
+        ),
+        ("Tomorrow morning", today.tomorrow().ok().and_then(morning)),
+        (
+            "Next week",
+            today
+                .nth_weekday(1, jiff::civil::Weekday::Monday)
+                .ok()
+                .and_then(morning),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, at)| Some((label, at?)))
+    .collect()
+}
+
+/// When a snoozed message comes back, for a notice: `Tue Nov 17, 08:00`.
+#[must_use]
+pub fn format_snooze(until: Timestamp, now: &Zoned) -> String {
+    until
+        .to_zoned(now.time_zone().clone())
+        .strftime("%a %b %-d, %H:%M")
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use jiff::tz::TimeZone;
+
+    #[test]
+    fn snoozes_end_in_three_hours_tomorrow_morning_or_next_monday() {
+        // Wednesday 2026-11-18 21:30 in Paris.
+        let now: Zoned = "2026-11-18T21:30[Europe/Paris]".parse().unwrap();
+        let times: Vec<(&str, String)> = snooze_times(&now)
+            .into_iter()
+            .map(|(label, at)| (label, format_snooze(at, &now)))
+            .collect();
+        assert_eq!(
+            times,
+            [
+                ("In 3 hours", "Thu Nov 19, 00:30".to_owned()),
+                ("Tomorrow morning", "Thu Nov 19, 08:00".to_owned()),
+                ("Next week", "Mon Nov 23, 08:00".to_owned()),
+            ]
+        );
+        let monday: Zoned = "2026-11-23T07:00[Europe/Paris]".parse().unwrap();
+        assert_eq!(
+            format_snooze(snooze_times(&monday)[2].1, &monday),
+            "Mon Nov 30, 08:00",
+            "from a Monday, next week is a week on"
+        );
+    }
 
     use super::*;
 

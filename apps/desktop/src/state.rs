@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use jiff::Zoned;
+use jiff::{Timestamp, Zoned};
 use postden_app::{
     Draft, Imported, Login, Mailroom, Passwords, Profile, Settings, Theme, Update, check_logins,
     eml_file_name, finish_google_sign_in, is_sealed, password_key, remove_account, save_account,
@@ -71,6 +71,8 @@ pub(crate) struct MessageMenu {
     pub(crate) point: PointerPress,
     /// Its "Move to" submenu is open.
     pub(crate) move_open: bool,
+    /// Its "Snooze" submenu is open.
+    pub(crate) snooze_open: bool,
 }
 
 impl MessageMenu {
@@ -233,6 +235,8 @@ const NOTICE_SECS: u64 = 6;
 const FIRST_UPDATE_CHECK: Duration = Duration::from_secs(10);
 /// How often updates are checked for while the app runs.
 const UPDATE_CHECK_EVERY: Duration = Duration::from_hours(24);
+/// How often snoozed messages are checked for being due, so one comes back within this of its time.
+const WAKE_EVERY: Duration = Duration::from_secs(30);
 
 pub(crate) struct Mail {
     handle: Option<AppHandle<Self>>,
@@ -389,6 +393,8 @@ impl Mail {
                     Err(_) => {}
                 }
                 mail.form.open = mail.accounts.is_empty();
+                // What came due while the app was closed comes back now, then the rest on time.
+                mail.wake_snoozed();
                 mail.updater = Updater::new();
                 if mail.settings.check_updates {
                     mail.schedule_update_check(FIRST_UPDATE_CHECK);
@@ -615,6 +621,7 @@ impl Mail {
                 to,
                 result,
             } => self.moved(&account, &mailbox, uid, &to, result),
+            update @ (Update::Snoozed { .. } | Update::Woke { .. }) => self.snoozed(update),
             Update::Exported {
                 account,
                 path,
@@ -1156,6 +1163,7 @@ impl Mail {
             message: (account.to_owned(), mailbox.to_owned(), uid),
             point,
             move_open: false,
+            snooze_open: false,
         });
     }
 
@@ -1167,6 +1175,15 @@ impl Mail {
     pub(crate) const fn toggle_move_menu(&mut self) {
         if let Some(menu) = &mut self.message_menu {
             menu.move_open = !menu.move_open;
+            menu.snooze_open = false;
+        }
+    }
+
+    /// Shows or hides the message menu's "Snooze" submenu.
+    pub(crate) const fn toggle_snooze_menu(&mut self) {
+        if let Some(menu) = &mut self.message_menu {
+            menu.snooze_open = !menu.snooze_open;
+            menu.move_open = false;
         }
     }
 
@@ -1249,6 +1266,92 @@ impl Mail {
             .is_some_and(|r| r.is(account, mailbox, uid))
         {
             self.reader = None;
+        }
+        self.reload();
+    }
+
+    /// Snoozes a message until `until`: it leaves the list at once, as when moved, and comes back
+    /// to the inbox unread once it's due.
+    pub(crate) fn snooze_message(&mut self, message: &StoredMessage, until: Timestamp) {
+        let (account, mailbox, uid) = (
+            message.account.as_str(),
+            message.mailbox.as_str(),
+            message.envelope.uid,
+        );
+        let message_id = message.envelope.message_id.as_deref();
+        let Ok(services) = &self.services else { return };
+        if let Err(e) = services.mailroom.snooze(
+            &services.store,
+            account,
+            mailbox,
+            uid,
+            message_id,
+            until.as_second(),
+        ) {
+            let label = self.label(account).to_owned();
+            self.notify(format!("{label}: couldn't snooze the message: {e}"));
+            return;
+        }
+        self.moving
+            .insert((account.to_owned(), mailbox.to_owned(), uid));
+        if self
+            .reader
+            .as_ref()
+            .is_some_and(|r| r.is(account, mailbox, uid))
+        {
+            self.reader = None;
+        }
+        self.reload();
+    }
+
+    /// The server moved a message asked for with [`Mail::snooze_message`] to its Snoozed mailbox,
+    /// or refused to, which lists it where it was again; or a snoozed message came back.
+    fn snoozed(&mut self, update: Update) {
+        let Update::Snoozed {
+            account,
+            mailbox,
+            uid,
+            until,
+            result,
+            ..
+        } = update
+        else {
+            // Back in the inbox, it arrives there as new mail; what a search found where it
+            // waited is gone. Failing, it's tried again soon.
+            if let Update::Woke {
+                account,
+                mailbox,
+                uids,
+                result: Ok(()),
+            } = update
+            {
+                for uid in uids {
+                    self.search.forget_message(&account, &mailbox, uid);
+                }
+                self.reload();
+            }
+            return;
+        };
+        let (account, mailbox) = (account.as_str(), mailbox.as_str());
+        self.moving
+            .remove(&(account.to_owned(), mailbox.to_owned(), uid));
+        match result {
+            Ok(current) => {
+                if current {
+                    self.search.forget_message(account, mailbox, uid);
+                }
+                let until = Timestamp::from_second(until).unwrap_or_default();
+                self.notify(format!(
+                    "Snoozed until {}",
+                    postden_app::format_snooze(until, &Zoned::now())
+                ));
+            }
+            Err(error) => {
+                let label = self.label(account).to_owned();
+                self.notify(format!(
+                    "{label}: couldn't move the message to be snoozed: {error}"
+                ));
+            }
         }
         self.reload();
     }
@@ -2358,6 +2461,27 @@ impl Mail {
             self.check_for_updates(false);
         }
         self.save_settings();
+    }
+
+    /// Brings back the snoozed messages that are due, then checks again after [`WAKE_EVERY`].
+    fn wake_snoozed(&mut self) {
+        let Some(handle) = self.handle.clone() else {
+            return;
+        };
+        if let Ok(services) = &self.services
+            && let Err(e) = services
+                .mailroom
+                .wake_due(&services.store, Timestamp::now().as_second())
+        {
+            self.notify(format!("couldn't check snoozed mail: {e}"));
+        }
+        drop(rune::task::spawn_after(
+            "wake-snoozed",
+            WAKE_EVERY,
+            move || {
+                handle.update(|s: &mut Self, _| s.wake_snoozed());
+            },
+        ));
     }
 
     /// Checks for updates after `delay`, then every [`UPDATE_CHECK_EVERY`], while automatic checks

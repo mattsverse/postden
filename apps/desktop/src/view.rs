@@ -748,7 +748,8 @@ fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
 }
 
 /// A message's menu, open at where it was right-clicked: marking it read or unread, replying,
-/// exporting it as an `.eml` file, and moving it to another of its account's mailboxes.
+/// exporting it as an `.eml` file, snoozing it, and moving it to another of its account's
+/// mailboxes.
 fn message_menu(
     s: &Mail,
     m: &StoredMessage,
@@ -809,6 +810,10 @@ fn message_menu(
             .filter(|b| b.name != mailbox)
     };
     let archive = elsewhere(Role::Archive);
+    // A snoozed message waits in the Snoozed mailbox; one already there isn't snoozed again.
+    let snoozable = s
+        .mailbox_with_role(account, Role::Snoozed)
+        .is_none_or(|b| b.name != mailbox);
     let destinations: Vec<MenuEntry> = s
         .mailboxes
         .get(account)
@@ -817,8 +822,26 @@ fn message_menu(
         .filter(|b| b.name != mailbox)
         .map(|b| MenuEntry::item(MenuItem::new(b.label()).on_select(move_to(&b.name))))
         .collect();
-    if archive.is_some() || !destinations.is_empty() {
+    if archive.is_some() || !destinations.is_empty() || snoozable {
         items = items.separator();
+    }
+    if snoozable {
+        let times = postden_app::snooze_times(&Zoned::now())
+            .into_iter()
+            .map(|(label, until)| {
+                // The message as listed: one a server search found isn't cached.
+                let message = m.clone();
+                MenuEntry::item(MenuItem::new(label).on_select(move |s: &mut Mail| {
+                    s.close_message_menu();
+                    s.snooze_message(&message, until);
+                }))
+            })
+            .collect();
+        items = items.item(
+            MenuItem::new("Snooze")
+                .submenu(times, menu.snooze_open)
+                .on_select(Mail::toggle_snooze_menu),
+        );
     }
     if let Some(archive) = archive {
         items = items.item(MenuItem::new("Archive").on_select(move_to(&archive.name)));

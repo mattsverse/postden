@@ -151,7 +151,7 @@ fn words(query: &str) -> impl Iterator<Item = String> + '_ {
 }
 
 /// `word` as an IMAP quoted string.
-fn quote(word: &str) -> String {
+pub(super) fn quote(word: &str) -> String {
     let mut quoted = String::with_capacity(word.len() + 2);
     quoted.push('"');
     for c in word.chars() {

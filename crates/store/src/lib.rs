@@ -31,6 +31,18 @@ pub struct StoredMessage {
     pub envelope: Envelope,
 }
 
+/// A snoozed message, waiting in an account's Snoozed mailbox until it's due back in the inbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snooze {
+    pub account: String,
+    /// Its `Message-ID`, without angle brackets: unlike its UID, it stays the same as it moves.
+    pub message_id: String,
+    /// The mailbox it waits in.
+    pub mailbox: String,
+    /// When it's due back, as Unix seconds.
+    pub until: i64,
+}
+
 /// Which cached mail to look through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope<'a> {
@@ -137,6 +149,15 @@ CREATE TABLE IF NOT EXISTS signature_images (
     mime     TEXT NOT NULL,
     data     BLOB NOT NULL,
     PRIMARY KEY (account, cid)
+) STRICT;
+
+-- Snoozed messages, by Message-ID, and when each is due back in the inbox, as Unix seconds.
+CREATE TABLE IF NOT EXISTS snoozes (
+    account    TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL,
+    mailbox    TEXT NOT NULL,
+    until      INTEGER NOT NULL,
+    PRIMARY KEY (account, message_id)
 ) STRICT;
 ";
 
@@ -251,12 +272,13 @@ impl Store {
         if !same_mailboxes {
             // Another server's or user's mailboxes: what's cached of the old ones, down to its
             // UIDs and UIDVALIDITY, says nothing about the new ones. Messages and bodies go with
-            // their mailbox.
+            // their mailbox. Snoozes too: they're of messages on the old server.
             tx.execute("DELETE FROM mailboxes WHERE account = ?1", [&account.id])?;
             tx.execute(
                 "DELETE FROM listed_mailboxes WHERE account = ?1",
                 [&account.id],
             )?;
+            tx.execute("DELETE FROM snoozes WHERE account = ?1", [&account.id])?;
         }
         upsert_account(&tx, account)?;
         tx.execute(
@@ -927,6 +949,60 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+
+    /// Snoozes a message until `snooze.until`, replacing when it was due if it was snoozed already.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails, as when the account isn't saved.
+    pub fn snooze(&self, snooze: &Snooze) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO snoozes (account, message_id, mailbox, until) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (account, message_id) DO UPDATE SET
+                mailbox = excluded.mailbox, until = excluded.until",
+            params![
+                snooze.account,
+                snooze.message_id,
+                snooze.mailbox,
+                snooze.until
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets a snooze, but only if it's still due at `until`: one snoozed again meanwhile
+    /// stays. Returns whether it was forgotten.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub fn unsnooze(&self, account: &str, message_id: &str, until: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM snoozes WHERE account = ?1 AND message_id = ?2 AND until = ?3",
+            params![account, message_id, until],
+        )? > 0)
+    }
+
+    /// Every snooze due by `now`, in Unix seconds, soonest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn due_snoozes(&self, now: i64) -> Result<Vec<Snooze>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT account, message_id, mailbox, until FROM snoozes
+             WHERE until <= ?1 ORDER BY until",
+        )?;
+        let rows = stmt.query_map([now], |row| {
+            Ok(Snooze {
+                account: row.get(0)?,
+                message_id: row.get(1)?,
+                mailbox: row.get(2)?,
+                until: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
 }
 
 /// Adds `account` or replaces its settings, keeping its label. See [`Store::save_account`].
@@ -1152,6 +1228,49 @@ mod tests {
     }
 
     #[test]
+    fn snoozes_come_due_in_order_and_go_with_their_account() {
+        let store = Store::open_in_memory().unwrap();
+        store.save_account(&account("me@example.com")).unwrap();
+        let snooze = |id: &str, until| Snooze {
+            account: "me@example.com".into(),
+            message_id: id.into(),
+            mailbox: "Snoozed".into(),
+            until,
+        };
+        store.snooze(&snooze("b@x", 200)).unwrap();
+        store.snooze(&snooze("a@x", 100)).unwrap();
+        store.snooze(&snooze("c@x", 300)).unwrap();
+        assert_eq!(store.due_snoozes(50).unwrap(), vec![]);
+        assert_eq!(
+            store.due_snoozes(200).unwrap(),
+            vec![snooze("a@x", 100), snooze("b@x", 200)]
+        );
+        // Snoozed again, it's due later, and the earlier wake-up no longer forgets it.
+        store.snooze(&snooze("a@x", 400)).unwrap();
+        assert!(!store.unsnooze("me@example.com", "a@x", 100).unwrap());
+        assert!(store.unsnooze("me@example.com", "b@x", 200).unwrap());
+        assert_eq!(
+            store.due_snoozes(1000).unwrap(),
+            vec![snooze("c@x", 300), snooze("a@x", 400)]
+        );
+        assert!(
+            store.snooze(&snooze_for("nobody@example.com")).is_err(),
+            "a snooze needs its account"
+        );
+        store.remove_account("me@example.com").unwrap();
+        assert_eq!(store.due_snoozes(1000).unwrap(), vec![]);
+    }
+
+    fn snooze_for(account: &str) -> Snooze {
+        Snooze {
+            account: account.into(),
+            message_id: "z@x".into(),
+            mailbox: "Snoozed".into(),
+            until: 1,
+        }
+    }
+
+    #[test]
     fn accounts_round_trip_and_update_in_place() {
         let store = Store::open_in_memory().unwrap();
         let mut a = account("me@example.com");
@@ -1234,6 +1353,14 @@ mod tests {
             store
                 .save_body(&mine.id, "INBOX", 1, &Body::default())
                 .unwrap();
+            store
+                .snooze(&Snooze {
+                    account: mine.id.clone(),
+                    message_id: "1@example.com".into(),
+                    mailbox: "Snoozed".into(),
+                    until: 5,
+                })
+                .unwrap();
         };
         cache(&mut store);
 
@@ -1247,6 +1374,7 @@ mod tests {
             "same mailboxes"
         );
         assert!(store.body(&mine.id, "INBOX", 1).unwrap().is_some());
+        assert_eq!(store.due_snoozes(5).unwrap().len(), 1, "and its snoozes");
 
         for change in [
             |a: &mut Account| a.imap.host = "imap.elsewhere.example".into(),
@@ -1264,6 +1392,11 @@ mod tests {
             );
             assert_eq!(store.body(&mine.id, "INBOX", 1).unwrap(), None);
             assert_eq!(store.mailbox_state(&mine.id, "INBOX").unwrap(), None);
+            assert_eq!(
+                store.due_snoozes(5).unwrap(),
+                vec![],
+                "snoozed on the old server"
+            );
             store.replace_account(&mine, None).unwrap();
         }
     }
