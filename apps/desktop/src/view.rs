@@ -20,7 +20,7 @@ use rune_kit::{
 };
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
-use crate::commands::{Command, Entry};
+use crate::commands::{Command, Entry, Shortcut};
 use crate::compose::{ComposeForm, Mode, Preview};
 use crate::form::{AccountForm, SECURITY, Step, security_index};
 use crate::rich::RichEditor;
@@ -126,7 +126,11 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
                 .icon(&BACK)
                 .variant(ButtonVariant::Ghost)
                 .help("Back to the list (Esc)")
-                .on_press(Mail::close_reader)
+                .on_press_tx(|s: &mut Mail, tx| {
+                    s.close_reader();
+                    // With the list as it comes back, not a frame after.
+                    s.reveal_cursor(tx);
+                })
                 .build(&k)
                 .key("back"),
         );
@@ -134,7 +138,7 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
             trailing = trailing.child(
                 Button::new("Reply")
                     .variant(ButtonVariant::Ghost)
-                    .shortcut(Command::Reply.hint())
+                    .shortcut(Command::Reply.hint(s))
                     .on_press(|s: &mut Mail| s.reply(false))
                     .build(&k)
                     .key("reply"),
@@ -165,7 +169,10 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
 
 /// The ⋯ menu of everything but Reply, which keeps a button of its own.
 fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
-    let close = |s: &mut Mail| s.actions_open = false;
+    let close = |s: &mut Mail| {
+        s.actions_open = false;
+        s.forget_go();
+    };
     let mut menu = Menu::new("actions")
         .trigger(
             IconButton::new(&MORE)
@@ -173,7 +180,11 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
                 .label("More actions")
                 .help("More actions")
                 .expanded(s.actions_open)
-                .on_press(|s: &mut Mail| s.actions_open = !s.actions_open)
+                .on_press(|s: &mut Mail| {
+                    s.actions_open = !s.actions_open;
+                    // Its items close it without `on_close`: a G pressed before goes nowhere.
+                    s.forget_go();
+                })
                 .build(k),
         )
         .placement(Placement::BottomEnd)
@@ -182,7 +193,7 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
         .on_close(close)
         .item(
             MenuItem::new("New message")
-                .shortcut(Command::Compose.hint())
+                .shortcut(Command::Compose.hint(s))
                 .on_select(|s: &mut Mail| {
                     s.actions_open = false;
                     s.compose();
@@ -208,7 +219,7 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
             .separator()
             .item(
                 MenuItem::new("Reply all")
-                    .shortcut(Command::ReplyAll.hint())
+                    .shortcut(Command::ReplyAll.hint(s))
                     .disabled(!downloaded)
                     .on_select(|s: &mut Mail| {
                         s.actions_open = false;
@@ -217,7 +228,7 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
             )
             .item(
                 MenuItem::new(seen)
-                    .shortcut(Command::ToggleSeen.hint())
+                    .shortcut(Command::ToggleSeen.hint(s))
                     .on_select(|s: &mut Mail| {
                         s.actions_open = false;
                         s.toggle_seen();
@@ -308,7 +319,7 @@ fn sidebar(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
         .icon(&INBOX)
         .height(32.0)
         .selected(showing(Role::Inbox))
-        .on_select(|s: &mut Mail, _| s.show(Showing::All(Role::Inbox)));
+        .on_select(|s: &mut Mail, tx| show_from_sidebar(s, tx, Showing::All(Role::Inbox)));
     if let Some(n) = badge(s.unread(None)) {
         all = all.badge(n);
     }
@@ -316,7 +327,7 @@ fn sidebar(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
         .icon(&SENT)
         .height(32.0)
         .selected(showing(Role::Sent))
-        .on_select(|s: &mut Mail, _| s.show(Showing::All(Role::Sent)));
+        .on_select(|s: &mut Mail, tx| show_from_sidebar(s, tx, Showing::All(Role::Sent)));
     let folders = col()
         .gap(4.0)
         .child(all.build(k).key("all"))
@@ -366,6 +377,21 @@ fn sidebar(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     sidebar.build(k)
 }
 
+/// Shows what a sidebar row stands for. A click leaves the keyboard to the list, for J, K and
+/// the other keys on their own; the sidebar keeps it only when the keyboard brought it there.
+fn show_from_sidebar(s: &mut Mail, tx: &mut Tx, showing: Showing) {
+    s.show(showing);
+    keep_keys_for_list(tx);
+}
+
+/// After a click, keys go to the window again, not the control clicked: the list's keys on
+/// their own keep working. A control the keyboard reached keeps them.
+fn keep_keys_for_list(tx: &mut Tx) {
+    if !tx.by_keys() {
+        tx.blur();
+    }
+}
+
 /// One of an account's mailboxes, under the account. Right-clicking it opens its menu.
 fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut Vec<El>) -> El {
     let showing = Showing::Mailbox {
@@ -381,7 +407,7 @@ fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut 
         })
         .depth(1)
         .selected(selected)
-        .on_select(move |s: &mut Mail, _| s.show(showing.clone()));
+        .on_select(move |s: &mut Mail, tx| show_from_sidebar(s, tx, showing.clone()));
     let unread = s.unread(Some(account));
     if mailbox.role == Role::Inbox && unread > 0 {
         r = r.badge(unread.to_string());
@@ -471,7 +497,10 @@ fn account_row(s: &Mail, account: &Account, k: &Kit) -> El {
         "Show mailboxes"
     })
     .expanded(expanded)
-    .on_press(move |s: &mut Mail| s.toggle_mailboxes(&toggle))
+    .on_press_tx(move |s: &mut Mail, tx| {
+        s.toggle_mailboxes(&toggle);
+        keep_keys_for_list(tx);
+    })
     .build(k);
     let mut r = SidebarRow::new(account.label().to_owned())
         .height(45.0)
@@ -486,7 +515,7 @@ fn account_row(s: &Mail, account: &Account, k: &Kit) -> El {
         )
         .trailing(disclosure)
         // The account itself stands for its inbox; its mailboxes, the inbox first, are the rows below.
-        .on_select(move |s: &mut Mail, _| s.show(Showing::inbox(&select)))
+        .on_select(move |s: &mut Mail, tx| show_from_sidebar(s, tx, Showing::inbox(&select)))
         .on_close(move |s: &mut Mail, _| s.remove(&remove));
     if confirming {
         r = r.subtitle_color(k.c.danger.fg);
@@ -542,8 +571,21 @@ fn search_bar(s: &Mail, k: &Kit) -> El {
         .on_edit(|s: &mut Mail| &mut s.search.query)
         .on_change(|s: &mut Mail, _| s.search_changed())
         .on_submit(|s: &mut Mail, _| s.search_server())
-        .on_key(|s: &mut Mail, ev: &rune::KeyEvent, _| {
-            ev.key == rune::Key::Escape && s.clear_search()
+        // Escape ends the search and leaves the field, so keys on their own work on the list again;
+        // ↓ leaves it for the results, with the cursor on the first.
+        .on_key(|s: &mut Mail, ev: &rune::KeyEvent, tx| {
+            // Keys typed here don't reach the window: a G pressed before goes nowhere.
+            s.forget_go();
+            match ev.key {
+                rune::Key::Escape => {
+                    s.clear_search();
+                }
+                // Only ↓ alone: ⇧↓ and ⌘↓ still select and move in the field.
+                _ if Shortcut::Down.matches(ev, false) && s.cursor_to_first(tx) => {}
+                _ => return false,
+            }
+            tx.blur();
+            true
         });
     if !s.search.query.text.is_empty() {
         input = input.clear_button().on_action(|s: &mut Mail, _| {
@@ -567,7 +609,10 @@ fn search_bar(s: &Mail, k: &Kit) -> El {
             SegmentedControl::new(&labels, Some(usize::from(s.search.everywhere)))
                 .label("Search in")
                 .fit()
-                .on_pick(|s: &mut Mail, i, _| s.search_everywhere(i == 1))
+                .on_pick(|s: &mut Mail, i, tx| {
+                    s.search_everywhere(i == 1);
+                    keep_keys_for_list(tx);
+                })
                 .build(k),
         );
     }
@@ -666,14 +711,22 @@ fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     // Mail from several accounts says whose it is.
     let multiple_accounts = s.listing().account().is_none() && s.accounts.len() > 1;
     let sent = s.showing_sent();
-    let mut list = col().key("messages").w_full();
+    let mut list = messages_column();
     for m in s.shown() {
         let e = &m.envelope;
         let strong = if e.seen { k.ty.ui } else { k.ty.ui_medium };
         let (account, mailbox, uid) = (m.account.clone(), m.mailbox.clone(), e.uid);
         let (menu_account, menu_mailbox) = (account.clone(), mailbox.clone());
+        let key = crate::state::message_key(m);
+        // The keyboard's cursor, while the list shows.
+        let under_cursor = s.reader.is_none() && s.cursor.as_ref() == Some(&key);
         let mut line = row()
-            .key(format!("msg-{}-{}-{}", m.account, m.mailbox, e.uid))
+            .key(crate::state::row_key(&key))
+            .fill(if under_cursor {
+                k.c.hover
+            } else {
+                Color::TRANSPARENT
+            })
             .on_press(move |s: &mut Mail| s.open_message(&account, &mailbox, uid))
             .on_secondary_press(move |s: &mut Mail, point, _| {
                 s.open_message_menu(&menu_account, &menu_mailbox, uid, point);
@@ -747,6 +800,19 @@ fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     })
     .grow(1.0)
     .min_h(0.0)
+}
+
+/// The list's column. Back from what covered it (a message, the settings, a message being
+/// written), the list comes back at its top: it scrolls to its cursor.
+fn messages_column() -> El {
+    col()
+        .key("messages")
+        .w_full()
+        .on_visible(|s: &mut Mail, shown, tx| {
+            if shown {
+                s.reveal_cursor(tx);
+            }
+        })
 }
 
 /// A message's menu, open at where it was right-clicked: marking it read or unread, replying,
@@ -955,6 +1021,7 @@ fn message(r: &Reader, k: &Kit) -> El {
             }
             if let Some(markdown) = &r.markdown {
                 return reader_frame(
+                    r,
                     header,
                     content.child(
                         Markdown::new(markdown.clone())
@@ -974,13 +1041,17 @@ fn message(r: &Reader, k: &Kit) -> El {
             content.child(shown.key("body").font(k.ty.body).wrap().selectable(true))
         }
     };
-    reader_frame(header, content, k)
+    reader_frame(r, header, content, k)
 }
 
 /// The reader's scrolling column: the headers, a rule, then the content.
-fn reader_frame(header: El, content: El, k: &Kit) -> El {
+fn reader_frame(r: &Reader, header: El, content: El, k: &Kit) -> El {
     col()
-        .key("reader")
+        // One per message, so the next one opens at its top.
+        .key(format!(
+            "reader-{}",
+            crate::state::row_key(&crate::state::message_key(&r.message))
+        ))
         // Fades and rises a few points into place as the download lands.
         .transition(Transition::offset(0.0, 8.0).combined(Transition::opacity()))
         .w_full()
@@ -2633,7 +2704,7 @@ fn palette(s: &Mail, k: &Kit, layer: &mut Vec<El>) {
     let active = p.active_row(&shown);
     let input = TextInput::new(&p.query)
         .label("Command")
-        .placeholder("Type a command")
+        .placeholder(p.placeholder())
         .leading_icon(&glyphs::SEARCH)
         .width(None)
         // A screen reader reads the highlighted row, while the field keeps the focus.
@@ -2791,10 +2862,15 @@ fn palette_row(entry: &Entry, on: bool, k: &Kit) -> El {
             .a11y_hidden()
     });
     item = item.child(detail.grow(1.0).shrink());
-    if let Some(shortcut) = entry.command.shortcut() {
+    if !entry.shortcuts.is_empty() {
+        let hint: Vec<String> = entry.shortcuts.iter().map(|k| k.label()).collect();
+        let keys = entry
+            .shortcuts
+            .iter()
+            .map(|shortcut| Keybind::new(&shortcut.keycaps()).build(k));
         item = item
-            .shortcut_hint(shortcut.label())
-            .child(Keybind::new(&[shortcut.label()]).build(k).a11y_hidden());
+            .shortcut_hint(hint.join(", "))
+            .child(row().gap(6.0).children(keys).a11y_hidden());
     }
     item
 }

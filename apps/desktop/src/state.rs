@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use jiff::{Timestamp, Zoned};
 use postden_app::{
@@ -26,7 +26,7 @@ use rune::{
 use rune_kit::shell::PaneState;
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
-use crate::commands::{self, Command, Palette};
+use crate::commands::{self, Command, Palette, PaletteMode, Shortcut};
 use crate::compose::{ComposeForm, Mode};
 use crate::form::{AccountForm, GoogleSignIn, Step};
 use crate::notifications::{self, Alert, Target};
@@ -236,6 +236,8 @@ const NOTICE_SECS: u64 = 6;
 const FIRST_UPDATE_CHECK: Duration = Duration::from_secs(10);
 /// How often updates are checked for while the app runs.
 const UPDATE_CHECK_EVERY: Duration = Duration::from_hours(24);
+/// How soon after G its second key must come.
+const GO_WITHIN: Duration = Duration::from_secs(2);
 /// How often snoozed messages are checked for being due, so one comes back within this of its time.
 const WAKE_EVERY: Duration = Duration::from_secs(30);
 
@@ -317,6 +319,10 @@ pub(crate) struct Mail {
     pub(crate) transfer: Transfer,
     /// The command palette (⌘K).
     pub(crate) palette: Palette,
+    /// The message under the list's cursor, which J and K move.
+    pub(crate) cursor: Option<MessageKey>,
+    /// When G was pressed: the next key, soon after, says where to go.
+    go_pressed: Option<Instant>,
 }
 
 impl Mail {
@@ -366,6 +372,8 @@ impl Mail {
             updater: Updater::default(),
             transfer: Transfer::default(),
             palette: Palette::default(),
+            cursor: None,
+            go_pressed: None,
         }
     }
 
@@ -859,14 +867,20 @@ impl Mail {
     pub(crate) fn toggle_palette(&mut self) {
         if self.palette.open {
             self.close_palette();
-            return;
+        } else {
+            self.open_palette(PaletteMode::Commands);
         }
+    }
+
+    /// Opens the palette afresh on `mode`, with nothing typed.
+    pub(crate) fn open_palette(&mut self, mode: PaletteMode) {
         // Menus left open would sit over it.
         self.actions_open = false;
         self.message_menu = None;
         self.mailbox_menu = None;
         self.palette = Palette {
             open: true,
+            mode,
             query: TextEdit::new(""),
             active: None,
         };
@@ -917,17 +931,171 @@ impl Mail {
         entry.command.run(self, tx);
     }
 
-    /// Runs the command whose shortcut `ev` is, if one applies here.
+    #[cfg(test)]
+    /// Runs the command whose shortcut `ev` is, if one applies here. G on its own starts a
+    /// "go to", and the key after it is taken whether it goes anywhere or not.
     pub(crate) fn run_shortcut(&mut self, ev: &rune::KeyEvent, tx: &mut Tx) -> bool {
-        let Some(command) = commands::available(self)
-            .into_iter()
-            .find(|c| c.shortcut().is_some_and(|k| k.matches(ev)))
-        else {
+        let go = self.take_go();
+        self.run_keys(ev, go, tx)
+    }
+
+    /// Whether G was pressed just before this key, forgetting it: whatever handles the key, G
+    /// only says where the next one goes.
+    pub(crate) fn take_go(&mut self) -> bool {
+        self.go_pressed
+            .take()
+            .is_some_and(|at| at.elapsed() < GO_WITHIN)
+    }
+
+    /// Forgets a G pressed before, when the key after it went elsewhere.
+    pub(crate) const fn forget_go(&mut self) {
+        self.go_pressed = None;
+    }
+
+    /// [`Mail::run_shortcut`], `go` when G came just before. While a menu is open, only ⌘
+    /// shortcuts count: keys on their own are the menu's.
+    pub(crate) fn run_keys(&mut self, ev: &rune::KeyEvent, go: bool, tx: &mut Tx) -> bool {
+        let menu = self.actions_open || self.message_menu.is_some() || self.mailbox_menu.is_some();
+        let counts =
+            |k: &Shortcut| !menu || matches!(k, Shortcut::Command { .. } | Shortcut::Sidebar);
+        let commands = commands::available(self);
+        let pressed = commands.iter().find(|c| {
+            c.shortcuts(self)
+                .iter()
+                .any(|k| counts(k) && k.matches(ev, go))
+        });
+        if let Some(command) = pressed.cloned() {
+            // A menu open (⌘N over it) would come back once what the command shows closes.
+            self.actions_open = false;
+            self.message_menu = None;
+            self.mailbox_menu = None;
+            self.close_palette();
+            command.run(self, tx);
+            return true;
+        }
+        let goes = |c: &Command| {
+            c.shortcuts(self)
+                .iter()
+                .any(|k| matches!(k, Shortcut::Go(_)))
+        };
+        if !go && !menu && Shortcut::Key('g').matches(ev, false) && commands.iter().any(goes) {
+            self.go_pressed = Some(Instant::now());
+            return true;
+        }
+        go
+    }
+
+    /// The message the keyboard acts on: the open one, else the one under the list's cursor.
+    pub(crate) fn focused_message(&self) -> Option<&StoredMessage> {
+        match &self.reader {
+            Some(r) => Some(&r.message),
+            None => self.find_listed(self.cursor.as_ref()?),
+        }
+    }
+
+    fn find_listed(&self, key: &MessageKey) -> Option<&StoredMessage> {
+        self.shown().find(|m| message_key(m) == *key)
+    }
+
+    /// The message `key` names, open or listed.
+    pub(crate) fn find_message(&self, key: &MessageKey) -> Option<&StoredMessage> {
+        self.reader
+            .as_ref()
+            .map(|r| &r.message)
+            .filter(|m| message_key(m) == *key)
+            .or_else(|| self.find_listed(key))
+    }
+
+    /// Moves the list's cursor `by` rows, stopping at the ends; with nothing under it, it starts
+    /// at the top. While a message is open, the next or previous one opens instead.
+    pub(crate) fn move_cursor(&mut self, by: isize, tx: &mut Tx) {
+        let keys: Vec<MessageKey> = self.shown().map(message_key).collect();
+        let Some(last) = keys.len().checked_sub(1) else {
+            return;
+        };
+        let open = self.reader.as_ref().map(|r| message_key(&r.message));
+        let from = open.clone().or_else(|| self.cursor.clone());
+        let at = from.and_then(|k| keys.iter().position(|x| *x == k));
+        let row = match at {
+            Some(i) => i.saturating_add_signed(by).min(last),
+            // An open message the list doesn't show has no next one.
+            None if open.is_some() => return,
+            None => 0,
+        };
+        let Some(key) = keys.get(row).cloned() else {
+            return;
+        };
+        tx.scroll_into_view(row_key(&key));
+        if open.is_some() && at != Some(row) {
+            self.open_message(&key.0, &key.1, key.2);
+        }
+        self.cursor = Some(key);
+    }
+
+    /// Scrolls the list to its cursor, as the list shows again.
+    pub(crate) fn reveal_cursor(&self, tx: &mut Tx) {
+        if let Some(key) = &self.cursor {
+            tx.scroll_into_view(row_key(key));
+        }
+    }
+
+    /// Puts the list's cursor on its first row, if it has one.
+    pub(crate) fn cursor_to_first(&mut self, tx: &mut Tx) -> bool {
+        let Some(first) = self.shown().next().map(message_key) else {
             return false;
         };
-        self.close_palette();
-        command.run(self, tx);
+        tx.scroll_into_view(row_key(&first));
+        self.cursor = Some(first);
         true
+    }
+
+    /// Opens the message under the list's cursor.
+    pub(crate) fn open_cursor(&mut self) {
+        if let Some(m) = self.focused_message() {
+            let (account, mailbox, uid) = (m.account.clone(), m.mailbox.clone(), m.envelope.uid);
+            self.open_message(&account, &mailbox, uid);
+        }
+    }
+
+    /// A message was moved, or snoozed, and leaves the list at once. A cursor on it (or on it
+    /// open) moves to the row after it, else the one before, and an open one closes.
+    pub(crate) fn left_list(&mut self, key: MessageKey) {
+        let open = self.reader.as_ref().map(|r| message_key(&r.message));
+        if self.cursor.as_ref() == Some(&key) || open.as_ref() == Some(&key) {
+            let keys: Vec<MessageKey> = self.shown().map(message_key).collect();
+            let at = keys.iter().position(|k| *k == key);
+            self.cursor = at
+                .and_then(|i| keys.get(i + 1).or_else(|| keys.get(i.checked_sub(1)?)))
+                .cloned();
+        }
+        if open.as_ref() == Some(&key) {
+            self.reader = None;
+        }
+        self.moving.insert(key);
+        self.reload();
+    }
+
+    /// Replies to the focused message: the open one once it's downloaded, or the one under the
+    /// list's cursor, which opens first.
+    pub(crate) fn reply_focused(&mut self, all: bool) {
+        if self.reader.is_some() {
+            return self.reply(all);
+        }
+        if let Some(key) = self
+            .cursor
+            .clone()
+            .filter(|k| self.find_listed(k).is_some())
+        {
+            self.reply_to(&key.0, &key.1, key.2, all);
+        }
+    }
+
+    /// Snoozes the message `key` names until `until`.
+    pub(crate) fn snooze_key(&mut self, key: &MessageKey, until: Timestamp) {
+        let Some(message) = self.find_message(key).cloned() else {
+            return;
+        };
+        self.snooze_message(&message, until);
     }
 
     /// Asks the server of each mailbox searched for what matches, beyond what's cached and in the
@@ -1117,6 +1285,8 @@ impl Mail {
         let Some(message) = listed.or_else(cached) else {
             return;
         };
+        // Back in the list, the cursor is on it.
+        self.cursor = Some((account.to_owned(), mailbox.to_owned(), uid));
         let mut reader = Reader {
             message,
             body: None,
@@ -1206,10 +1376,11 @@ impl Mail {
         });
     }
 
-    /// Flips the open message between read and unread.
+    /// Flips the focused message between read and unread.
     pub(crate) fn toggle_seen(&mut self) {
-        let Some(reader) = &self.reader else { return };
-        let m = &reader.message;
+        let Some(m) = self.focused_message() else {
+            return;
+        };
         let (account, mailbox, uid) = (m.account.clone(), m.mailbox.clone(), m.envelope.uid);
         self.set_seen(&account, &mailbox, uid, !m.envelope.seen);
     }
@@ -1248,6 +1419,7 @@ impl Mail {
         uid: u32,
         point: PointerPress,
     ) {
+        self.forget_go();
         self.message_menu = Some(MessageMenu {
             message: (account.to_owned(), mailbox.to_owned(), uid),
             point,
@@ -1258,6 +1430,8 @@ impl Mail {
 
     pub(crate) fn close_message_menu(&mut self) {
         self.message_menu = None;
+        // Escape in the menu doesn't reach the window: a G pressed before goes nowhere.
+        self.forget_go();
     }
 
     /// Shows or hides the message menu's "Move to" submenu.
@@ -1278,6 +1452,7 @@ impl Mail {
 
     /// Opens the menu of a mailbox in the sidebar at `point`, where it was right-clicked.
     pub(crate) fn open_mailbox_menu(&mut self, account: &str, mailbox: &str, point: PointerPress) {
+        self.forget_go();
         self.mailbox_menu = Some(MailboxMenu {
             mailbox: (account.to_owned(), mailbox.to_owned()),
             point,
@@ -1286,6 +1461,7 @@ impl Mail {
 
     pub(crate) fn close_mailbox_menu(&mut self) {
         self.mailbox_menu = None;
+        self.forget_go();
     }
 
     /// Marks every message in one of an account's mailboxes read, on the server too. It shows once
@@ -1347,16 +1523,7 @@ impl Mail {
             self.notify(format!("{label}: couldn't move the message: {e}"));
             return;
         }
-        self.moving
-            .insert((account.to_owned(), mailbox.to_owned(), uid));
-        if self
-            .reader
-            .as_ref()
-            .is_some_and(|r| r.is(account, mailbox, uid))
-        {
-            self.reader = None;
-        }
-        self.reload();
+        self.left_list((account.to_owned(), mailbox.to_owned(), uid));
     }
 
     /// Snoozes a message until `until`: it leaves the list at once, as when moved, and comes back
@@ -1381,16 +1548,7 @@ impl Mail {
             self.notify(format!("{label}: couldn't snooze the message: {e}"));
             return;
         }
-        self.moving
-            .insert((account.to_owned(), mailbox.to_owned(), uid));
-        if self
-            .reader
-            .as_ref()
-            .is_some_and(|r| r.is(account, mailbox, uid))
-        {
-            self.reader = None;
-        }
-        self.reload();
+        self.left_list((account.to_owned(), mailbox.to_owned(), uid));
     }
 
     /// The server moved a message asked for with [`Mail::snooze_message`] to its Snoozed mailbox,
@@ -2784,6 +2942,18 @@ impl Mail {
             self.mailbox_menu = None;
         }
     }
+}
+
+/// A message's place in the store: its account, mailbox and UID.
+pub(crate) fn message_key(m: &StoredMessage) -> MessageKey {
+    (m.account.clone(), m.mailbox.clone(), m.envelope.uid)
+}
+
+/// The key of a message's row in the list. Hashed, as a mailbox's name can hold any character.
+pub(crate) fn row_key(key: &MessageKey) -> String {
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(key, &mut hasher);
+    format!("msg-{:016x}", std::hash::Hasher::finish(&hasher))
 }
 
 #[cfg(test)]
