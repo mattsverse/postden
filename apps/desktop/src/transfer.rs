@@ -1,11 +1,13 @@
 //! Moving Postden to another computer, from the settings: exporting every account and setting to
-//! a file locked with a passphrase, and importing one.
+//! a file locked with a passphrase, or sending that file straight to the other computer, and
+//! importing one.
 
 use std::collections::HashSet;
 
 use postden_app::{ImportOptions, MIN_PASSPHRASE, Profile};
 use postden_core::secrets::SecretString;
 use rune::TextEdit;
+use tokio::task::{AbortHandle, Id};
 
 /// The extension of a profile file.
 pub(crate) const EXTENSION: &str = "postden";
@@ -18,6 +20,12 @@ pub(crate) enum Step {
     Idle,
     /// Typing the passphrase to lock an export with, twice.
     Export,
+    /// Typing the passphrase to lock what's sent with, twice, then going online to send it.
+    Send,
+    /// Online: showing the code the other computer types, until it took the profile.
+    Offering,
+    /// Typing the code the sending computer shows, then downloading what it sends.
+    Receive,
     /// A profile file was picked: typing the passphrase it was locked with.
     Unlock,
     /// The profile is unlocked: what it holds, and what to do with what's set up already.
@@ -34,7 +42,11 @@ pub(crate) struct Transfer {
     /// Encrypting, decrypting or writing is under way.
     pub(crate) busy: bool,
     pub(crate) error: Option<String>,
-    /// The picked file's name and bytes, while unlocking.
+    /// The code typed, while receiving.
+    pub(crate) code: TextEdit,
+    /// Sending to or receiving from another computer, under way.
+    pub(crate) online: Option<Online>,
+    /// The picked or received file's name and bytes, while unlocking.
     pub(crate) file: Option<(String, Vec<u8>)>,
     /// The unlocked profile, while reviewing it.
     pub(crate) profile: Option<Profile>,
@@ -44,11 +56,48 @@ pub(crate) struct Transfer {
     pub(crate) options: ImportOptions,
 }
 
+/// Sending a profile to another computer, or receiving one, in the background.
+#[derive(Debug)]
+pub(crate) struct Online {
+    /// Locking the profile, going online and waiting for the other computer to take it; or
+    /// dialing the sending computer and downloading. Stopped when this is dropped: when the
+    /// transfer is cancelled, done, or replaced.
+    task: AbortHandle,
+    /// The code the other computer types, once the sender is online.
+    pub(crate) code: Option<String>,
+}
+
+impl Online {
+    pub(crate) const fn new(task: AbortHandle) -> Self {
+        Self { task, code: None }
+    }
+}
+
+impl Drop for Online {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 impl Transfer {
     /// Starts exporting: asking for a passphrase.
     pub(crate) fn export() -> Self {
+        Self::at(Step::Export)
+    }
+
+    /// Starts sending to another computer: asking for a passphrase.
+    pub(crate) fn send() -> Self {
+        Self::at(Step::Send)
+    }
+
+    /// Starts receiving from another computer: asking for the code it shows.
+    pub(crate) fn receive() -> Self {
+        Self::at(Step::Receive)
+    }
+
+    fn at(step: Step) -> Self {
         Self {
-            step: Step::Export,
+            step,
             ..Self::default()
         }
     }
@@ -91,6 +140,19 @@ impl Transfer {
         Ok(SecretString::from(typed.clone()))
     }
 
+    /// Whether `task` is the one sending or receiving now: an update from a transfer cancelled
+    /// or replaced since, posted before it was stopped, is for no one.
+    pub(crate) fn is_online(&self, task: Id) -> bool {
+        self.online
+            .as_ref()
+            .is_some_and(|online| online.task.id() == task)
+    }
+
+    /// Whether the step under way can be cancelled: anything but writing or decrypting a file.
+    pub(crate) const fn can_cancel(&self) -> bool {
+        !self.busy || self.online.is_some()
+    }
+
     /// The passphrase typed to unlock a profile.
     pub(crate) fn typed_passphrase(&self) -> Option<SecretString> {
         let typed = &self.passphrase.text;
@@ -110,6 +172,24 @@ mod tests {
             confirm: TextEdit::new(confirm),
             ..Transfer::export()
         }
+    }
+
+    #[tokio::test]
+    async fn only_the_transfer_under_way_takes_updates() {
+        let now = tokio::spawn(std::future::pending::<()>());
+        let cancelled = tokio::spawn(async {});
+        let t = Transfer {
+            online: Some(Online::new(now.abort_handle())),
+            ..Transfer::send()
+        };
+        assert!(t.is_online(now.id()), "the task under way");
+        assert!(!t.is_online(cancelled.id()), "a task cancelled before it");
+        assert!(!Transfer::send().is_online(now.id()), "nothing under way");
+        drop(t);
+        assert!(
+            now.await.unwrap_err().is_cancelled(),
+            "stopped once dropped"
+        );
     }
 
     #[test]

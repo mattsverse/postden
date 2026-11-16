@@ -16,6 +16,7 @@ postden-secrets.workspace = true
 postden-app.workspace = true
 postden-html.workspace = true
 postden-update.workspace = true
+postden-transfer.workspace = true
 # `native-file-dialog`: picking a signature's images.
 rune = { workspace = true, features = ["native-file-dialog"] }
 # `markdown` draws HTML mail, converted to Markdown.

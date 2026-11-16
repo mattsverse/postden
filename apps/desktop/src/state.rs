@@ -18,8 +18,10 @@ use postden_core::secrets::{SecretStore, SecretString};
 use postden_mail::imap::{Status, WatchConfig};
 use postden_secrets::Backend;
 use postden_store::{Scope, Store, StoredMessage};
+use postden_transfer::{Code, Offer};
 use rune::{
-    AppHandle, FileDialogOptions, ImageCache, PointerPress, Taskbar, Tray, Tx, WindowHandle,
+    AppHandle, FileDialogOptions, ImageCache, PointerPress, Taskbar, TextEdit, Tray, Tx,
+    WindowHandle,
 };
 use rune_kit::shell::PaneState;
 
@@ -1675,8 +1677,151 @@ impl Mail {
     /// Stops exporting or importing, forgetting the passphrase typed. Work under way still
     /// finishes, and says how it went.
     pub(crate) fn cancel_transfer(&mut self) {
-        if !self.transfer.busy {
+        if self.transfer.can_cancel() {
             self.transfer = Transfer::default();
+        }
+    }
+
+    /// Starts sending every account and setting to another computer: the settings ask for a
+    /// passphrase.
+    pub(crate) fn start_send(&mut self) {
+        self.transfer = Transfer::send();
+    }
+
+    /// Starts receiving accounts and settings from another computer: the settings ask for the
+    /// code it shows.
+    pub(crate) fn start_receive(&mut self) {
+        self.transfer = Transfer::receive();
+    }
+
+    /// Locks every account and setting with the passphrase typed, then goes online to offer
+    /// them to another computer, in the background: the settings show the code it types.
+    pub(crate) fn send_profile(&mut self) {
+        let (Ok(services), Some(handle)) = (&self.services, &self.handle) else {
+            return;
+        };
+        if self.transfer.busy {
+            return;
+        }
+        let passphrase = match self.transfer.new_passphrase() {
+            Ok(passphrase) => passphrase,
+            Err(e) => {
+                self.transfer.error = Some(e);
+                return;
+            }
+        };
+        let profile = match Profile::collect(&services.store, services.secrets.as_ref()) {
+            Ok(profile) => profile,
+            Err(e) => {
+                self.transfer.error = Some(format!("Couldn't send: {e}"));
+                return;
+            }
+        };
+        let count = profile.accounts.len();
+        let handle = handle.clone();
+        let task = services.mailroom.handle().spawn(async move {
+            let task = tokio::task::id();
+            let sealed = tokio::task::spawn_blocking(move || profile.seal(&passphrase)).await;
+            let offer = match sealed {
+                Ok(Ok(file)) => Offer::new(file).await.map_err(|e| e.to_string()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            let delivered = match offer {
+                Ok(offer) => {
+                    let code = offer.code().to_string();
+                    handle.update(move |s: &mut Self, _| s.offering(task, code));
+                    offer.deliver().await.map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e),
+            };
+            handle.update(move |s: &mut Self, _| s.profile_sent(task, delivered, count));
+        });
+        let t = &mut self.transfer;
+        t.busy = true;
+        t.error = None;
+        t.online = Some(transfer::Online::new(task.abort_handle()));
+    }
+
+    /// The profile is locked and offered under `code`: the settings show it.
+    fn offering(&mut self, task: tokio::task::Id, code: String) {
+        let t = &mut self.transfer;
+        if !t.is_online(task) {
+            return;
+        }
+        let (transfer::Step::Send, Some(online)) = (t.step, &mut t.online) else {
+            return;
+        };
+        online.code = Some(code);
+        t.step = transfer::Step::Offering;
+        t.busy = false;
+        t.passphrase = TextEdit::default();
+        t.confirm = TextEdit::default();
+    }
+
+    /// The other computer took the profile, or sending it failed.
+    fn profile_sent(&mut self, task: tokio::task::Id, delivered: Result<(), String>, count: usize) {
+        if !self.transfer.is_online(task) {
+            return;
+        }
+        match delivered {
+            Ok(()) => {
+                self.transfer = Transfer::default();
+                let s = if count == 1 { "" } else { "s" };
+                self.notify(format!("Sent {count} account{s} to the other computer"));
+            }
+            Err(e) => {
+                self.transfer = Transfer {
+                    error: Some(format!("Couldn't send: {e}")),
+                    ..Transfer::send()
+                };
+            }
+        }
+    }
+
+    /// Dials the computer showing the code typed and downloads its profile, in the background,
+    /// then asks for its passphrase.
+    pub(crate) fn receive_profile(&mut self) {
+        let (Ok(services), Some(handle)) = (&self.services, &self.handle) else {
+            return;
+        };
+        let t = &mut self.transfer;
+        if t.busy {
+            return;
+        }
+        let code: Code = match t.code.text.parse() {
+            Ok(code) => code,
+            Err(e) => {
+                t.error = Some(format!("{e}"));
+                return;
+            }
+        };
+        let handle = handle.clone();
+        let task = services.mailroom.handle().spawn(async move {
+            let task = tokio::task::id();
+            let received = postden_transfer::receive(&code)
+                .await
+                .map_err(|e| e.to_string());
+            handle.update(move |s: &mut Self, _| s.profile_received(task, received));
+        });
+        t.busy = true;
+        t.error = None;
+        t.online = Some(transfer::Online::new(task.abort_handle()));
+    }
+
+    fn profile_received(&mut self, task: tokio::task::Id, received: Result<Vec<u8>, String>) {
+        let t = &mut self.transfer;
+        if t.step != transfer::Step::Receive || !t.is_online(task) {
+            return;
+        }
+        t.online = None;
+        t.busy = false;
+        match received {
+            Ok(file) if is_sealed(&file) => {
+                self.transfer = Transfer::unlock("the profile sent".into(), file);
+            }
+            Ok(_) => t.error = Some("the other computer didn't send a Postden profile".into()),
+            Err(e) => t.error = Some(format!("Couldn't receive: {e}")),
         }
     }
 

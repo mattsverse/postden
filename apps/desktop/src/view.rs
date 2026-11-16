@@ -2074,7 +2074,8 @@ fn signature_view(c: &ComposeForm, k: &Kit) -> Option<El> {
 /// What moving Postden to another computer takes along, and leaves.
 const TRANSFER_ABOUT: &str = "Export every account, with its password or Google sign-in and its \
      signature, and these settings to a file locked with a passphrase, then import it in Postden \
-     on the other computer. Mail isn't in the file: the other computer fetches it again.";
+     on the other computer. Or send them over the internet: the other computer types the code \
+     this one shows. Mail isn't sent: the other computer fetches it again.";
 
 /// The settings' section for moving to another computer.
 fn transfer(t: &Transfer, k: &Kit) -> El {
@@ -2103,9 +2104,25 @@ fn transfer_step(t: &Transfer, k: &Kit) -> El {
                         .on_press_tx(|_: &mut Mail, tx| Mail::pick_profile(tx))
                         .build(k)
                         .key("import-profile"),
+                )
+                .child(
+                    Button::new("Send…")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(Mail::start_send)
+                        .build(k)
+                        .key("send-profile"),
+                )
+                .child(
+                    Button::new("Receive…")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(Mail::start_receive)
+                        .build(k)
+                        .key("receive-profile"),
                 );
         }
-        moving::Step::Export => export_form(t, k),
+        moving::Step::Export | moving::Step::Send => export_form(t, k),
+        moving::Step::Offering => offering(t, k),
+        moving::Step::Receive => receive_form(t, k),
         moving::Step::Unlock => unlock_form(t, k),
         moving::Step::Review => review(t, k),
     };
@@ -2143,26 +2160,34 @@ fn transfer_actions(t: &Transfer, k: &Kit, go: El) -> El {
     row().gap(8.0).child(go).child(
         Button::new("Cancel")
             .variant(ButtonVariant::Ghost)
-            .disabled(t.busy)
+            .disabled(!t.can_cancel())
             .on_press(Mail::cancel_transfer)
             .build(k)
             .key("cancel-transfer"),
     )
 }
 
-/// Typing the passphrase to lock an export with, twice, then picking where to save it.
+/// Typing the passphrase to lock an export with, twice, then picking where to save it, or
+/// going online to send it.
 fn export_form(t: &Transfer, k: &Kit) -> El {
-    let (label, variant) = if t.busy {
-        ("Encrypting…", ButtonVariant::Loading)
+    let sending = t.step == moving::Step::Send;
+    let (submit, key): (fn(&mut Mail, &mut Tx), _) = if sending {
+        (|s, _| s.send_profile(), "send-start")
     } else {
-        ("Export…", ButtonVariant::Contrast)
+        (Mail::export_profile, "export-save")
+    };
+    let (label, variant) = match (t.busy, sending) {
+        (true, true) => ("Going online…", ButtonVariant::Loading),
+        (true, false) => ("Encrypting…", ButtonVariant::Loading),
+        (false, true) => ("Send", ButtonVariant::Contrast),
+        (false, false) => ("Export…", ButtonVariant::Contrast),
     };
     let go = Button::new(label)
         .variant(variant)
         .disabled(t.busy)
-        .on_press_tx(Mail::export_profile)
+        .on_press_tx(submit)
         .build(k)
-        .key("export-save");
+        .key(key);
     col()
         .w_full()
         .gap(10.0)
@@ -2177,7 +2202,7 @@ fn export_form(t: &Transfer, k: &Kit) -> El {
                         "Passphrase",
                         &t.passphrase,
                         |s| &mut s.transfer.passphrase,
-                        Mail::export_profile,
+                        submit,
                     )
                     .build(k)
                     .key("transfer-passphrase"),
@@ -2190,7 +2215,7 @@ fn export_form(t: &Transfer, k: &Kit) -> El {
                         "The passphrase again",
                         &t.confirm,
                         |s| &mut s.transfer.confirm,
-                        Mail::export_profile,
+                        submit,
                     )
                     .build(k)
                     .key("transfer-confirm"),
@@ -2202,6 +2227,96 @@ fn export_form(t: &Transfer, k: &Kit) -> El {
                  both can read your passwords.",
                 postden_app::MIN_PASSPHRASE
             ))
+            .font(k.ty.small)
+            .color(k.c.text_muted)
+            .wrap(),
+        )
+        .child(transfer_actions(t, k, go))
+}
+
+/// The code the other computer types, while waiting for it to take the profile.
+fn offering(t: &Transfer, k: &Kit) -> El {
+    let code = t
+        .online
+        .as_ref()
+        .and_then(|online| online.code.clone())
+        .unwrap_or_default();
+    let copy = Button::new("Copy")
+        .variant(ButtonVariant::Ghost)
+        .on_press_tx(|s: &mut Mail, tx| {
+            if let Some(code) = s.transfer.online.as_ref().and_then(|o| o.code.clone()) {
+                tx.copy(code);
+            }
+        })
+        .build(k)
+        .key("copy-code");
+    col()
+        .w_full()
+        .gap(10.0)
+        .child(
+            text(
+                "On the other computer, open these settings, choose Receive… and type this code:"
+                    .to_owned(),
+            )
+            .font(k.ty.ui)
+            .color(k.c.text_base)
+            .wrap(),
+        )
+        .child(
+            text(code)
+                .key("transfer-code")
+                .font(k.ty.mono)
+                .color(k.c.text_base)
+                .selectable(true),
+        )
+        .child(
+            text(
+                "Waiting for the other computer… It will also ask for the passphrase. Anyone \
+                 with both can read your passwords."
+                    .to_owned(),
+            )
+            .font(k.ty.small)
+            .color(k.c.text_muted)
+            .wrap(),
+        )
+        .child(transfer_actions(t, k, copy))
+}
+
+/// Typing the code the sending computer shows.
+fn receive_form(t: &Transfer, k: &Kit) -> El {
+    let (label, variant) = if t.busy {
+        ("Receiving…", ButtonVariant::Loading)
+    } else {
+        ("Receive", ButtonVariant::Contrast)
+    };
+    let go = Button::new(label)
+        .variant(variant)
+        .disabled(t.busy)
+        .on_press(Mail::receive_profile)
+        .build(k)
+        .key("receive-start");
+    col()
+        .w_full()
+        .gap(10.0)
+        .child(field(
+            k,
+            "The code the other computer shows",
+            TextInput::new(&t.code)
+                .label("Code")
+                .placeholder("k3f9-2xqa-7m0d-wnhc")
+                .width(None)
+                .disabled(t.busy)
+                .on_edit(|s: &mut Mail| &mut s.transfer.code)
+                .on_submit(|s: &mut Mail, _| s.receive_profile())
+                .build(k)
+                .key("receive-code"),
+        ))
+        .child(
+            text(
+                "On the other computer, open these settings and choose Send…, then type the code \
+                 it shows."
+                    .to_owned(),
+            )
             .font(k.ty.small)
             .color(k.c.text_muted)
             .wrap(),

@@ -1,0 +1,17 @@
+[package]
+name = "postden-transfer"
+description = "Sending a Postden profile straight to another computer over iroh, found with a short code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+iroh.workspace = true
+ring.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -20,6 +20,7 @@ postden-secrets = { path = "crates/secrets" }
 postden-app = { path = "crates/app" }
 postden-html = { path = "crates/html" }
 postden-update = { path = "crates/update" }
+postden-transfer = { path = "crates/transfer" }
 
 # shared
 thiserror = "2"
@@ -43,6 +44,9 @@ base64 = "0.22"
 ring = "0.17"
 # profiles: an exported profile is encrypted with a passphrase
 age = "0.12"
+# sending a profile straight to another computer: QUIC between two computers dialed by key,
+# through NATs, relayed when they can't reach each other directly
+iroh = "1.4"
 
 # html
 scraper = { version = "0.29", default-features = false, features = ["deterministic"] }
