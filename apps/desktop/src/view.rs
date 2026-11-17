@@ -460,11 +460,12 @@ fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut 
     }
 }
 
-/// A mailbox's menu, open at where it was right-clicked. While it's `marking` read, it can't be
-/// marked again.
+/// A mailbox's menu, open at where it was right-clicked: refreshing it, and marking it all read.
+/// While it's `marking` read, it can't be marked again.
 fn mailbox_menu(menu: &MailboxMenu, marking: bool, row: El, k: &Kit, layer: &mut Vec<El>) -> El {
     let (account, mailbox) = &menu.mailbox;
     let (a, b) = (account.clone(), mailbox.clone());
+    let (refresh_account, refresh_mailbox) = (account.clone(), mailbox.clone());
     context_menu(
         format!("mailbox-menu-{account}-{mailbox}"),
         row,
@@ -472,6 +473,10 @@ fn mailbox_menu(menu: &MailboxMenu, marking: bool, row: El, k: &Kit, layer: &mut
     )
     .min_width(200.0)
     .on_close(Mail::close_mailbox_menu)
+    .item(MenuItem::new("Refresh").on_select(move |s: &mut Mail| {
+        s.close_mailbox_menu();
+        s.refresh_mailbox(&refresh_account, &refresh_mailbox);
+    }))
     .item(
         MenuItem::new(if marking {
             "Marking all as read…"

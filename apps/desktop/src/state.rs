@@ -2034,6 +2034,18 @@ impl Mail {
         self.forget_go();
     }
 
+    /// Syncs one of an account's mailboxes with the server now, rather than waiting for the server
+    /// to report a change or the next interval. What it finds shows as it arrives.
+    pub(crate) fn refresh_mailbox(&self, account: &str, mailbox: &str) {
+        let Ok(services) = &self.services else { return };
+        // Servers may spell the inbox in any case.
+        if mailbox.eq_ignore_ascii_case(INBOX) {
+            services.mailroom.refresh_inbox(account);
+        } else {
+            services.mailroom.refresh(account);
+        }
+    }
+
     /// Marks every message in one of an account's mailboxes read, on the server too. It shows once
     /// the server agrees; until then the mailbox shows it's busy, and isn't marked again.
     pub(crate) fn mark_all_seen(&mut self, account: &str, mailbox: &str) {
