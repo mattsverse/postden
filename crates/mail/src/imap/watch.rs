@@ -8,6 +8,7 @@ use async_imap::types::{Fetch, Flag};
 use futures::TryStreamExt as _;
 use postden_core::account::Account;
 use postden_core::message::{Envelope, Mailbox, MailboxState, Role};
+use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{sleep, timeout};
 
@@ -179,9 +180,10 @@ impl Synced {
 
 /// Watches `account`'s inbox until `events` is closed, sending what arrives.
 ///
-/// Starts from `state`, what's already cached, so only newer mail is fetched. Connection failures are
-/// reported as [`Status::Failed`] and retried with backoff, so this only returns once nobody is
-/// listening any more.
+/// Starts from `state`, what's already cached, so only newer mail is fetched. Notifying `nudge` syncs
+/// it now, rather than once the server reports a change or the next poll. Connection failures are
+/// reported as [`Status::Failed`] and retried with backoff, or sooner when nudged, so this only
+/// returns once nobody is listening any more.
 ///
 /// `events` can carry any type an [`Event`] converts into, so a caller can share one channel between
 /// watchers and other work.
@@ -190,11 +192,13 @@ pub async fn watch<T: From<Event>>(
     credentials: Credentials,
     mut state: Option<MailboxState>,
     config: WatchConfig,
+    nudge: Arc<Notify>,
     events: UnboundedSender<T>,
 ) {
     let mut watcher = Watcher {
         account: &account,
         config: &config,
+        nudge: &nudge,
         events: &events,
         backoff: MIN_BACKOFF,
     };
@@ -213,7 +217,11 @@ pub async fn watch<T: From<Event>>(
         }) {
             return;
         }
-        sleep(retry_in).await;
+        // A nudge, such as the user asking for a refresh, retries now.
+        tokio::select! {
+            () = sleep(retry_in) => {}
+            () = nudge.notified() => {}
+        }
         watcher.backoff = (retry_in.saturating_mul(2)).min(MAX_BACKOFF);
     }
 }
@@ -221,6 +229,7 @@ pub async fn watch<T: From<Event>>(
 struct Watcher<'a, T> {
     account: &'a Account,
     config: &'a WatchConfig,
+    nudge: &'a Notify,
     events: &'a UnboundedSender<T>,
     backoff: Duration,
 }
@@ -266,9 +275,12 @@ impl<T: From<Event>> Watcher<'_, T> {
                 return Ok(());
             }
             session = if push {
-                idle(session).await?
+                idle(session, self.nudge).await?
             } else {
-                sleep(self.config.poll_interval).await;
+                tokio::select! {
+                    () = sleep(self.config.poll_interval) => {}
+                    () = self.nudge.notified() => {}
+                }
                 session
             };
         }
@@ -284,13 +296,26 @@ pub(super) async fn with_timeout<T>(
         .map_err(Into::into)
 }
 
-/// Waits until the server reports a change, or [`IDLE_TIMEOUT`] passes.
-async fn idle(session: Session) -> Result<Session> {
+/// Waits until the server reports a change, `nudge` is notified, or [`IDLE_TIMEOUT`] passes.
+async fn idle(session: Session, nudge: &Notify) -> Result<Session> {
     let mut handle = session.idle();
     with_timeout(handle.init()).await?;
-    let (wait, _stop) = handle.wait_with_timeout(IDLE_TIMEOUT);
-    // Whatever woke us (new mail, a flag change, or the timeout), the next sync finds out what changed.
-    wait.await?;
+    {
+        let (wait, stop) = handle.wait_with_timeout(IDLE_TIMEOUT);
+        tokio::pin!(wait);
+        // Whatever woke us (new mail, a flag change, a nudge or the timeout), the next sync finds
+        // out what changed.
+        tokio::select! {
+            waited = &mut wait => {
+                waited?;
+            }
+            () = nudge.notified() => {
+                // Dropping the stop source interrupts the wait, which then ends cleanly.
+                drop(stop);
+                wait.await?;
+            }
+        }
+    }
     with_timeout(handle.done()).await
 }
 

@@ -565,6 +565,8 @@ struct Watched {
     tasks: [AbortHandle; 3],
     /// Wakes the refresher.
     nudge: Arc<Notify>,
+    /// Wakes the inbox's watcher.
+    inbox_nudge: Arc<Notify>,
     /// Which watch of the account this is: see [`Job::Watching`].
     number: u64,
 }
@@ -824,11 +826,13 @@ impl Mailroom {
             }
         });
         let nudge = Arc::new(Notify::new());
+        let inbox_nudge = Arc::new(Notify::new());
         let watcher = self.handle.spawn(watch(
             account.clone(),
             imap_credentials.clone(),
             inbox,
             self.config.clone(),
+            Arc::clone(&inbox_nudge),
             events.clone(),
         ));
         let refresher = self.handle.spawn(refresh(
@@ -852,6 +856,7 @@ impl Mailroom {
                     numberer.abort_handle(),
                 ],
                 nudge,
+                inbox_nudge,
                 number,
             },
         );
@@ -1420,6 +1425,14 @@ impl Mailroom {
     pub fn refresh(&self, account: &str) {
         if let Some(w) = self.watchers.get(account) {
             w.nudge.notify_one();
+        }
+    }
+
+    /// Syncs `account`'s inbox now, rather than once the server reports a change or at the next
+    /// poll. Does nothing for an account that isn't watched.
+    pub fn refresh_inbox(&self, account: &str) {
+        if let Some(w) = self.watchers.get(account) {
+            w.inbox_nudge.notify_one();
         }
     }
 
