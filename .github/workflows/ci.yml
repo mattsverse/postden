@@ -58,8 +58,32 @@ jobs:
           python3 -m unittest discover -s scripts -p 'test_*.py'
           python3 scripts/release.py check-config
           bash -n scripts/*.sh
+      # An unoptimized bundle: it reuses the test build, while still checking the script, the
+      # Info.plist and the signing. The release-profile build runs on main (bundle job) and in
+      # the release workflow.
       - name: Build app bundle
         if: runner.os == 'macOS'
         run: |
           plutil -lint assets/macos/Info.plist
-          bash scripts/bundle-macos.sh
+          bash scripts/bundle-macos.sh --dev
+
+  bundle:
+    name: bundle (release, macos-15)
+    # Post-merge only: a release-only build failure is rare, and the release workflow builds the
+    # same thing before publishing. Its own job keeps release artifacts out of the PR caches.
+    if: github.event_name != 'pull_request'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          version: 2026.11.6
+          install_args: rust python
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build app bundle
+        run: bash scripts/bundle-macos.sh
