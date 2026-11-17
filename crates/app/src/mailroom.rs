@@ -11,15 +11,16 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use postden_core::account::{Account, Server};
-use postden_core::message::{Body, Envelope, Outgoing, Role};
+use postden_core::message::{Body, Envelope, Mailbox, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
-    Event, Found, Older, Prefetched, SNOOZED_NAME, Status, WatchConfig, download_message,
+    Event, Flags, Found, Older, Prefetched, SNOOZED_NAME, Status, WatchConfig, download_message,
     fetch_older, mark_all_seen, move_message, open_message, prefetch_messages, refresh,
-    save_sent_copy, search, set_seen, snooze_message, wake_message, watch,
+    restore_message, save_sent_copy, search, set_flagged, set_seen, snooze_message, wake_message,
+    watch,
 };
 use postden_mail::{Credentials, smtp};
-use postden_store::{Snooze, Store};
+use postden_store::{Snooze, Store, Written};
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender, unbounded_channel};
@@ -57,7 +58,12 @@ pub enum Update {
         /// The new messages that arrived unread, oldest first, to tell the user about. Empty on a
         /// first sync.
         unread: Vec<Envelope>,
+        /// The Message-IDs of the messages saved, of those that have one.
+        message_ids: Vec<String>,
     },
+    /// Cached messages in a mailbox were read, unread, starred or unstarred elsewhere, and the
+    /// store says so now.
+    FlagsChanged { account: String, mailbox: String },
     /// Mail older than what was cached, asked for with [`Mailroom::fetch_older`], was saved.
     /// `done` says the mailbox has nothing older left on the server.
     Older {
@@ -90,6 +96,9 @@ pub enum Update {
     Opened {
         account: String,
         mailbox: String,
+        /// The mailbox's UIDVALIDITY it was downloaded under: the body is of the message `uid`
+        /// named then.
+        uid_validity: u32,
         uid: u32,
         body: Result<Body, String>,
     },
@@ -112,7 +121,20 @@ pub enum Update {
         account: String,
         mailbox: String,
         uid: u32,
+        /// What it was to be marked.
+        seen: bool,
         error: String,
+    },
+    /// A message was starred or unstarred, as asked with [`Mailroom::set_flagged`], on the server
+    /// and in the store; or it wasn't, and the store still says what it did before.
+    Flagged {
+        account: String,
+        mailbox: String,
+        /// The mailbox's UIDVALIDITY the star was asked under: `uid` named the message then.
+        uid_validity: u32,
+        uid: u32,
+        flagged: bool,
+        result: Result<(), String>,
     },
     /// Every message in a mailbox was marked read, as asked with [`Mailroom::mark_all_seen`], on
     /// the server and in the store; or it wasn't, and the store still says what it did before.
@@ -157,6 +179,19 @@ pub enum Update {
         uids: Vec<u32>,
         result: Result<(), String>,
     },
+    /// A message asked for with [`Mailroom::restore`] was moved back from `mailbox` to `to`, where
+    /// it was; or it wasn't, and it's still in `mailbox`, snoozed again if it was snoozed. Moved,
+    /// it says whether it was found in `mailbox` at all: it had `uids` there, none if it had been
+    /// moved on meanwhile or `mailbox` started over since.
+    Restored {
+        account: String,
+        mailbox: String,
+        /// The message's Message-ID, which it was found by.
+        message_id: String,
+        uids: Vec<u32>,
+        to: String,
+        result: Result<bool, String>,
+    },
     /// A message handed to [`Mailroom::send`] was accepted by the account's SMTP server, or wasn't.
     /// On success, it's the `Message-ID` it was sent with.
     Sent {
@@ -174,6 +209,7 @@ fn all_seen(
     mailbox: String,
     uid_validity: u32,
     result: Result<u32, String>,
+    at: u64,
 ) -> Update {
     let result = result.and_then(|up_to| {
         // Started over meanwhile, the cached UIDs name other messages than were marked.
@@ -187,12 +223,22 @@ fn all_seen(
         store
             .set_all_seen(&account, &mailbox, up_to)
             .map_err(|e| e.to_string())?;
+        store.written_all_read(&account, &mailbox, (uid_validity, up_to), at);
         Ok(Some(up_to))
     });
     Update::AllSeen {
         account,
         mailbox,
         result,
+    }
+}
+
+/// A read mark to read, answered at `at`.
+const fn read(at: u64) -> Written {
+    Written {
+        at,
+        seen: Some(true),
+        flagged: None,
     }
 }
 
@@ -222,13 +268,30 @@ enum Job {
         uid_validity: u32,
         uid: u32,
         body: Result<Body, String>,
+        /// When it was answered, as [`WatchConfig::changes`] counts: downloaded, it's read.
+        at: u64,
     },
     Seen {
         account: String,
         mailbox: String,
+        /// The mailbox's UIDVALIDITY the mark was asked under.
+        uid_validity: u32,
         uid: u32,
         seen: bool,
         result: Result<(), String>,
+        /// When it was answered, as [`WatchConfig::changes`] counts.
+        at: u64,
+    },
+    Flagged {
+        account: String,
+        mailbox: String,
+        /// The mailbox's UIDVALIDITY the star was asked under.
+        uid_validity: u32,
+        uid: u32,
+        flagged: bool,
+        result: Result<(), String>,
+        /// When it was answered, as [`WatchConfig::changes`] counts.
+        at: u64,
     },
     AllSeen {
         account: String,
@@ -236,8 +299,13 @@ enum Job {
         uid_validity: u32,
         /// The mailbox's UIDNEXT when it was marked: every message below it is read.
         result: Result<u32, String>,
+        /// When it was answered, as [`WatchConfig::changes`] counts.
+        at: u64,
     },
     Moved(Moving, Result<(), String>),
+    /// A message was moved back where it was, or wasn't: the UIDVALIDITY of the mailbox it was in
+    /// and the UIDs it had there, or `None` if that mailbox couldn't be opened.
+    Restored(Restoring, Result<Option<(u32, Vec<u32>)>, String>),
     /// A snoozed message was brought back, or wasn't: the UIDVALIDITY of the mailbox it waited in
     /// and the UIDs it had there, or `None` if that mailbox couldn't be opened.
     Woke(Snooze, Result<Option<(u32, Vec<u32>)>, String>),
@@ -249,6 +317,9 @@ enum Job {
         mailbox: String,
         uid_validity: u32,
         result: Result<Older, String>,
+        /// [`WatchConfig::changes`] when it was asked: read marks and stars counted after are
+        /// newer than what the messages say.
+        asked: u64,
     },
     Searched {
         id: u64,
@@ -287,12 +358,57 @@ struct Moving {
     snooze: Option<i64>,
 }
 
+/// A message being moved back where it was, as asked of [`Mailroom::restore`].
+#[derive(Debug)]
+struct Restoring {
+    account: String,
+    /// Where it is.
+    mailbox: String,
+    message_id: String,
+    /// Where it goes back to.
+    to: String,
+    /// It was snoozed until then; the snooze is forgotten once it's moved back.
+    snoozed: Option<i64>,
+}
+
+/// Whether a message can be found again on the server by its Message-ID, `message_id`: it has
+/// one, and it's printable ASCII (RFC 5322 section 3.6.4), so it can be searched for.
+#[must_use]
+pub fn is_searchable(message_id: &str) -> bool {
+    !message_id.is_empty() && message_id.chars().all(|c| c.is_ascii_graphic())
+}
+
+/// The UIDVALIDITY to ask the server under: `expected`, the one a UID was known under, if given
+/// and still `cached`, else `cached`.
+fn under(expected: Option<u32>, cached: u32, mailbox: &str) -> Result<u32> {
+    match expected {
+        Some(expected) if expected != cached => {
+            Err(Error::Invalid(format!("{mailbox} changed on the server")))
+        }
+        _ => Ok(cached),
+    }
+}
+
+/// Whether the account's `mailbox` is cached under `uid_validity`, so a UID known under it still
+/// names the same message.
+fn is_current(
+    store: &Store,
+    account: &str,
+    mailbox: &str,
+    uid_validity: u32,
+) -> std::result::Result<bool, postden_store::Error> {
+    Ok(store
+        .mailbox_state(account, mailbox)?
+        .is_some_and(|s| s.uid_validity == uid_validity))
+}
+
 /// Whose watch an event is from.
 fn event_account(event: &Event) -> &str {
     match event {
         Event::Status { account, .. }
         | Event::Messages { account, .. }
-        | Event::Mailboxes { account, .. } => account,
+        | Event::Mailboxes { account, .. }
+        | Event::Flags { account, .. } => account,
     }
 }
 
@@ -307,11 +423,13 @@ impl Job {
         match self {
             Self::Opened { account, .. }
             | Self::Seen { account, .. }
+            | Self::Flagged { account, .. }
             | Self::AllSeen { account, .. }
             | Self::Older { account, .. }
             | Self::Searched { account, .. } => Some(account),
             Self::Moved(moving, _) => Some(&moving.account),
             Self::Woke(snooze, _) => Some(&snooze.account),
+            Self::Restored(restoring, _) => Some(&restoring.account),
             _ => None,
         }
     }
@@ -324,6 +442,7 @@ impl Job {
                 mailbox,
                 uid_validity,
                 uid,
+                at,
                 ..
             } => Self::Opened {
                 account,
@@ -331,43 +450,70 @@ impl Job {
                 uid_validity,
                 uid,
                 body: replaced(),
+                at,
             },
             Self::Seen {
                 account,
                 mailbox,
+                uid_validity,
                 uid,
                 seen,
+                at,
                 ..
             } => Self::Seen {
                 account,
                 mailbox,
+                uid_validity,
                 uid,
                 seen,
                 result: replaced(),
+                at,
             },
             Self::AllSeen {
                 account,
                 mailbox,
                 uid_validity,
+                at,
                 ..
             } => Self::AllSeen {
                 account,
                 mailbox,
                 uid_validity,
                 result: replaced(),
+                at,
+            },
+            Self::Flagged {
+                account,
+                mailbox,
+                uid_validity,
+                uid,
+                flagged,
+                at,
+                ..
+            } => Self::Flagged {
+                account,
+                mailbox,
+                uid_validity,
+                uid,
+                flagged,
+                result: replaced(),
+                at,
             },
             Self::Moved(moving, _) => Self::Moved(moving, replaced()),
+            Self::Restored(restoring, _) => Self::Restored(restoring, replaced()),
             Self::Woke(snooze, _) => Self::Woke(snooze, replaced()),
             Self::Older {
                 account,
                 mailbox,
                 uid_validity,
+                asked,
                 ..
             } => Self::Older {
                 account,
                 mailbox,
                 uid_validity,
                 result: replaced(),
+                asked,
             },
             Self::Searched {
                 id,
@@ -452,6 +598,9 @@ pub struct Mailroom {
     last_watch: u64,
     /// The accounts whose due snoozes are being brought back, not to be asked for twice at once.
     waking: Arc<Mutex<HashSet<String>>>,
+    /// Snoozed messages being moved back by [`Mailroom::restore`], by account and Message-ID:
+    /// their snoozes are kept until they're moved, but not brought back meanwhile.
+    unsnoozing: Arc<Mutex<HashSet<(String, String)>>>,
 }
 
 type Logins = Arc<Mutex<HashMap<String, (Server, Credentials, u64)>>>;
@@ -510,6 +659,7 @@ impl Mailroom {
             watches,
             last_watch: 0,
             waking: Arc::default(),
+            unsnoozing: Arc::default(),
         })
     }
 
@@ -682,10 +832,11 @@ impl Mailroom {
         })
     }
 
-    /// Opens a message and marks it read. One downloaded ahead is returned at once, and marked
-    /// read in the background, arriving as [`Update::Seen`] or [`Update::SeenFailed`]. Any
-    /// other is downloaded in the background, arriving as [`Update::Opened`], and `None` is
-    /// returned.
+    /// Opens a message, and marks it read. One downloaded ahead is returned at once, and marked
+    /// read in the background, arriving as [`Update::Seen`] or [`Update::SeenFailed`], unless
+    /// `mark` isn't set, as when that's asked already; the `bool` says whether it was asked of
+    /// the server. Any other is downloaded in the background, which marks it read, arriving as
+    /// [`Update::Opened`], and `None` is returned.
     ///
     /// # Errors
     ///
@@ -697,16 +848,20 @@ impl Mailroom {
         account: &str,
         mailbox: &str,
         uid: u32,
-    ) -> Result<Option<Body>> {
+        mark: bool,
+    ) -> Result<(Option<Body>, bool)> {
         if let Some(body) = store.body(account, mailbox, uid)? {
-            if store.seen(account, mailbox, uid)? == Some(false) {
-                // Shown all the same while disconnected; it stays unread until opened online.
-                let _ignored = self.set_seen(store, account, mailbox, uid, true);
-            }
-            return Ok(Some(body));
+            // Shown all the same while disconnected; it stays unread until opened online.
+            let marking = mark
+                && store.seen(account, mailbox, uid)? == Some(false)
+                && self
+                    .set_seen(store, account, mailbox, uid, true, None)
+                    .is_ok();
+            return Ok((Some(body), marking));
         }
         let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
         let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
+        let changes = self.config.changes.clone();
         self.handle.spawn(async move {
             let body = open_message(&server, &credentials, &mailbox, uid_validity, uid)
                 .await
@@ -718,9 +873,10 @@ impl Mailroom {
                 uid_validity,
                 uid,
                 body,
+                at: changes.answered(),
             });
         });
-        Ok(None)
+        Ok((None, false))
     }
 
     /// Downloads a message whole in the background and writes it to `path` as an `.eml` file,
@@ -762,7 +918,7 @@ impl Mailroom {
     }
 
     /// Marks a message read or unread in the background. The result arrives as [`Update::Seen`] or
-    /// [`Update::SeenFailed`].
+    /// [`Update::SeenFailed`]. With `uid_validity`, only under it: see [`Mailroom::target_under`].
     ///
     /// # Errors
     ///
@@ -774,9 +930,12 @@ impl Mailroom {
         mailbox: &str,
         uid: u32,
         seen: bool,
+        uid_validity: Option<u32>,
     ) -> Result<()> {
-        let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
+        let (server, credentials, uid_validity, jobs) =
+            self.target_under(store, account, mailbox, uid_validity)?;
         let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
+        let changes = self.config.changes.clone();
         self.handle.spawn(async move {
             let result = set_seen(&server, &credentials, &mailbox, uid_validity, uid, seen)
                 .await
@@ -784,9 +943,47 @@ impl Mailroom {
             let _ignored = jobs.send(Job::Seen {
                 account,
                 mailbox,
+                uid_validity,
                 uid,
                 seen,
                 result,
+                at: changes.answered(),
+            });
+        });
+        Ok(())
+    }
+
+    /// Stars a message, or takes its star away, in the background. The result arrives as
+    /// [`Update::Flagged`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Mailroom::open`].
+    pub fn set_flagged(
+        &self,
+        store: &Store,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        flagged: bool,
+        uid_validity: Option<u32>,
+    ) -> Result<()> {
+        let (server, credentials, uid_validity, jobs) =
+            self.target_under(store, account, mailbox, uid_validity)?;
+        let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
+        let changes = self.config.changes.clone();
+        self.handle.spawn(async move {
+            let result = set_flagged(&server, &credentials, &mailbox, uid_validity, uid, flagged)
+                .await
+                .map_err(|e| e.to_string());
+            let _ignored = jobs.send(Job::Flagged {
+                account,
+                mailbox,
+                uid_validity,
+                uid,
+                flagged,
+                result,
+                at: changes.answered(),
             });
         });
         Ok(())
@@ -801,6 +998,7 @@ impl Mailroom {
     pub fn mark_all_seen(&self, store: &Store, account: &str, mailbox: &str) -> Result<()> {
         let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
         let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
+        let changes = self.config.changes.clone();
         self.handle.spawn(async move {
             let result = mark_all_seen(&server, &credentials, &mailbox, uid_validity)
                 .await
@@ -810,6 +1008,7 @@ impl Mailroom {
                 mailbox,
                 uid_validity,
                 result,
+                at: changes.answered(),
             });
         });
         Ok(())
@@ -828,8 +1027,10 @@ impl Mailroom {
         mailbox: &str,
         uid: u32,
         to: &str,
+        uid_validity: Option<u32>,
     ) -> Result<()> {
-        let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
+        let (server, credentials, uid_validity, jobs) =
+            self.target_under(store, account, mailbox, uid_validity)?;
         let nudge = Arc::clone(&self.watched(account)?.nudge);
         let (account, mailbox, to) = (account.to_owned(), mailbox.to_owned(), to.to_owned());
         self.handle.spawn(async move {
@@ -857,7 +1058,7 @@ impl Mailroom {
     /// mailbox in the background, creating one if there's none, as [`Mailroom::move_message`].
     /// The result arrives as [`Update::Snoozed`]. Once due, [`Mailroom::wake_due`] brings it back.
     ///
-    /// The message is found again by `message_id`, its Message-ID as listed. The snooze is saved
+    /// `message` is as listed: it's found again by its Message-ID. The snooze is saved
     /// before the message is moved, and kept whatever the move's result, which may be unknown:
     /// if the message never reached the Snoozed mailbox, waking it finds nothing there and just
     /// forgets it.
@@ -871,10 +1072,11 @@ impl Mailroom {
         store: &Store,
         account: &str,
         mailbox: &str,
-        uid: u32,
-        message_id: Option<&str>,
+        message: &Envelope,
         until: i64,
+        uid_validity: Option<u32>,
     ) -> Result<()> {
+        let uid = message.uid;
         let snoozed = store
             .mailboxes(account)?
             .into_iter()
@@ -883,14 +1085,16 @@ impl Mailroom {
         if snoozed.as_deref() == Some(mailbox) {
             return Err(Error::Invalid("the message is snoozed already".to_owned()));
         }
-        // A Message-ID is printable ASCII (RFC 5322 section 3.6.4), so it can be searched for.
-        let message_id = message_id
-            .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_graphic()))
+        let message_id = message
+            .message_id
+            .as_deref()
+            .filter(|id| is_searchable(id))
             .map(str::to_owned)
             .ok_or_else(|| {
                 Error::Invalid("the message has no Message-ID to find it by later".to_owned())
             })?;
-        let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
+        let (server, credentials, uid_validity, jobs) =
+            self.target_under(store, account, mailbox, uid_validity)?;
         let nudge = Arc::clone(&self.watched(account)?.nudge);
         let create = snoozed.is_none();
         let to = snoozed.unwrap_or_else(|| SNOOZED_NAME.to_owned());
@@ -929,6 +1133,95 @@ impl Mailroom {
         Ok(())
     }
 
+    /// Moves a message back from the account's mailbox `mailbox`, where it was moved or snoozed
+    /// to, to `to`, where it was, in the background, as when that's undone. It's found by
+    /// `message_id`, as its UID there isn't known, and stays read or unread as it is. A message
+    /// snoozed until `snoozed` is no longer snoozed once it's moved back; until then, and if it
+    /// can't be, its snooze is kept, but it isn't brought back. The result arrives as
+    /// [`Update::Restored`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Mailroom::open`], and when the message has no Message-ID to find it by.
+    pub fn restore(
+        &self,
+        account: &str,
+        mailbox: &str,
+        message_id: &str,
+        to: &str,
+        snoozed: Option<i64>,
+    ) -> Result<()> {
+        if !is_searchable(message_id) {
+            return Err(Error::Invalid(
+                "the message has no Message-ID to find it by".to_owned(),
+            ));
+        }
+        let watched = self.watched(account)?;
+        let (server, credentials) = (watched.server.clone(), watched.credentials.clone());
+        let jobs = Asking {
+            jobs: self.jobs.clone(),
+            watch: watched.number,
+        };
+        let nudge = Arc::clone(&watched.nudge);
+        // Not while snoozes are being brought back, which may have taken it already; and not
+        // brought back while it's being moved.
+        let reserved = (account.to_owned(), message_id.to_owned());
+        if snoozed.is_some() {
+            let busy = || {
+                Error::Invalid(
+                    "snoozed mail is being brought back; try again in a moment".to_owned(),
+                )
+            };
+            if self
+                .waking
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(account)
+            {
+                return Err(busy());
+            }
+            if !self
+                .unsnoozing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(reserved.clone())
+            {
+                return Err(busy());
+            }
+        }
+        let unsnoozing = snoozed.map(|_| Arc::clone(&self.unsnoozing));
+        let restoring = Restoring {
+            account: account.to_owned(),
+            mailbox: mailbox.to_owned(),
+            message_id: message_id.to_owned(),
+            to: to.to_owned(),
+            snoozed,
+        };
+        self.handle.spawn(async move {
+            let result = restore_message(
+                &server,
+                &credentials,
+                &restoring.mailbox,
+                &restoring.message_id,
+                &restoring.to,
+            )
+            .await
+            .map_err(|e| e.to_string());
+            if result.is_ok() {
+                nudge.notify_one();
+            }
+            // Bringing it back once due finds nothing to bring if it was moved.
+            if let Some(unsnoozing) = unsnoozing {
+                unsnoozing
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&reserved);
+            }
+            let _ignored = jobs.send(Job::Restored(restoring, result));
+        });
+        Ok(())
+    }
+
     /// Brings every snooze due by `now`, in Unix seconds, back to its account's inbox in the
     /// background, unread. Each arrives as [`Update::Woke`]. An account's are brought back one
     /// at a time, on one connection at a time, so many due at once don't crowd the server. Those
@@ -939,7 +1232,15 @@ impl Mailroom {
     /// Returns an error when the store can't be read.
     pub fn wake_due(&self, store: &Store, now: i64) -> Result<()> {
         let mut due: HashMap<String, Vec<Snooze>> = HashMap::new();
+        let unsnoozing = self
+            .unsnoozing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         for snooze in store.due_snoozes(now)? {
+            if unsnoozing.contains(&(snooze.account.clone(), snooze.message_id.clone())) {
+                continue;
+            }
             due.entry(snooze.account.clone()).or_default().push(snooze);
         }
         for (account, snoozes) in due {
@@ -1005,6 +1306,8 @@ impl Mailroom {
             return Err(Error::Invalid(format!("{mailbox} has nothing cached yet")));
         };
         let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
+        // Before anything is read: what's changed after is newer than what's read.
+        let asked = self.config.changes.now();
         self.handle.spawn(async move {
             let result = fetch_older(&server, &credentials, &mailbox, uid_validity, before, count)
                 .await
@@ -1014,6 +1317,7 @@ impl Mailroom {
                 mailbox,
                 uid_validity,
                 result,
+                asked,
             });
         });
         Ok(())
@@ -1115,14 +1419,28 @@ impl Mailroom {
         account: &str,
         mailbox: &str,
     ) -> Result<(Server, Credentials, u32, Asking)> {
+        self.target_under(store, account, mailbox, None)
+    }
+
+    /// As [`Mailroom::target`], but under `expected`, the UIDVALIDITY the message's UID was
+    /// known under, if given: refused if the mailbox started over since, and the server is
+    /// asked under it, so it refuses too if it started over meanwhile.
+    fn target_under(
+        &self,
+        store: &Store,
+        account: &str,
+        mailbox: &str,
+        expected: Option<u32>,
+    ) -> Result<(Server, Credentials, u32, Asking)> {
         let watched = self.watched(account)?;
         let state = store
             .mailbox_state(account, mailbox)?
             .ok_or_else(|| Error::Invalid(format!("{mailbox} hasn't synced yet")))?;
+        let uid_validity = under(expected, state.uid_validity, mailbox)?;
         Ok((
             watched.server.clone(),
             watched.credentials.clone(),
-            state.uid_validity,
+            uid_validity,
             Asking {
                 jobs: self.jobs.clone(),
                 watch: watched.number,
@@ -1222,6 +1540,7 @@ impl Prefetcher {
                 uid_validity,
                 uid,
                 body: Ok(body),
+                at,
             } if mailbox == INBOX && self.count.load(Ordering::Relaxed) > 0 => {
                 let mut updates = Vec::new();
                 // Kept like one downloaded ahead, so it opens again without waiting; unless the
@@ -1247,6 +1566,7 @@ impl Prefetcher {
                     uid_validity,
                     uid,
                     body: Ok(body),
+                    at,
                 };
                 updates.extend(save(store, opened));
                 (account, updates)
@@ -1274,9 +1594,7 @@ impl Prefetcher {
     ) -> Vec<Update> {
         let result = (|| -> Result<()> {
             // Started over meanwhile, the UIDs name other messages.
-            let current = store
-                .mailbox_state(account, INBOX)?
-                .is_some_and(|s| s.uid_validity == uid_validity);
+            let current = is_current(store, account, INBOX, uid_validity)?;
             if !current {
                 return Ok(());
             }
@@ -1370,18 +1688,9 @@ fn save(store: &mut Store, job: Job) -> Vec<Update> {
     match job {
         Job::Watched(Event::Status { account, status }) => vec![Update::Status { account, status }],
         Job::Watched(Event::Mailboxes { account, mailboxes }) => {
-            // A refresher stopped as its account was removed can still have a listing in flight.
-            match store.account(&account).and_then(|a| {
-                a.map(|_| store.save_mailbox_list(&account, &mailboxes))
-                    .transpose()
-            }) {
-                Ok(Some(())) => vec![Update::Mailboxes { account }],
-                Ok(None) => Vec::new(),
-                Err(e) => vec![Update::SaveFailed {
-                    account,
-                    error: e.to_string(),
-                }],
-            }
+            save_mailboxes(store, account, &mailboxes)
+                .into_iter()
+                .collect()
         }
         Job::Watched(Event::Messages {
             account,
@@ -1389,67 +1698,30 @@ fn save(store: &mut Store, job: Job) -> Vec<Update> {
             role,
             uid_validity,
             messages,
-        }) => save_messages(store, account, mailbox, role, uid_validity, &messages)
-            .into_iter()
-            .collect(),
-        Job::Opened {
-            account,
-            mailbox,
-            uid,
-            body,
-            ..
-        } => {
-            let mut updates = Vec::new();
-            if body.is_ok()
-                && let Err(e) = store.set_seen(&account, &mailbox, uid, true)
-            {
-                updates.push(Update::SaveFailed {
-                    account: account.clone(),
-                    error: e.to_string(),
-                });
-            }
-            updates.push(Update::Opened {
-                account,
-                mailbox,
-                uid,
-                body,
-            });
-            updates
-        }
-        Job::Seen {
-            account,
-            mailbox,
-            uid,
-            seen,
-            result,
-        } => {
-            let result = result.and_then(|()| {
-                store
-                    .set_seen(&account, &mailbox, uid, seen)
-                    .map_err(|e| e.to_string())
-            });
-            vec![match result {
-                Ok(_) => Update::Seen {
-                    account,
-                    mailbox,
-                    uid,
-                    seen,
-                },
-                Err(error) => Update::SeenFailed {
-                    account,
-                    mailbox,
-                    uid,
-                    error,
-                },
-            }]
-        }
-        Job::AllSeen {
+            asked,
+        }) => save_messages(
+            store,
+            (account, mailbox, role),
+            (uid_validity, asked),
+            messages,
+        )
+        .into_iter()
+        .collect(),
+        Job::Watched(Event::Flags {
             account,
             mailbox,
             uid_validity,
-            result,
-        } => vec![all_seen(store, account, mailbox, uid_validity, result)],
+            flags,
+            asked,
+        }) => save_flags(store, account, mailbox, uid_validity, &flags, asked)
+            .into_iter()
+            .collect(),
+        job @ (Job::Opened { .. }
+        | Job::Seen { .. }
+        | Job::Flagged { .. }
+        | Job::AllSeen { .. }) => save_answered(store, job),
         Job::Moved(moving, result) => vec![moved(store, moving, result)],
+        Job::Restored(restoring, result) => vec![restored(store, restoring, result)],
         Job::Woke(snooze, result) => vec![woke(store, &snooze, result)],
         Job::Done(update) => vec![update],
         Job::Older {
@@ -1457,7 +1729,13 @@ fn save(store: &mut Store, job: Job) -> Vec<Update> {
             mailbox,
             uid_validity,
             result,
-        } => vec![save_older(store, account, mailbox, uid_validity, result)],
+            asked,
+        } => vec![save_older(
+            store,
+            (account, mailbox, uid_validity),
+            result,
+            asked,
+        )],
         Job::Searched {
             id,
             account,
@@ -1466,6 +1744,61 @@ fn save(store: &mut Store, job: Job) -> Vec<Update> {
             result,
         } => vec![searched(store, id, account, mailbox, uid_validity, result)],
         // Numbered and downloading-ahead jobs, which `Prefetcher::save` handles first.
+        _ => Vec::new(),
+    }
+}
+
+/// Saves what the server answered about a message being opened, marked or starred, or a
+/// mailbox marked read, as [`save`].
+fn save_answered(store: &Store, job: Job) -> Vec<Update> {
+    match job {
+        Job::Opened {
+            account,
+            mailbox,
+            uid_validity,
+            uid,
+            body,
+            at,
+        } => opened(store, (account, mailbox, uid_validity), uid, body, at),
+        Job::Seen {
+            account,
+            mailbox,
+            uid_validity,
+            uid,
+            seen,
+            result,
+            at,
+        } => vec![marked(
+            store,
+            (account, mailbox, uid_validity),
+            uid,
+            seen,
+            result,
+            at,
+        )],
+        Job::Flagged {
+            account,
+            mailbox,
+            uid_validity,
+            uid,
+            flagged,
+            result,
+            at,
+        } => vec![starred(
+            store,
+            (account, mailbox, uid_validity),
+            uid,
+            flagged,
+            result,
+            at,
+        )],
+        Job::AllSeen {
+            account,
+            mailbox,
+            uid_validity,
+            result,
+            at,
+        } => vec![all_seen(store, account, mailbox, uid_validity, result, at)],
         _ => Vec::new(),
     }
 }
@@ -1528,9 +1861,7 @@ fn woke(
             let Some((uid_validity, uids)) = found else {
                 return Ok(());
             };
-            let current = store
-                .mailbox_state(&snooze.account, &snooze.mailbox)?
-                .is_some_and(|s| s.uid_validity == uid_validity);
+            let current = is_current(store, &snooze.account, &snooze.mailbox, uid_validity)?;
             if current {
                 for uid in uids {
                     store.remove_message(&snooze.account, &snooze.mailbox, uid)?;
@@ -1545,6 +1876,206 @@ fn woke(
         account: snooze.account.clone(),
         mailbox: snooze.mailbox.clone(),
         uids: left,
+        result,
+    }
+}
+
+/// Saves an account's mailboxes as the server listed them.
+fn save_mailboxes(store: &mut Store, account: String, mailboxes: &[Mailbox]) -> Option<Update> {
+    // A refresher stopped as its account was removed can still have a listing in flight.
+    match store.account(&account).and_then(|a| {
+        a.map(|_| store.save_mailbox_list(&account, mailboxes))
+            .transpose()
+    }) {
+        Ok(Some(())) => Some(Update::Mailboxes { account }),
+        Ok(None) => None,
+        Err(e) => Some(Update::SaveFailed {
+            account,
+            error: e.to_string(),
+        }),
+    }
+}
+
+/// Saves whether cached messages are read and starred, as a sync found them, and says so if
+/// any changed.
+fn save_flags(
+    store: &mut Store,
+    account: String,
+    mailbox: String,
+    uid_validity: u32,
+    flags: &[Flags],
+    asked: u64,
+) -> Option<Update> {
+    let flags: Vec<_> = flags.iter().map(|f| (f.uid, f.seen, f.flagged)).collect();
+    match store.set_flags(&account, &mailbox, uid_validity, asked, &flags) {
+        Ok(0) => None,
+        Ok(_) => Some(Update::FlagsChanged { account, mailbox }),
+        Err(e) => Some(Update::SaveFailed {
+            account,
+            error: e.to_string(),
+        }),
+    }
+}
+
+/// A message was downloaded, and so marked read on the server, or couldn't be: read in the
+/// store too, unless its mailbox, given with the UIDVALIDITY it was downloaded under, started
+/// over since.
+fn opened(
+    store: &Store,
+    (account, mailbox, uid_validity): (String, String, u32),
+    uid: u32,
+    body: Result<Body, String>,
+    at: u64,
+) -> Vec<Update> {
+    let mut updates = Vec::new();
+    // Unless the mailbox started over meanwhile: its UID names another message now.
+    let marked = || {
+        if is_current(store, &account, &mailbox, uid_validity)? {
+            store.set_seen(&account, &mailbox, uid, true)?;
+            store.written(&account, &mailbox, (uid_validity, uid), read(at));
+        }
+        Ok::<_, postden_store::Error>(())
+    };
+    if body.is_ok()
+        && let Err(e) = marked()
+    {
+        updates.push(Update::SaveFailed {
+            account: account.clone(),
+            error: e.to_string(),
+        });
+    }
+    updates.push(Update::Opened {
+        account,
+        mailbox,
+        uid_validity,
+        uid,
+        body,
+    });
+    updates
+}
+
+/// Marks a message read or unread in the store once the server did.
+fn marked(
+    store: &Store,
+    (account, mailbox, uid_validity): (String, String, u32),
+    uid: u32,
+    seen: bool,
+    result: Result<(), String>,
+    at: u64,
+) -> Update {
+    let result = result.and_then(|()| {
+        // Unless the mailbox started over meanwhile: its UID names another message now.
+        if is_current(store, &account, &mailbox, uid_validity).map_err(|e| e.to_string())? {
+            store
+                .set_seen(&account, &mailbox, uid, seen)
+                .map_err(|e| e.to_string())?;
+            let written = Written {
+                at,
+                seen: Some(seen),
+                flagged: None,
+            };
+            store.written(&account, &mailbox, (uid_validity, uid), written);
+        }
+        Ok(())
+    });
+    match result {
+        Ok(()) => Update::Seen {
+            account,
+            mailbox,
+            uid,
+            seen,
+        },
+        Err(error) => Update::SeenFailed {
+            account,
+            mailbox,
+            uid,
+            seen,
+            error,
+        },
+    }
+}
+
+/// Stars or unstars a message in the store once the server did, unless its mailbox, given with
+/// the UIDVALIDITY it was starred under, started over since: its UID names another message now.
+fn starred(
+    store: &Store,
+    (account, mailbox, uid_validity): (String, String, u32),
+    uid: u32,
+    flagged: bool,
+    result: Result<(), String>,
+    at: u64,
+) -> Update {
+    let result = result.and_then(|()| {
+        let saved = (|| {
+            let current = is_current(store, &account, &mailbox, uid_validity)?;
+            if current {
+                store.set_flagged(&account, &mailbox, uid, flagged)?;
+                let written = Written {
+                    at,
+                    seen: None,
+                    flagged: Some(flagged),
+                };
+                store.written(&account, &mailbox, (uid_validity, uid), written);
+            }
+            Ok::<_, postden_store::Error>(())
+        })();
+        saved.map_err(|e| e.to_string())
+    });
+    Update::Flagged {
+        account,
+        mailbox,
+        uid_validity,
+        uid,
+        flagged,
+        result,
+    }
+}
+
+/// A message was moved back where it was, or wasn't. Moved, or no longer there, it leaves the
+/// mailbox it was in, unless that started over since, and a snooze it had is forgotten; not, the
+/// snooze is kept.
+fn restored(
+    store: &mut Store,
+    restoring: Restoring,
+    result: Result<Option<(u32, Vec<u32>)>, String>,
+) -> Update {
+    let Restoring {
+        account,
+        mailbox,
+        message_id,
+        to,
+        snoozed,
+    } = restoring;
+    let mut left = Vec::new();
+    let result = match result {
+        Ok(found) => {
+            let saved = (|| {
+                if let Some(until) = snoozed {
+                    store.unsnooze(&account, &message_id, until)?;
+                }
+                let Some((uid_validity, uids)) = found else {
+                    return Ok(false);
+                };
+                let moved = !uids.is_empty();
+                let current = is_current(store, &account, &mailbox, uid_validity)?;
+                if current {
+                    for uid in uids {
+                        store.remove_message(&account, &mailbox, uid)?;
+                        left.push(uid);
+                    }
+                }
+                Ok::<_, postden_store::Error>(moved)
+            })();
+            saved.map_err(|e| e.to_string())
+        }
+        Err(error) => Err(error),
+    };
+    Update::Restored {
+        account,
+        mailbox,
+        message_id,
+        uids: left,
+        to,
         result,
     }
 }
@@ -1578,12 +2109,18 @@ fn searched(
 
 fn save_older(
     store: &mut Store,
-    account: String,
-    mailbox: String,
-    uid_validity: u32,
+    (account, mailbox, uid_validity): (String, String, u32),
     result: Result<Older, String>,
+    asked: u64,
 ) -> Update {
-    let saved = result.and_then(|older| {
+    let saved = result.and_then(|mut older| {
+        // Read or starred since it was asked, that's newer than what it fetched.
+        store.with_written(
+            &account,
+            &mailbox,
+            (uid_validity, asked),
+            &mut older.messages,
+        );
         store
             .save_older_messages(&account, &mailbox, uid_validity, &older.messages)
             .map_err(|e| e.to_string())
@@ -1617,12 +2154,13 @@ fn save_older(
 
 fn save_messages(
     store: &mut Store,
-    account: String,
-    mailbox: String,
-    role: Role,
-    uid_validity: u32,
-    messages: &[Envelope],
+    (account, mailbox, role): (String, String, Role),
+    (uid_validity, asked): (u32, u64),
+    mut messages: Vec<Envelope>,
 ) -> Option<Update> {
+    // Read or starred since the sync started, that's newer than what it fetched.
+    store.with_written(&account, &mailbox, (uid_validity, asked), &mut messages);
+    let messages = messages.as_slice();
     let result = (|| -> Result<Option<bool>> {
         // A watcher stopped as its account was removed can still have mail in flight.
         if store.account(&account)?.is_none() {
@@ -1648,6 +2186,10 @@ fn save_messages(
             } else {
                 messages.iter().filter(|m| !m.seen).cloned().collect()
             },
+            message_ids: messages
+                .iter()
+                .filter_map(|m| m.message_id.clone())
+                .collect(),
         }),
         Err(e) => Some(Update::SaveFailed {
             account,
@@ -1696,8 +2238,10 @@ mod tests {
                     subject: None,
                     date: None,
                     seen: false,
+                    flagged: false,
                 })
                 .collect(),
+            asked: 0,
         })
     }
 
@@ -1770,6 +2314,7 @@ mod tests {
                 subject: None,
                 date: None,
                 seen: false,
+                flagged: false,
             })
             .collect();
         let job = |uid_validity, older: &[Envelope]| Job::Older {
@@ -1780,6 +2325,7 @@ mod tests {
                 messages: older.to_vec(),
                 done: false,
             }),
+            asked: 0,
         };
 
         let updates = save(&mut store, job(1, &older));
@@ -1922,9 +2468,11 @@ mod tests {
             job: Box::new(Job::Seen {
                 account: "me@example.com".into(),
                 mailbox: "INBOX".into(),
+                uid_validity: 1,
                 uid: 2,
                 seen: true,
                 result: Ok(()),
+                at: 0,
             }),
         };
         let is_seen = |store: &Store| store.seen("me@example.com", "INBOX", 2).unwrap();
@@ -2094,6 +2642,7 @@ mod tests {
             uid_validity,
             uid: 1,
             body: Ok(Body::default()),
+            at: 0,
         };
         let (_runtime, mut off) = prefetcher(0);
         off.save(&mut store, messages(1, &[1]));
@@ -2150,6 +2699,7 @@ mod tests {
             uid_validity: 1,
             uid: 1,
             body,
+            at: 0,
         };
         let seen = |store: &Store| {
             store.recent_messages(Role::Inbox, 1).unwrap()[0]
@@ -2176,9 +2726,11 @@ mod tests {
         let job = |result| Job::Seen {
             account: "me@example.com".into(),
             mailbox: "INBOX".into(),
+            uid_validity: 1,
             uid: 1,
             seen: false,
             result,
+            at: 0,
         };
         let seen = |store: &Store| {
             store.recent_messages(Role::Inbox, 1).unwrap()[0]
@@ -2207,6 +2759,7 @@ mod tests {
             mailbox: "INBOX".into(),
             uid_validity,
             result,
+            at: 0,
         };
         let seen = |store: &Store, uid| store.seen("me@example.com", "INBOX", uid).unwrap();
 
@@ -2364,7 +2917,9 @@ mod tests {
                 subject: None,
                 date: None,
                 seen: true,
+                flagged: false,
             }],
+            asked: 0,
         });
         save(&mut store, waiting);
         store.snooze(&snooze(100)).unwrap();
@@ -2402,5 +2957,364 @@ mod tests {
             vec![],
             "forgotten, not retried"
         );
+    }
+
+    #[test]
+    fn a_star_only_sticks_when_the_server_agreed() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        save(&mut store, messages(1, &[1]));
+        let job = |result| Job::Flagged {
+            account: "me@example.com".into(),
+            mailbox: "INBOX".into(),
+            uid_validity: 1,
+            uid: 1,
+            flagged: true,
+            result,
+            at: 0,
+        };
+        let flagged = |store: &Store| {
+            store.recent_messages(Role::Inbox, 1).unwrap()[0]
+                .envelope
+                .flagged
+        };
+
+        let failed = save(&mut store, job(Err("offline".into())));
+        assert!(matches!(
+            failed.as_slice(),
+            [Update::Flagged { result: Err(_), .. }]
+        ));
+        assert!(!flagged(&store));
+        let done = save(&mut store, job(Ok(())));
+        assert!(matches!(
+            done.as_slice(),
+            [Update::Flagged {
+                flagged: true,
+                result: Ok(()),
+                ..
+            }]
+        ));
+        assert!(flagged(&store));
+    }
+
+    #[test]
+    fn a_message_moved_back_leaves_where_it_was_moved_and_its_snooze_goes_only_then() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        let archived = Job::Watched(Event::Messages {
+            account: "me@example.com".into(),
+            mailbox: "Snoozed".into(),
+            role: Role::Snoozed,
+            uid_validity: 7,
+            messages: vec![Envelope {
+                uid: 3,
+                message_id: Some("a@example.com".into()),
+                from: Address::default(),
+                to: Vec::new(),
+                subject: None,
+                date: None,
+                seen: true,
+                flagged: false,
+            }],
+            asked: 0,
+        });
+        save(&mut store, archived);
+        let job = |result| {
+            let restoring = Restoring {
+                account: "me@example.com".into(),
+                mailbox: "Snoozed".into(),
+                message_id: "a@example.com".into(),
+                to: "INBOX".into(),
+                snoozed: Some(100),
+            };
+            Job::Restored(restoring, result)
+        };
+        let cached = |store: &Store| store.recent_messages(Role::Snoozed, 10).unwrap().len();
+
+        store.snooze(&snooze(100)).unwrap();
+        let failed = save(&mut store, job(Err("offline".into())));
+        assert!(
+            matches!(failed.as_slice(), [Update::Restored { result: Err(_), .. }]),
+            "got {failed:?}"
+        );
+        assert_eq!(
+            store.due_snoozes(100).unwrap(),
+            vec![snooze(100)],
+            "still snoozed, as it's still waiting"
+        );
+        assert_eq!(cached(&store), 1);
+
+        let gone = save(&mut store, job(Ok(Some((7, Vec::new())))));
+        assert!(
+            matches!(
+                gone.as_slice(),
+                [Update::Restored {
+                    result: Ok(false),
+                    ..
+                }]
+            ),
+            "not there any more: {gone:?}"
+        );
+        assert_eq!(
+            store.due_snoozes(100).unwrap(),
+            vec![],
+            "nothing to bring back"
+        );
+        store.snooze(&snooze(100)).unwrap();
+        let restored = save(&mut store, job(Ok(Some((7, vec![3])))));
+        assert!(
+            matches!(
+                restored.as_slice(),
+                [Update::Restored { uids, to, result: Ok(true), .. }] if uids == &[3] && to == "INBOX"
+            ),
+            "got {restored:?}"
+        );
+        assert_eq!(cached(&store), 0, "it left where it was moved");
+        assert_eq!(store.due_snoozes(100).unwrap(), vec![], "and isn't snoozed");
+    }
+
+    #[test]
+    fn a_uid_is_asked_under_the_uid_validity_it_was_known_under() {
+        assert_eq!(under(None, 7, "INBOX").unwrap(), 7);
+        assert_eq!(under(Some(7), 7, "INBOX").unwrap(), 7);
+        assert!(
+            under(Some(6), 7, "INBOX").is_err(),
+            "started over: UID may name another message"
+        );
+    }
+
+    #[test]
+    fn a_read_mark_answered_after_its_mailbox_started_over_isnt_saved() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        save(&mut store, messages(2, &[1]));
+        let marked = save(
+            &mut store,
+            Job::Seen {
+                account: "me@example.com".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                uid: 1,
+                seen: true,
+                result: Ok(()),
+                at: 0,
+            },
+        );
+        assert!(matches!(marked.as_slice(), [Update::Seen { .. }]));
+        assert_eq!(
+            store.seen("me@example.com", "INBOX", 1).unwrap(),
+            Some(false),
+            "UID 1 is another message under UIDVALIDITY 2"
+        );
+    }
+
+    #[test]
+    fn a_download_answered_after_its_mailbox_started_over_isnt_marked_read() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        save(&mut store, messages(2, &[1]));
+        let opened = save(
+            &mut store,
+            Job::Opened {
+                account: "me@example.com".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                uid: 1,
+                body: Ok(Body::default()),
+                at: 0,
+            },
+        );
+        assert!(matches!(opened.as_slice(), [Update::Opened { .. }]));
+        assert_eq!(
+            store.seen("me@example.com", "INBOX", 1).unwrap(),
+            Some(false),
+            "UID 1 is another message under UIDVALIDITY 2"
+        );
+    }
+
+    #[test]
+    fn flags_read_before_a_star_was_answered_dont_take_it_away() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        save(&mut store, messages(1, &[1, 2]));
+        let flags = |flagged, asked| {
+            Job::Watched(Event::Flags {
+                account: "me@example.com".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                flags: [1, 2]
+                    .map(|uid| Flags {
+                        uid,
+                        seen: true,
+                        flagged,
+                    })
+                    .to_vec(),
+                asked,
+            })
+        };
+        let flagged = |store: &Store, uid| {
+            store
+                .recent_messages(Role::Inbox, 10)
+                .unwrap()
+                .into_iter()
+                .find(|m| m.envelope.uid == uid)
+                .unwrap()
+                .envelope
+                .flagged
+        };
+        // A sync starts (count 4), a star is answered (5) and saved, then what the sync read is,
+        // whatever order they reach the store in.
+        save(
+            &mut store,
+            Job::Flagged {
+                account: "me@example.com".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                uid: 1,
+                flagged: true,
+                result: Ok(()),
+                at: 5,
+            },
+        );
+        save(&mut store, flags(false, 4));
+        assert!(
+            flagged(&store, 1),
+            "the star is newer than what the sync read"
+        );
+        assert_eq!(
+            store.seen("me@example.com", "INBOX", 2).unwrap(),
+            Some(true),
+            "the rest of what it read is saved"
+        );
+        // A sync started after the star has the last word.
+        save(&mut store, flags(false, 5));
+        assert!(!flagged(&store, 1), "unstarred elsewhere since");
+    }
+
+    #[test]
+    fn a_message_fetched_before_its_star_was_answered_is_saved_starred() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        save(&mut store, messages(1, &[1]));
+        // UID 2 was found by searching the server, and starred, before the sync that fetched it
+        // (started at count 4) was saved.
+        save(
+            &mut store,
+            Job::Flagged {
+                account: "me@example.com".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                uid: 2,
+                flagged: true,
+                result: Ok(()),
+                at: 5,
+            },
+        );
+        let mut fetched = messages(1, &[2]);
+        if let Job::Watched(Event::Messages { asked, .. }) = &mut fetched {
+            *asked = 4;
+        }
+        save(&mut store, fetched);
+        let starred = store
+            .recent_messages(Role::Inbox, 10)
+            .unwrap()
+            .into_iter()
+            .any(|m| m.envelope.uid == 2 && m.envelope.flagged);
+        assert!(starred);
+    }
+
+    #[test]
+    fn a_star_from_before_its_mailbox_started_over_isnt_put_on_the_message_with_its_uid_now() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        save(&mut store, messages(1, &[1]));
+        // A sync starts (count 4) and finds INBOX started over; meanwhile UID 1 is starred under
+        // the old UIDVALIDITY (5), then the sync's messages are saved.
+        save(
+            &mut store,
+            Job::Flagged {
+                account: "me@example.com".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                uid: 1,
+                flagged: true,
+                result: Ok(()),
+                at: 5,
+            },
+        );
+        let mut started_over = messages(2, &[1]);
+        if let Job::Watched(Event::Messages { asked, .. }) = &mut started_over {
+            *asked = 4;
+        }
+        save(&mut store, started_over);
+        let starred = store.recent_messages(Role::Inbox, 10).unwrap()[0]
+            .envelope
+            .flagged;
+        assert!(!starred, "UID 1 names another message under UIDVALIDITY 2");
+    }
+
+    #[test]
+    fn older_mail_fetched_before_its_star_was_answered_is_saved_starred() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        save(&mut store, messages(1, &[5]));
+        // Older mail is asked for (count 4); UID 1, found by searching the server, is starred
+        // (5); a sync started after the star (5) is saved; then the older mail, as read before
+        // the star, is.
+        save(
+            &mut store,
+            Job::Flagged {
+                account: "me@example.com".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                uid: 1,
+                flagged: true,
+                result: Ok(()),
+                at: 5,
+            },
+        );
+        let older = Envelope {
+            uid: 1,
+            message_id: None,
+            from: Address::default(),
+            to: Vec::new(),
+            subject: None,
+            date: Some(1),
+            seen: true,
+            flagged: false,
+        };
+        save(
+            &mut store,
+            Job::Watched(Event::Flags {
+                account: "me@example.com".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                flags: vec![Flags {
+                    uid: 5,
+                    seen: true,
+                    flagged: false,
+                }],
+                asked: 5,
+            }),
+        );
+        save(
+            &mut store,
+            Job::Older {
+                account: "me@example.com".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                result: Ok(Older {
+                    messages: vec![older],
+                    done: true,
+                }),
+                asked: 4,
+            },
+        );
+        let starred = store
+            .recent_messages(Role::Inbox, 10)
+            .unwrap()
+            .into_iter()
+            .any(|m| m.envelope.uid == 1 && m.envelope.flagged);
+        assert!(starred, "the star is newer than what the fetch read");
     }
 }

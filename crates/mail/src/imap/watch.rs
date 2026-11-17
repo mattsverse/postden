@@ -1,8 +1,10 @@
 //! Keeping an account's inbox in sync and reporting new mail as it arrives.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use async_imap::types::Fetch;
+use async_imap::types::{Fetch, Flag};
 use futures::TryStreamExt as _;
 use postden_core::account::Account;
 use postden_core::message::{Envelope, Mailbox, MailboxState, Role};
@@ -20,6 +22,9 @@ pub(super) const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long to IDLE before re-issuing it. RFC 2177 asks for under 29 minutes; shorter also gets
 /// past NAT boxes that drop quiet connections, and notices a dead connection sooner.
 const IDLE_TIMEOUT: Duration = Duration::from_mins(9);
+/// How many of a mailbox's newest messages have their flags read again on each sync, so being
+/// read or starred elsewhere shows here: what the list shows first.
+const FLAGS_WINDOW: u32 = 500;
 const MIN_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_mins(5);
 
@@ -32,6 +37,9 @@ pub struct WatchConfig {
     pub initial_fetch: u32,
     /// How often mailboxes other than the inbox are listed and synced.
     pub refresh_interval: Duration,
+    /// Counts read marks and stars the server answered, shared with what asks for them: what a
+    /// sync reads is older than those counted after it started.
+    pub changes: Changes,
 }
 
 impl Default for WatchConfig {
@@ -40,9 +48,38 @@ impl Default for WatchConfig {
             poll_interval: Duration::from_secs(60),
             initial_fetch: 200,
             refresh_interval: Duration::from_mins(5),
+            changes: Changes::default(),
         }
     }
 }
+
+/// Counts read marks and stars as the server answers them, so what a sync read can be told
+/// apart from what was changed after it started.
+#[derive(Debug, Clone, Default)]
+pub struct Changes(Arc<AtomicU64>);
+
+impl Changes {
+    /// The count now.
+    #[must_use]
+    pub fn now(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Counts one the server just answered, and returns its count.
+    #[must_use]
+    pub fn answered(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
+/// Every copy counts the same changes.
+impl PartialEq for Changes {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Changes {}
 
 /// What a watcher is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,12 +110,71 @@ pub enum Event {
         role: Role,
         uid_validity: u32,
         messages: Vec<Envelope>,
+        /// [`WatchConfig::changes`] when the sync started: read marks and stars counted after
+        /// are newer than what the messages say.
+        asked: u64,
     },
     /// The account's mailboxes, as the server just listed them.
     Mailboxes {
         account: String,
         mailboxes: Vec<Mailbox>,
     },
+    /// Whether messages already cached from `mailbox` are read and starred, as the server says
+    /// now. Only for the mailbox under `uid_validity`.
+    Flags {
+        account: String,
+        mailbox: String,
+        uid_validity: u32,
+        flags: Vec<Flags>,
+        /// As [`Event::Messages`]'s.
+        asked: u64,
+    },
+}
+
+/// Whether a message is read and starred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Flags {
+    pub uid: u32,
+    pub seen: bool,
+    pub flagged: bool,
+}
+
+/// What a [`sync`] found.
+pub(super) struct Synced {
+    pub(super) uid_validity: u32,
+    /// The new messages, or `None` when nothing changed.
+    pub(super) messages: Option<Vec<Envelope>>,
+    /// The flags of the newest messages that were already there.
+    pub(super) flags: Vec<Flags>,
+    /// [`WatchConfig::changes`] when it started.
+    pub(super) asked: u64,
+}
+
+impl Synced {
+    /// What to report of it for `mailbox` of `account`, with `role`.
+    pub(super) fn events(self, account: &str, mailbox: &str, role: Role) -> Vec<Event> {
+        let mut events = Vec::new();
+        if let Some(messages) = self.messages {
+            events.push(Event::Messages {
+                account: account.to_owned(),
+                mailbox: mailbox.to_owned(),
+                role,
+                uid_validity: self.uid_validity,
+                messages,
+                asked: self.asked,
+            });
+        }
+        if !self.flags.is_empty() {
+            events.push(Event::Flags {
+                account: account.to_owned(),
+                mailbox: mailbox.to_owned(),
+                uid_validity: self.uid_validity,
+                flags: self.flags,
+                asked: self.asked,
+            });
+        }
+        events
+    }
 }
 
 /// Watches `account`'s inbox until `events` is closed, sending what arrives.
@@ -161,16 +257,10 @@ impl<T: From<Event>> Watcher<'_, T> {
         }
         loop {
             let synced = with_timeout(sync(&mut session, INBOX, self.config, state)).await?;
-            if let Some((uid_validity, messages)) = synced
-                && !self.send(Event::Messages {
-                    account: self.account.id.clone(),
-                    mailbox: INBOX.to_owned(),
-                    role: Role::Inbox,
-                    uid_validity,
-                    messages,
-                })
-            {
-                return Ok(());
+            for event in synced.events(&self.account.id, INBOX, Role::Inbox) {
+                if !self.send(event) {
+                    return Ok(());
+                }
             }
             if self.events.is_closed() {
                 return Ok(());
@@ -204,15 +294,16 @@ async fn idle(session: Session) -> Result<Session> {
     with_timeout(handle.done()).await
 }
 
-/// Fetches what's new in the mailbox since `state`, and advances `state` past it.
-///
-/// Returns the mailbox's UIDVALIDITY and the new messages, or `None` when nothing changed.
+/// Fetches what's new in the mailbox since `state`, and advances `state` past it, and reads again
+/// the flags of the newest [`FLAGS_WINDOW`] messages that were there before.
 pub(super) async fn sync(
     session: &mut Session,
     name: &str,
     config: &WatchConfig,
     state: &mut Option<MailboxState>,
-) -> Result<Option<(u32, Vec<Envelope>)>> {
+) -> Result<Synced> {
+    // Before anything is read: what's changed after is newer than what's read.
+    let asked = config.changes.now();
     let mailbox = session.select(name).await?;
     let uid_validity = mailbox
         .uid_validity
@@ -248,6 +339,32 @@ pub(super) async fn sync(
     messages.sort_by_key(|m| m.uid);
 
     let reset = state.is_none_or(|s| s.uid_validity != uid_validity);
+    // Those just fetched came with their flags, and after a reset nothing older is cached.
+    let flags = match plan {
+        Some(Plan::After(_)) if !reset => {
+            let from = mailbox
+                .exists
+                .saturating_sub(FLAGS_WINDOW.saturating_sub(1))
+                .max(1);
+            let flagged: Vec<Fetch> = session
+                .fetch(format!("{from}:*"), "(UID FLAGS)")
+                .await?
+                .try_collect()
+                .await?;
+            flagged
+                .iter()
+                .filter_map(|f| {
+                    let uid = f.uid.filter(|&uid| uid <= after)?;
+                    Some(Flags {
+                        uid,
+                        seen: f.flags().any(|f| f == Flag::Seen),
+                        flagged: f.flags().any(|f| f == Flag::Flagged),
+                    })
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
     let last_uid = messages
         .last()
         .map(|m| m.uid)
@@ -256,7 +373,12 @@ pub(super) async fn sync(
         uid_validity,
         last_uid,
     });
-    Ok((reset || !messages.is_empty()).then_some((uid_validity, messages)))
+    Ok(Synced {
+        uid_validity,
+        messages: (reset || !messages.is_empty()).then_some(messages),
+        flags,
+        asked,
+    })
 }
 
 /// What to fetch after selecting a mailbox.

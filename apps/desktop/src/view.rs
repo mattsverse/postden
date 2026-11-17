@@ -9,23 +9,24 @@ use postden_html::compat::{self, Client, Provider};
 use postden_mail::imap::Status;
 use postden_store::StoredMessage;
 use rune::{
-    Block, Color, Cx, El, Icon, Mark, ScrollSpec, TextEdit, TextStyle, Transition, Tx, col, el,
-    row, text,
+    Block, Color, Cx, El, GrowthSpec, Icon, Mark, ScrollSpec, TextEdit, TextStyle, Transition, Tx,
+    col, el, icon, row, text,
 };
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow, SplitView, Toolbar};
 use rune_kit::{
-    Button, ButtonVariant, Dialog, Divider, IconButton, IconButtonVariant, Kit, Markdown,
+    Button, ButtonVariant, Dialog, Divider, IconButton, IconButtonVariant, Keybind, Kit, Markdown,
     MarkdownStyle, Menu, MenuEntry, MenuItem, Placement, SegmentedControl, Spinner, State, Switch,
     TextArea, TextInput, Toast, ToastRegion, context_menu, glyphs, root,
 };
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
+use crate::commands::{Command, Entry, Shortcut};
 use crate::compose::{ComposeForm, Mode, Preview};
 use crate::form::{AccountForm, SECURITY, Step, security_index};
 use crate::rich::RichEditor;
 use crate::search::{SERVER_PAGE, ServerSearch};
 use crate::state::{
-    INBOX as INBOX_NAME, Mail, MailboxMenu, MessageMenu, Reader, SettingsSection, Showing,
+    Answer, INBOX as INBOX_NAME, Mail, MailboxMenu, MessageMenu, Reader, SettingsSection, Showing,
 };
 use crate::transfer::{self as moving, Transfer};
 use crate::update::{self, Phase};
@@ -68,6 +69,12 @@ static PICTURE: Icon = Icon {
     name: "postden-picture",
     view: 16.0,
     body: r#"<rect x="2.5" y="3" width="11" height="10" rx="1.5" stroke="currentColor" stroke-width="1.2" fill="none"/><circle cx="6" cy="6.5" r="1.1" fill="currentColor"/><path d="M3 11.5L6.5 8.5L9 10.5L10.75 9L13 11" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/>"#,
+};
+/// A starred message.
+static STAR: Icon = Icon {
+    name: "postden-star",
+    view: 16.0,
+    body: r#"<path d="M8 2.25L9.69 5.83L13.5 6.31L10.7 8.97L11.4 12.75L8 10.9L4.6 12.75L5.3 8.97L2.5 6.31L6.31 5.83Z" fill="currentColor" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/>"#,
 };
 static PLUS: Icon = Icon {
     name: "postden-plus",
@@ -125,7 +132,11 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
                 .icon(&BACK)
                 .variant(ButtonVariant::Ghost)
                 .help("Back to the list (Esc)")
-                .on_press(Mail::close_reader)
+                .on_press_tx(|s: &mut Mail, tx| {
+                    s.close_reader();
+                    // With the list as it comes back, not a frame after.
+                    s.reveal_cursor(tx);
+                })
                 .build(&k)
                 .key("back"),
         );
@@ -133,7 +144,7 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
             trailing = trailing.child(
                 Button::new("Reply")
                     .variant(ButtonVariant::Ghost)
-                    .shortcut("⌘R")
+                    .shortcut(Command::Reply.hint(s))
                     .on_press(|s: &mut Mail| s.reply(false))
                     .build(&k)
                     .key("reply"),
@@ -145,6 +156,7 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
     }
     let toolbar = toolbar.trailing(trailing);
     update_dialog(s, &k, &mut layer);
+    palette(s, &k, &mut layer);
     let window = SplitView::new(main)
         .sidebar(
             &s.sidebar,
@@ -163,7 +175,10 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
 
 /// The ⋯ menu of everything but Reply, which keeps a button of its own.
 fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
-    let close = |s: &mut Mail| s.actions_open = false;
+    let close = |s: &mut Mail| {
+        s.actions_open = false;
+        s.forget_go();
+    };
     let mut menu = Menu::new("actions")
         .trigger(
             IconButton::new(&MORE)
@@ -171,7 +186,11 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
                 .label("More actions")
                 .help("More actions")
                 .expanded(s.actions_open)
-                .on_press(|s: &mut Mail| s.actions_open = !s.actions_open)
+                .on_press(|s: &mut Mail| {
+                    s.actions_open = !s.actions_open;
+                    // Its items close it without `on_close`: a G pressed before goes nowhere.
+                    s.forget_go();
+                })
                 .build(k),
         )
         .placement(Placement::BottomEnd)
@@ -180,7 +199,7 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
         .on_close(close)
         .item(
             MenuItem::new("New message")
-                .shortcut("⌘N")
+                .shortcut(Command::Compose.hint(s))
                 .on_select(|s: &mut Mail| {
                     s.actions_open = false;
                     s.compose();
@@ -206,7 +225,7 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
             .separator()
             .item(
                 MenuItem::new("Reply all")
-                    .shortcut("⇧⌘R")
+                    .shortcut(Command::ReplyAll.hint(s))
                     .disabled(!downloaded)
                     .on_select(|s: &mut Mail| {
                         s.actions_open = false;
@@ -214,12 +233,33 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
                     }),
             )
             .item(
+                MenuItem::new("Forward")
+                    .shortcut(Command::Forward.hint(s))
+                    .disabled(!downloaded)
+                    .on_select(|s: &mut Mail| {
+                        s.actions_open = false;
+                        s.answer(Answer::Forward);
+                    }),
+            )
+            .item(
                 MenuItem::new(seen)
-                    .shortcut("⇧⌘U")
+                    .shortcut(Command::ToggleSeen.hint(s))
                     .on_select(|s: &mut Mail| {
                         s.actions_open = false;
                         s.toggle_seen();
                     }),
+            )
+            .item(
+                MenuItem::new(if reader.message.envelope.flagged {
+                    "Remove star"
+                } else {
+                    "Star"
+                })
+                .shortcut(Command::ToggleStar.hint(s))
+                .on_select(|s: &mut Mail| {
+                    s.actions_open = false;
+                    s.toggle_star();
+                }),
             )
             .item(
                 MenuItem::new("Export as .eml…").on_select_tx(|s: &mut Mail, tx| {
@@ -251,6 +291,8 @@ fn title(s: &Mail) -> String {
     if s.compose.open {
         return if s.compose.is_reply() {
             "Reply"
+        } else if s.compose.is_forward() {
+            "Forward"
         } else {
             "New message"
         }
@@ -306,7 +348,7 @@ fn sidebar(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
         .icon(&INBOX)
         .height(32.0)
         .selected(showing(Role::Inbox))
-        .on_select(|s: &mut Mail, _| s.show(Showing::All(Role::Inbox)));
+        .on_select(|s: &mut Mail, tx| show_from_sidebar(s, tx, Showing::All(Role::Inbox)));
     if let Some(n) = badge(s.unread(None)) {
         all = all.badge(n);
     }
@@ -314,7 +356,7 @@ fn sidebar(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
         .icon(&SENT)
         .height(32.0)
         .selected(showing(Role::Sent))
-        .on_select(|s: &mut Mail, _| s.show(Showing::All(Role::Sent)));
+        .on_select(|s: &mut Mail, tx| show_from_sidebar(s, tx, Showing::All(Role::Sent)));
     let folders = col()
         .gap(4.0)
         .child(all.build(k).key("all"))
@@ -364,6 +406,21 @@ fn sidebar(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     sidebar.build(k)
 }
 
+/// Shows what a sidebar row stands for. A click leaves the keyboard to the list, for J, K and
+/// the other keys on their own; the sidebar keeps it only when the keyboard brought it there.
+fn show_from_sidebar(s: &mut Mail, tx: &mut Tx, showing: Showing) {
+    s.show(showing);
+    keep_keys_for_list(tx);
+}
+
+/// After a click, keys go to the window again, not the control clicked: the list's keys on
+/// their own keep working. A control the keyboard reached keeps them.
+fn keep_keys_for_list(tx: &mut Tx) {
+    if !tx.by_keys() {
+        tx.blur();
+    }
+}
+
 /// One of an account's mailboxes, under the account. Right-clicking it opens its menu.
 fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut Vec<El>) -> El {
     let showing = Showing::Mailbox {
@@ -379,7 +436,7 @@ fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut 
         })
         .depth(1)
         .selected(selected)
-        .on_select(move |s: &mut Mail, _| s.show(showing.clone()));
+        .on_select(move |s: &mut Mail, tx| show_from_sidebar(s, tx, showing.clone()));
     let unread = s.unread(Some(account));
     if mailbox.role == Role::Inbox && unread > 0 {
         r = r.badge(unread.to_string());
@@ -469,7 +526,10 @@ fn account_row(s: &Mail, account: &Account, k: &Kit) -> El {
         "Show mailboxes"
     })
     .expanded(expanded)
-    .on_press(move |s: &mut Mail| s.toggle_mailboxes(&toggle))
+    .on_press_tx(move |s: &mut Mail, tx| {
+        s.toggle_mailboxes(&toggle);
+        keep_keys_for_list(tx);
+    })
     .build(k);
     let mut r = SidebarRow::new(account.label().to_owned())
         .height(45.0)
@@ -484,7 +544,7 @@ fn account_row(s: &Mail, account: &Account, k: &Kit) -> El {
         )
         .trailing(disclosure)
         // The account itself stands for its inbox; its mailboxes, the inbox first, are the rows below.
-        .on_select(move |s: &mut Mail, _| s.show(Showing::inbox(&select)))
+        .on_select(move |s: &mut Mail, tx| show_from_sidebar(s, tx, Showing::inbox(&select)))
         .on_close(move |s: &mut Mail, _| s.remove(&remove));
     if confirming {
         r = r.subtitle_color(k.c.danger.fg);
@@ -540,8 +600,21 @@ fn search_bar(s: &Mail, k: &Kit) -> El {
         .on_edit(|s: &mut Mail| &mut s.search.query)
         .on_change(|s: &mut Mail, _| s.search_changed())
         .on_submit(|s: &mut Mail, _| s.search_server())
-        .on_key(|s: &mut Mail, ev: &rune::KeyEvent, _| {
-            ev.key == rune::Key::Escape && s.clear_search()
+        // Escape ends the search and leaves the field, so keys on their own work on the list again;
+        // ↓ leaves it for the results, with the cursor on the first.
+        .on_key(|s: &mut Mail, ev: &rune::KeyEvent, tx| {
+            // Keys typed here don't reach the window: a G pressed before goes nowhere.
+            s.forget_go();
+            match ev.key {
+                rune::Key::Escape => {
+                    s.clear_search();
+                }
+                // Only ↓ alone: ⇧↓ and ⌘↓ still select and move in the field.
+                _ if Shortcut::Down.matches(ev, false) && s.cursor_to_first(tx) => {}
+                _ => return false,
+            }
+            tx.blur();
+            true
         });
     if !s.search.query.text.is_empty() {
         input = input.clear_button().on_action(|s: &mut Mail, _| {
@@ -565,7 +638,10 @@ fn search_bar(s: &Mail, k: &Kit) -> El {
             SegmentedControl::new(&labels, Some(usize::from(s.search.everywhere)))
                 .label("Search in")
                 .fit()
-                .on_pick(|s: &mut Mail, i, _| s.search_everywhere(i == 1))
+                .on_pick(|s: &mut Mail, i, tx| {
+                    s.search_everywhere(i == 1);
+                    keep_keys_for_list(tx);
+                })
                 .build(k),
         );
     }
@@ -664,14 +740,22 @@ fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     // Mail from several accounts says whose it is.
     let multiple_accounts = s.listing().account().is_none() && s.accounts.len() > 1;
     let sent = s.showing_sent();
-    let mut list = col().key("messages").w_full();
+    let mut list = messages_column();
     for m in s.shown() {
         let e = &m.envelope;
         let strong = if e.seen { k.ty.ui } else { k.ty.ui_medium };
         let (account, mailbox, uid) = (m.account.clone(), m.mailbox.clone(), e.uid);
         let (menu_account, menu_mailbox) = (account.clone(), mailbox.clone());
+        let key = crate::state::message_key(m);
+        // The keyboard's cursor, while the list shows.
+        let under_cursor = s.reader.is_none() && s.cursor.as_ref() == Some(&key);
         let mut line = row()
-            .key(format!("msg-{}-{}-{}", m.account, m.mailbox, e.uid))
+            .key(crate::state::row_key(&key))
+            .fill(if under_cursor {
+                k.c.hover
+            } else {
+                Color::TRANSPARENT
+            })
             .on_press(move |s: &mut Mail| s.open_message(&account, &mailbox, uid))
             .on_secondary_press(move |s: &mut Mail, point, _| {
                 s.open_message_menu(&menu_account, &menu_mailbox, uid, point);
@@ -710,7 +794,13 @@ fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
                     .truncate()
                     .grow(1.0)
                     .min_w(0.0),
-            );
+            )
+            // A slot whether starred or not, so the dates line up.
+            .child(if e.flagged {
+                icon(&STAR, 14.0).color(k.c.text_accent).label("Starred")
+            } else {
+                el().w(14.0)
+            });
         if multiple_accounts {
             line = line.child(
                 text(s.label(&m.account).to_owned())
@@ -747,9 +837,22 @@ fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     .min_h(0.0)
 }
 
-/// A message's menu, open at where it was right-clicked: marking it read or unread, replying,
-/// exporting it as an `.eml` file, snoozing it, and moving it to another of its account's
-/// mailboxes.
+/// The list's column. Back from what covered it (a message, the settings, a message being
+/// written), the list comes back at its top: it scrolls to its cursor.
+fn messages_column() -> El {
+    col()
+        .key("messages")
+        .w_full()
+        .on_visible(|s: &mut Mail, shown, tx| {
+            if shown {
+                s.reveal_cursor(tx);
+            }
+        })
+}
+
+/// A message's menu, open at where it was right-clicked: marking it read or unread, starring
+/// it, replying to or forwarding it, exporting it as an `.eml` file, snoozing it, archiving it,
+/// marking it as spam, moving it to another of its account's mailboxes, and deleting it.
 fn message_menu(
     s: &Mail,
     m: &StoredMessage,
@@ -767,13 +870,6 @@ fn message_menu(
             f(s, &account, &mailbox, uid);
         }
     };
-    let move_to = |to: &str| {
-        let (account, mailbox, to) = (account.to_owned(), mailbox.to_owned(), to.to_owned());
-        move |s: &mut Mail| {
-            s.close_message_menu();
-            s.move_message(&account, &mailbox, uid, &to);
-        }
-    };
     let seen = m.envelope.seen;
     let mut items = context_menu(
         format!("message-{account}-{mailbox}-{uid}"),
@@ -789,14 +885,29 @@ fn message_menu(
             "Mark as read"
         })
         .on_select(act(if seen {
-            |s, a, b, uid| s.set_seen(a, b, uid, false)
+            |s, a, b, uid| s.mark_seen((a.to_owned(), b.to_owned(), uid), false)
         } else {
-            |s, a, b, uid| s.set_seen(a, b, uid, true)
+            |s, a, b, uid| s.mark_seen((a.to_owned(), b.to_owned(), uid), true)
+        })),
+    )
+    .item(
+        MenuItem::new(if m.envelope.flagged {
+            "Remove star"
+        } else {
+            "Star"
+        })
+        .on_select(act(if m.envelope.flagged {
+            |s, a, b, uid| s.star((a.to_owned(), b.to_owned(), uid), false)
+        } else {
+            |s, a, b, uid| s.star((a.to_owned(), b.to_owned(), uid), true)
         })),
     )
     .separator()
     .item(MenuItem::new("Reply").on_select(act(|s, a, b, uid| s.reply_to(a, b, uid, false))))
     .item(MenuItem::new("Reply all").on_select(act(|s, a, b, uid| s.reply_to(a, b, uid, true))))
+    .item(MenuItem::new("Forward").on_select(act(|s, a, b, uid| {
+        s.answer_message(a, b, uid, Answer::Forward);
+    })))
     .separator()
     .item(MenuItem::new("Export as .eml…").on_select_tx({
         let message = m.clone();
@@ -805,11 +916,26 @@ fn message_menu(
             Mail::export_message(tx, &message);
         }
     }));
+    items = message_menu_moves(s, m, menu, items);
+    items.build(k, layer).w_full()
+}
+
+/// The end of a message's menu: snoozing it, and moving it to another of its account's mailboxes.
+fn message_menu_moves(s: &Mail, m: &StoredMessage, menu: &MessageMenu, mut items: Menu) -> Menu {
+    let (account, mailbox, uid) = (m.account.as_str(), m.mailbox.as_str(), m.envelope.uid);
+    let move_to = |to: &str| {
+        let (account, mailbox, to) = (account.to_owned(), mailbox.to_owned(), to.to_owned());
+        move |s: &mut Mail| {
+            s.close_message_menu();
+            s.move_message(&account, &mailbox, uid, &to);
+        }
+    };
     let elsewhere = |role| {
         s.mailbox_with_role(account, role)
             .filter(|b| b.name != mailbox)
     };
     let archive = elsewhere(Role::Archive);
+    let junk = elsewhere(Role::Junk);
     // A snoozed message waits in the Snoozed mailbox; one already there isn't snoozed again.
     let snoozable = s
         .mailbox_with_role(account, Role::Snoozed)
@@ -822,7 +948,7 @@ fn message_menu(
         .filter(|b| b.name != mailbox)
         .map(|b| MenuEntry::item(MenuItem::new(b.label()).on_select(move_to(&b.name))))
         .collect();
-    if archive.is_some() || !destinations.is_empty() || snoozable {
+    if archive.is_some() || junk.is_some() || !destinations.is_empty() || snoozable {
         items = items.separator();
     }
     if snoozable {
@@ -846,6 +972,9 @@ fn message_menu(
     if let Some(archive) = archive {
         items = items.item(MenuItem::new("Archive").on_select(move_to(&archive.name)));
     }
+    if let Some(junk) = junk {
+        items = items.item(MenuItem::new("Mark as spam").on_select(move_to(&junk.name)));
+    }
     if !destinations.is_empty() {
         items = items.item(
             MenuItem::new("Move to")
@@ -860,7 +989,7 @@ fn message_menu(
                 .on_select(move_to(&trash.name)),
         );
     }
-    items.build(k, layer).w_full()
+    items
 }
 
 /// The list's end, which loads older mail as it comes on screen, and spins while it's fetched.
@@ -909,14 +1038,25 @@ fn message(r: &Reader, k: &Kit) -> El {
     let subject = e.subject.clone().unwrap_or_else(|| "(no subject)".into());
     let mut header = col()
         .gap(6.0)
-        .child(
-            text(subject)
+        .child({
+            let subject = text(subject)
                 .key("subject")
                 .font(SUBJECT)
                 .color(k.c.text_base)
                 .wrap()
-                .selectable(true),
-        )
+                .selectable(true)
+                .grow(1.0)
+                .min_w(0.0);
+            let star = e.flagged.then(|| {
+                icon(&STAR, 18.0)
+                    .color(k.c.text_accent)
+                    .label("Starred")
+                    .mt(4.0)
+            });
+            row()
+                .gap(8.0)
+                .children(std::iter::once(subject).chain(star))
+        })
         .child(header_line(k, "From", std::slice::from_ref(&e.from)));
     if let Ok(body) = body {
         if !body.to.is_empty() {
@@ -953,6 +1093,7 @@ fn message(r: &Reader, k: &Kit) -> El {
             }
             if let Some(markdown) = &r.markdown {
                 return reader_frame(
+                    r,
                     header,
                     content.child(
                         Markdown::new(markdown.clone())
@@ -972,13 +1113,17 @@ fn message(r: &Reader, k: &Kit) -> El {
             content.child(shown.key("body").font(k.ty.body).wrap().selectable(true))
         }
     };
-    reader_frame(header, content, k)
+    reader_frame(r, header, content, k)
 }
 
 /// The reader's scrolling column: the headers, a rule, then the content.
-fn reader_frame(header: El, content: El, k: &Kit) -> El {
+fn reader_frame(r: &Reader, header: El, content: El, k: &Kit) -> El {
     col()
-        .key("reader")
+        // One per message, so the next one opens at its top.
+        .key(format!(
+            "reader-{}",
+            crate::state::row_key(&crate::state::message_key(&r.message))
+        ))
         // Fades and rises a few points into place as the download lands.
         .transition(Transition::offset(0.0, 8.0).combined(Transition::opacity()))
         .w_full()
@@ -2618,6 +2763,188 @@ fn update_dialog(s: &Mail, k: &Kit, layer: &mut Vec<El>) {
     .child(footer.child(update_actions(s, k)))
     .open(true)
     .build(k, layer);
+}
+
+/// The command palette (⌘K), over everything: a field, and the commands that match what's typed
+/// in it, each with its shortcut. ↑ and ↓ move the highlight, and Return runs the highlighted one.
+fn palette(s: &Mail, k: &Kit, layer: &mut Vec<El>) {
+    let p = &s.palette;
+    if !p.open {
+        return;
+    }
+    let shown = p.shown(s);
+    let active = p.active_row(&shown);
+    let input = TextInput::new(&p.query)
+        .label("Command")
+        .placeholder(p.placeholder())
+        .leading_icon(&glyphs::SEARCH)
+        .width(None)
+        // A screen reader reads the highlighted row, while the field keeps the focus.
+        .active_descendant(shown.get(active).map(|e| e.command.key()))
+        .on_edit(|s: &mut Mail| &mut s.palette.query)
+        .on_change(|s: &mut Mail, tx| {
+            s.palette_changed();
+            if let Some(first) = s.palette.shown(s).first() {
+                tx.scroll_into_view(first.command.key());
+            }
+        })
+        .on_submit(|s: &mut Mail, tx| s.run_palette(None, tx))
+        .on_key(|s: &mut Mail, ev: &rune::KeyEvent, tx| {
+            let by = match ev.key {
+                rune::Key::Up => -1,
+                rune::Key::Down => 1,
+                _ => return false,
+            };
+            s.move_palette(by);
+            if let Some(command) = &s.palette.active {
+                tx.scroll_into_view(command.key());
+            }
+            true
+        });
+    let list = palette_list(&shown, active, k);
+    let mut panel = col()
+        .key("palette")
+        .role("dialog")
+        .label("Command palette")
+        .w_full()
+        .max_w(560.0)
+        .shrink()
+        .min_h(0.0)
+        .radius(8.0)
+        .fill(k.c.layer_01)
+        .preserve_focus_on_press(true)
+        .child(
+            row()
+                .w_full()
+                .padding(10.0)
+                .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+                .child(row().grow(1.0).min_w(0.0).child(input.build(k))),
+        )
+        .child(list)
+        .token_motion(k.motion.overlay)
+        .modal(true, Mail::close_palette);
+    for shadow in k.shadow_layers(&k.elevation.overlay) {
+        panel = panel.box_shadow(shadow);
+    }
+    layer.push(
+        el().key("palette-scrim")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .fill(k.c.scrim)
+            .token_motion(k.motion.overlay)
+            .a11y_hidden(),
+    );
+    layer.push(
+        col()
+            .key("palette-layer")
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .padding(16.0)
+            .pt(96.0)
+            .items_center()
+            .child(panel),
+    );
+}
+
+/// The palette's rows, or a word that nothing matches, in a list that scrolls.
+fn palette_list(shown: &[Entry], active: usize, k: &Kit) -> El {
+    // Virtual, so the highlighted row is revealed whenever the highlight moves to another one.
+    // Rows coming in above it are followed where mail updates arrive, in `Mail::try_start`.
+    let mut rows = col()
+        .key("palette-rows")
+        .w_full()
+        .growth(GrowthSpec::default())
+        .virtualize(32.0)
+        .reveal_selected(true);
+    for (i, entry) in shown.iter().enumerate() {
+        rows = rows.child(palette_row(entry, i == active, k));
+    }
+    let list = if shown.is_empty() {
+        el().key("palette-empty")
+            .w_full()
+            .h(32.0)
+            .px(10.0)
+            .center_y()
+            .child(
+                text("No matching command")
+                    .font(k.ty.ui)
+                    .color(k.c.text_muted),
+            )
+    } else {
+        rows
+    };
+    col()
+        .key("palette-scroll")
+        .role("listbox")
+        .label("Commands")
+        .w_full()
+        .padding(6.0)
+        .child(list)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .max_h(360.0)
+        // A short window shrinks the list, not the field, so the panel stays inside it.
+        .shrink()
+        .min_h(0.0)
+}
+
+/// One command in the palette: what it's called, what it applies to, and its shortcut. `on` when
+/// it's highlighted.
+fn palette_row(entry: &Entry, on: bool, k: &Kit) -> El {
+    let (hovered, pressed) = (entry.command.clone(), entry.command.clone());
+    let mut item = row()
+        .key(entry.command.key())
+        .role("option")
+        .label(&entry.title)
+        .description(entry.detail.clone().unwrap_or_default())
+        .focus_selected(on)
+        .w_full()
+        .h(32.0)
+        .px(10.0)
+        .gap(8.0)
+        .center_y()
+        .radius(4.0)
+        .fill(if on { k.c.hover } else { Color::TRANSPARENT })
+        // The pointer moves the highlight, so just one row shows as the one Return runs. Only
+        // when it moves: a row that appears under a resting pointer keeps the best match.
+        .on_pointer_move_local(move |s: &mut Mail, _, tx| {
+            if s.palette.active.as_ref() == Some(&hovered) {
+                tx.live_only();
+            } else {
+                s.palette.active = Some(hovered.clone());
+            }
+        })
+        .on_press_tx(move |s: &mut Mail, tx| s.run_palette(Some(pressed.clone()), tx))
+        .child(
+            text(&entry.title)
+                .font(k.ty.ui)
+                .color(k.c.text_base)
+                .shrink()
+                .truncate()
+                .a11y_hidden(),
+        );
+    let detail = entry.detail.as_deref().map_or_else(el, |d| {
+        text(d)
+            .font(k.ty.ui)
+            .color(k.c.text_muted)
+            .truncate()
+            .a11y_hidden()
+    });
+    item = item.child(detail.grow(1.0).shrink());
+    if !entry.shortcuts.is_empty() {
+        let hint: Vec<String> = entry.shortcuts.iter().map(|k| k.label()).collect();
+        let keys = entry
+            .shortcuts
+            .iter()
+            .map(|shortcut| Keybind::new(&shortcut.keycaps()).build(k));
+        item = item
+            .shortcut_hint(hint.join(", "))
+            .child(row().gap(6.0).children(keys).a11y_hidden());
+    }
+    item
 }
 
 /// The announcement's buttons: Skip this version, Later, and Update, Restart now, or, for a

@@ -15,14 +15,16 @@ const SENT_NAMES: [&str; 4] = ["Sent", "Sent Items", "Sent Messages", "Sent Mail
 const ARCHIVE_NAMES: [&str; 2] = ["Archive", "Archives"];
 /// What a Trash mailbox is called when the server doesn't mark one, as [`SENT_NAMES`].
 const TRASH_NAMES: [&str; 3] = ["Trash", "Deleted Items", "Deleted Messages"];
+/// What a Junk mailbox is called when the server doesn't mark one, as [`SENT_NAMES`].
+const JUNK_NAMES: [&str; 5] = ["Junk", "Spam", "Junk E-mail", "Junk Email", "Bulk Mail"];
 /// What a Snoozed mailbox is called when the server doesn't mark one, as [`SENT_NAMES`], and what
 /// one is created as when there's none.
 pub const SNOOZED_NAME: &str = "Snoozed";
 /// The special use some servers mark a Snoozed mailbox with (draft-ietf-mailmaint-imap-snooze).
 const SNOOZED_ATTRIBUTE: &str = "\\Snoozed";
 
-/// Every mailbox on the account that can be opened, with the inbox, Sent, Archive, Trash and
-/// Snoozed mailboxes marked.
+/// Every mailbox on the account that can be opened, with the inbox, Sent, Archive, Trash,
+/// Snoozed and Junk mailboxes marked.
 ///
 /// # Errors
 ///
@@ -40,6 +42,7 @@ pub(crate) async fn list_mailboxes(session: &mut Session) -> Result<Vec<Mailbox>
                 (NameAttribute::Archive, Mark::Archive),
                 (NameAttribute::All, Mark::All),
                 (NameAttribute::Trash, Mark::Trash),
+                (NameAttribute::Junk, Mark::Junk),
             ];
             Listed {
                 name: n.name().to_owned(),
@@ -77,7 +80,8 @@ pub(crate) async fn find_sent(session: &mut Session) -> Result<Option<String>> {
 }
 
 /// The selectable mailboxes, each with its role. A mailbox has one role at most: the inbox comes
-/// first, then Sent, Archive, Trash and Snoozed, each picked from the mailboxes not picked already.
+/// first, then Sent, Archive, Trash, Snoozed and Junk, each picked from the mailboxes not picked
+/// already.
 fn classify(listed: &[Listed]) -> Vec<Mailbox> {
     // INBOX is case-insensitive (RFC 3501 section 5.1).
     let inbox = listed
@@ -87,11 +91,12 @@ fn classify(listed: &[Listed]) -> Vec<Mailbox> {
     let mut taken: Vec<&str> = inbox.into_iter().collect();
     let mut roles = Vec::new();
     // Gmail has no Archive mailbox: archiving there moves mail to All Mail, which it marks `\All`.
-    let wanted: [(Role, &[Mark], &[&str]); 4] = [
+    let wanted: [(Role, &[Mark], &[&str]); 5] = [
         (Role::Sent, &[Mark::Sent], &SENT_NAMES),
         (Role::Archive, &[Mark::Archive, Mark::All], &ARCHIVE_NAMES),
         (Role::Trash, &[Mark::Trash], &TRASH_NAMES),
         (Role::Snoozed, &[Mark::Snoozed], &[SNOOZED_NAME]),
+        (Role::Junk, &[Mark::Junk], &JUNK_NAMES),
     ];
     for (role, marks, names) in wanted {
         if let Some(name) = pick(listed, marks, names, &taken) {
@@ -126,6 +131,7 @@ enum Mark {
     All,
     Trash,
     Snoozed,
+    Junk,
 }
 
 /// A mailbox as LIST reports it.
@@ -292,6 +298,22 @@ mod tests {
             Some("INBOX/snoozed")
         );
         assert_eq!(role_of(&[listed("INBOX", &[])], Role::Snoozed), None);
+    }
+
+    #[test]
+    fn junk_is_found_by_mark_then_by_name() {
+        let marked = [
+            listed("INBOX", &[]),
+            listed("Junk", &[]),
+            listed("[Gmail]/Spam", &[Mark::Junk]),
+        ];
+        assert_eq!(
+            role_of(&marked, Role::Junk).as_deref(),
+            Some("[Gmail]/Spam")
+        );
+        let named = [listed("INBOX", &[]), listed("Junk E-mail", &[])];
+        assert_eq!(role_of(&named, Role::Junk).as_deref(), Some("Junk E-mail"));
+        assert_eq!(role_of(&[listed("INBOX", &[])], Role::Junk), None);
     }
 
     #[test]

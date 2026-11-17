@@ -47,10 +47,13 @@ pub struct Envelope {
     pub date: Option<i64>,
     /// Whether the message has been read.
     pub seen: bool,
+    /// Whether the message is starred: flagged `\\Flagged` on the server.
+    pub flagged: bool,
 }
 
-/// What a mailbox is for. Each account has one inbox and at most one Sent, Archive, Trash and
-/// Snoozed mailbox, though their names differ by server; every other mailbox is [`Role::Other`].
+/// What a mailbox is for. Each account has one inbox and at most one Sent, Archive, Trash,
+/// Snoozed and Junk mailbox, though their names differ by server; every other mailbox is
+/// [`Role::Other`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Role {
     /// Where mail arrives: `INBOX`.
@@ -64,7 +67,9 @@ pub enum Role {
     Trash,
     /// Where snoozed messages wait until they're due back in the inbox, such as `Snoozed`.
     Snoozed,
-    /// Any other mailbox: folders, drafts, junk.
+    /// Where spam goes, such as `Junk` or Gmail's `[Gmail]/Spam`.
+    Junk,
+    /// Any other mailbox: folders and drafts.
     Other,
 }
 
@@ -78,6 +83,7 @@ impl Role {
             Self::Archive => "archive",
             Self::Trash => "trash",
             Self::Snoozed => "snoozed",
+            Self::Junk => "junk",
             Self::Other => "other",
         }
     }
@@ -91,6 +97,7 @@ impl Role {
             Self::Archive,
             Self::Trash,
             Self::Snoozed,
+            Self::Junk,
             Self::Other,
         ]
         .into_iter()

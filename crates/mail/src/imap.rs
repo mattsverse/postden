@@ -22,10 +22,10 @@ pub use connection::{Session, check_login, connect};
 pub use mailboxes::SNOOZED_NAME;
 pub use message::{
     Prefetched, download_message, mark_all_seen, move_message, open_message, prefetch_messages,
-    set_seen, snooze_message, wake_message,
+    restore_message, set_flagged, set_seen, snooze_message, wake_message,
 };
 pub use older::{Older, fetch_older};
 pub use refresh::refresh;
 pub use search::{Found, search};
 pub use sent::save_sent_copy;
-pub use watch::{Event, Status, WatchConfig, watch};
+pub use watch::{Changes, Event, Flags, Status, WatchConfig, watch};

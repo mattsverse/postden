@@ -2,8 +2,10 @@
 //!
 //! Account passwords never land here; they live in a [`postden_core::secrets::SecretStore`].
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use postden_core::account::{Account, Auth, Security, Server, Signature};
 pub use postden_core::message::MailboxState;
@@ -93,6 +95,8 @@ CREATE TABLE IF NOT EXISTS messages (
     seen       INTEGER NOT NULL,
     -- The To header: each address as name, U+001F, email; addresses separated by U+001E.
     to_list    TEXT,
+    -- 1 when starred: flagged as such on the server.
+    flagged    INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account, mailbox, uid),
     FOREIGN KEY (account, mailbox) REFERENCES mailboxes(account, name) ON DELETE CASCADE
 ) STRICT;
@@ -162,20 +166,63 @@ CREATE TABLE IF NOT EXISTS snoozes (
 ";
 
 /// The schema version [`SCHEMA`] creates, kept in `PRAGMA user_version`.
-const VERSION: i64 = 3;
+const VERSION: i64 = 4;
 
 /// Columns added since version 0, for databases created before them. Tables added since are
 /// created by [`SCHEMA`] itself.
-const MIGRATIONS: [(&str, &str, &str); 4] = [
+const MIGRATIONS: [(&str, &str, &str); 5] = [
     ("mailboxes", "role", "TEXT NOT NULL DEFAULT 'inbox'"),
     ("messages", "to_list", "TEXT"),
     // Version 2.
     ("accounts", "auth", "TEXT NOT NULL DEFAULT 'password'"),
     // Version 3.
     ("accounts", "label", "TEXT"),
+    // Version 4.
+    ("messages", "flagged", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
-const MESSAGE_COLUMNS: &str = "m.account, m.mailbox, m.uid, m.message_id, m.from_name, m.from_email, m.subject, m.date, m.seen, m.to_list";
+const MESSAGE_COLUMNS: &str = "m.account, m.mailbox, m.uid, m.message_id, m.from_name, m.from_email, m.subject, m.date, m.seen, m.to_list, m.flagged";
+
+/// A message, by account, mailbox and UID, or a whole mailbox with `None`.
+type Touched = (String, String, Option<u32>);
+
+/// What was last written for a message, or a whole mailbox: each with when, as
+/// [`Written::at`] counts.
+#[derive(Debug, Clone, Copy, Default)]
+struct Marks {
+    /// The mailbox's UIDVALIDITY they were written under: under another, the UID names another
+    /// message.
+    uid_validity: u32,
+    seen: Option<(bool, u64)>,
+    flagged: Option<(bool, u64)>,
+    /// For a whole mailbox: every message below this UID was marked read.
+    read_below: Option<(u32, u64)>,
+    /// When anything was last written here.
+    last: Option<Instant>,
+}
+
+/// How long what was written is kept: longer than any fetch can take (each IMAP command gives
+/// up after two minutes, and a fetch's logout after seconds), so one that started before it and
+/// is saved after it finds it. Kept
+/// longer, it's left alone by what was read after it anyway.
+const KEEP_WRITTEN: Duration = Duration::from_mins(10);
+
+/// Forgets what was written longer ago than [`KEEP_WRITTEN`].
+fn forget_old(all: &mut HashMap<Touched, Marks>) {
+    all.retain(|_, marks| marks.last.is_some_and(|t| t.elapsed() < KEEP_WRITTEN));
+}
+
+/// `marks`, as kept under `uid_validity`: started afresh if they were kept under another.
+fn under(marks: &mut Marks, uid_validity: u32) -> &mut Marks {
+    if marks.uid_validity != uid_validity {
+        *marks = Marks {
+            uid_validity,
+            ..Marks::default()
+        };
+    }
+    marks.last = Some(Instant::now());
+    marks
+}
 
 /// The SQLite-backed cache.
 #[derive(Debug)]
@@ -186,6 +233,21 @@ pub struct Store {
     /// mailbox's UIDVALIDITY holds, so they're kept until it changes. Fetches don't outlive the
     /// app, so this isn't saved.
     removed: HashSet<(String, String, u32)>,
+    /// The last read mark and star written for each message, by account, mailbox and UID, and
+    /// the last time a whole mailbox was marked read, with `None`: what a sync read before then
+    /// is older. Kept for [`KEEP_WRITTEN`].
+    written: RefCell<HashMap<Touched, Marks>>,
+}
+
+/// A read mark or star the server answered, and when, as counted by the mail watchers' shared
+/// count of changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Written {
+    pub at: u64,
+    /// Read or unread, if that's what was written.
+    pub seen: Option<bool>,
+    /// Starred or not, if that's what was written.
+    pub flagged: Option<bool>,
 }
 
 impl Store {
@@ -229,6 +291,7 @@ impl Store {
         Ok(Self {
             conn,
             removed: HashSet::new(),
+            written: RefCell::new(HashMap::new()),
         })
     }
 
@@ -629,6 +692,170 @@ impl Store {
             "UPDATE messages SET seen = ?4 WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
             params![account, mailbox, uid, seen],
         )? > 0)
+    }
+
+    /// Notes a read mark or star the server answered for message `uid`, under the mailbox's
+    /// `uid_validity`: what a sync read before it is older, and doesn't undo it. Each keeps its
+    /// own time.
+    pub fn written(
+        &self,
+        account: &str,
+        mailbox: &str,
+        (uid_validity, uid): (u32, u32),
+        written: Written,
+    ) {
+        let key = (account.to_owned(), mailbox.to_owned(), Some(uid));
+        let mut all = self.written.borrow_mut();
+        forget_old(&mut all);
+        let marks = under(all.entry(key).or_default(), uid_validity);
+        let newer = |old: Option<(bool, u64)>, new: Option<bool>| match (old, new) {
+            (Some((_, at)), Some(_)) if at > written.at => old,
+            (_, Some(value)) => Some((value, written.at)),
+            (old, None) => old,
+        };
+        marks.seen = newer(marks.seen, written.seen);
+        marks.flagged = newer(marks.flagged, written.flagged);
+    }
+
+    /// Notes that every message of a mailbox with a UID below `up_to` was marked read under its
+    /// `uid_validity`, answered at `at`, as [`Store::written`].
+    pub fn written_all_read(
+        &self,
+        account: &str,
+        mailbox: &str,
+        (uid_validity, up_to): (u32, u32),
+        at: u64,
+    ) {
+        let key = (account.to_owned(), mailbox.to_owned(), None);
+        let mut all = self.written.borrow_mut();
+        forget_old(&mut all);
+        let marks = under(all.entry(key).or_default(), uid_validity);
+        if marks.read_below.is_none_or(|(_, old)| old < at) {
+            marks.read_below = Some((up_to, at));
+        }
+    }
+
+    /// Whether message `uid`, under the mailbox's `uid_validity`, is read, and starred, as
+    /// written after a sync that started at `asked`: the newest of its own read mark and its
+    /// mailbox's marking all read.
+    fn written_since(
+        &self,
+        account: &str,
+        mailbox: &str,
+        (uid_validity, uid): (u32, u32),
+        asked: u64,
+    ) -> (Option<bool>, Option<bool>) {
+        let all = self.written.borrow();
+        let get = |uid| {
+            all.get(&(account.to_owned(), mailbox.to_owned(), uid))
+                .copied()
+                .filter(|marks| marks.uid_validity == uid_validity)
+                .unwrap_or_default()
+        };
+        let (own, mailbox_wide) = (get(Some(uid)), get(None));
+        let all_read = mailbox_wide
+            .read_below
+            .filter(|&(up_to, _)| uid < up_to)
+            .map(|(_, at)| (true, at));
+        let seen = [own.seen, all_read]
+            .into_iter()
+            .flatten()
+            .filter(|&(_, at)| at > asked)
+            .max_by_key(|&(_, at)| at)
+            .map(|(value, _)| value);
+        let flagged = own
+            .flagged
+            .filter(|&(_, at)| at > asked)
+            .map(|(value, _)| value);
+        (seen, flagged)
+    }
+
+    /// Shows `messages`, fetched under the mailbox's `uid_validity` by a sync that started at
+    /// `asked`, read and starred as written since under it, which is newer.
+    pub fn with_written(
+        &self,
+        account: &str,
+        mailbox: &str,
+        (uid_validity, asked): (u32, u64),
+        messages: &mut [Envelope],
+    ) {
+        for m in messages {
+            let at = (uid_validity, m.uid);
+            let (seen, flagged) = self.written_since(account, mailbox, at, asked);
+            m.seen = seen.unwrap_or(m.seen);
+            m.flagged = flagged.unwrap_or(m.flagged);
+        }
+    }
+
+    /// Stars a cached message, or takes its star away. Returns whether it's cached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub fn set_flagged(
+        &self,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        flagged: bool,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE messages SET flagged = ?4 WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+            params![account, mailbox, uid, flagged],
+        )? > 0)
+    }
+
+    /// Marks cached messages read or unread and starred or not, each as `(uid, seen, flagged)`
+    /// says, while the mailbox is cached under `uid_validity`: as the server said they were in a
+    /// sync that started at `asked`. What was [written](Store::written) since is newer, and
+    /// wins. Returns how many changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails. Nothing is written in that case.
+    pub fn set_flags(
+        &mut self,
+        account: &str,
+        mailbox: &str,
+        uid_validity: u32,
+        asked: u64,
+        flags: &[(u32, bool, bool)],
+    ) -> Result<usize> {
+        // What was written since is newer than what it read.
+        let since: HashMap<u32, (Option<bool>, Option<bool>)> = flags
+            .iter()
+            .map(|&(uid, ..)| {
+                let at = (uid_validity, uid);
+                (uid, self.written_since(account, mailbox, at, asked))
+            })
+            .collect();
+        let tx = self.conn.transaction()?;
+        let cached: Option<u32> = tx
+            .query_row(
+                "SELECT uid_validity FROM mailboxes WHERE account = ?1 AND name = ?2",
+                [account, mailbox],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if cached != Some(uid_validity) {
+            return Ok(0);
+        }
+        let mut changed = 0;
+        {
+            let mut update = tx.prepare(
+                "UPDATE messages SET seen = ?4, flagged = ?5
+                 WHERE account = ?1 AND mailbox = ?2 AND uid = ?3
+                    AND (seen != ?4 OR flagged != ?5)",
+            )?;
+            for &(uid, seen, flagged) in flags {
+                let (seen_since, flagged_since) = since.get(&uid).copied().unwrap_or_default();
+                let seen = seen_since.unwrap_or(seen);
+                let flagged = flagged_since.unwrap_or(flagged);
+                changed += update.execute(params![account, mailbox, uid, seen, flagged])?;
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// Marks every cached message in a mailbox with a UID below `up_to` read. Returns how many
@@ -1083,6 +1310,7 @@ fn message_from_row(row: &Row<'_>) -> rusqlite::Result<StoredMessage> {
                     .as_deref()
                     .unwrap_or_default(),
             ),
+            flagged: row.get(10)?,
         },
     })
 }
@@ -1165,11 +1393,12 @@ fn insert_messages(
     messages: &[Envelope],
 ) -> Result<()> {
     let mut insert = tx.prepare(
-        "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(account, mailbox, uid) DO UPDATE SET
             message_id = excluded.message_id, from_name = excluded.from_name,
             from_email = excluded.from_email, subject = excluded.subject,
-            date = excluded.date, seen = excluded.seen, to_list = excluded.to_list",
+            date = excluded.date, seen = excluded.seen, to_list = excluded.to_list,
+            flagged = excluded.flagged",
     )?;
     for m in messages {
         insert.execute(params![
@@ -1183,6 +1412,7 @@ fn insert_messages(
             m.date,
             m.seen,
             encode_addresses(&m.to),
+            m.flagged,
         ])?;
     }
     Ok(())
@@ -1224,6 +1454,7 @@ mod tests {
                 name: None,
                 email: Some("me@example.com".into()),
             }],
+            flagged: false,
         }
     }
 
@@ -1738,6 +1969,77 @@ mod tests {
     }
 
     #[test]
+    fn messages_can_be_starred_and_stars_follow_the_server() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account("me@example.com")).unwrap();
+        let save = |store: &mut Store, flagged| {
+            let message = Envelope {
+                flagged,
+                ..envelope(1, 10)
+            };
+            store
+                .save_messages("me@example.com", "INBOX", Role::Inbox, 1, &[message])
+                .unwrap();
+        };
+        let flagged = |store: &Store| {
+            store.recent_messages(Role::Inbox, 1).unwrap()[0]
+                .envelope
+                .flagged
+        };
+        save(&mut store, false);
+        assert!(!flagged(&store));
+        assert!(
+            store
+                .set_flagged("me@example.com", "INBOX", 1, true)
+                .unwrap()
+        );
+        assert!(flagged(&store));
+        save(&mut store, false);
+        assert!(!flagged(&store), "unstarred elsewhere");
+        save(&mut store, true);
+        assert!(flagged(&store), "starred elsewhere");
+        assert!(
+            !store
+                .set_flagged("me@example.com", "INBOX", 2, true)
+                .unwrap(),
+            "not cached"
+        );
+        // As the server says when synced again: read and unstarred elsewhere.
+        assert_eq!(
+            store
+                .set_flags(
+                    "me@example.com",
+                    "INBOX",
+                    1,
+                    0,
+                    &[(1, true, false), (9, true, true)]
+                )
+                .unwrap(),
+            1
+        );
+        assert!(!flagged(&store));
+        assert_eq!(
+            store.seen("me@example.com", "INBOX", 1).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            store
+                .set_flags("me@example.com", "INBOX", 1, 0, &[(1, true, false)])
+                .unwrap(),
+            0,
+            "nothing changed"
+        );
+        assert_eq!(
+            store
+                .set_flags("me@example.com", "INBOX", 2, 0, &[(1, false, true)])
+                .unwrap(),
+            0,
+            "another UIDVALIDITY's UIDs"
+        );
+        assert!(!flagged(&store));
+    }
+
+    #[test]
     fn a_whole_mailbox_is_marked_read_up_to_a_uid() {
         let mut store = Store::open_in_memory().unwrap();
         store.save_account(&account("me@example.com")).unwrap();
@@ -2033,6 +2335,7 @@ mod tests {
         let inbox = store.recent_messages(Role::Inbox, 10).unwrap();
         assert_eq!(inbox.len(), 1, "old mail is filed as the inbox");
         assert_eq!(inbox[0].envelope.to, vec![]);
+        assert!(!inbox[0].envelope.flagged, "old mail isn't starred");
         let old = store.account("me@example.com").unwrap().unwrap();
         assert_eq!(
             old.auth,
@@ -2105,5 +2408,77 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn a_sync_older_than_a_star_keeps_a_read_mark_it_saw_after() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account("me@example.com")).unwrap();
+        store
+            .save_messages(
+                "me@example.com",
+                "INBOX",
+                Role::Inbox,
+                1,
+                &[envelope(1, 10)],
+            )
+            .unwrap();
+        let state = |store: &Store| {
+            let m = &store.recent_messages(Role::Inbox, 1).unwrap()[0].envelope;
+            (m.seen, m.flagged)
+        };
+        // Read here at 1; a sync starts at 1, after it was marked unread elsewhere; starred at 2.
+        let written = |at, seen, flagged| Written { at, seen, flagged };
+        store.written(
+            "me@example.com",
+            "INBOX",
+            (1, 1),
+            written(1, Some(true), None),
+        );
+        store.written(
+            "me@example.com",
+            "INBOX",
+            (1, 1),
+            written(2, None, Some(true)),
+        );
+        store
+            .set_flags("me@example.com", "INBOX", 1, 1, &[(1, false, false)])
+            .unwrap();
+        assert_eq!(
+            state(&store),
+            (false, true),
+            "unread as the sync saw, after the read mark; starred, after the sync"
+        );
+    }
+
+    #[test]
+    fn a_message_marked_unread_after_its_mailbox_was_all_read_stays_unread() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account("me@example.com")).unwrap();
+        let messages = [envelope(1, 10), envelope(2, 20), envelope(30, 30)];
+        store
+            .save_messages("me@example.com", "INBOX", Role::Inbox, 1, &messages)
+            .unwrap();
+        // A sync starts at 1; INBOX is marked all read below UID 10 at 2; UID 1 unread at 3.
+        store.written_all_read("me@example.com", "INBOX", (1, 10), 2);
+        let unread = Written {
+            at: 3,
+            seen: Some(false),
+            flagged: None,
+        };
+        store.written("me@example.com", "INBOX", (1, 1), unread);
+        store
+            .set_flags(
+                "me@example.com",
+                "INBOX",
+                1,
+                1,
+                &[(1, false, false), (2, false, false), (30, false, false)],
+            )
+            .unwrap();
+        let seen = |uid| store.seen("me@example.com", "INBOX", uid).unwrap();
+        assert_eq!(seen(1), Some(false), "marked unread last");
+        assert_eq!(seen(2), Some(true), "marked all read since the sync");
+        assert_eq!(seen(30), Some(false), "above where all was marked read");
     }
 }

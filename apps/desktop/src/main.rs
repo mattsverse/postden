@@ -6,6 +6,7 @@
 //! shows how much mail is unread, and new mail is announced with a system notification.
 
 mod account_settings;
+mod commands;
 mod compose;
 mod form;
 mod notifications;
@@ -18,7 +19,6 @@ mod update;
 mod view;
 
 use rune::{App, AppSpec, Chrome, Key, KeyEvent, Tx};
-use rune_kit::shell;
 
 use crate::compose::Mode;
 use crate::state::Mail;
@@ -83,40 +83,52 @@ fn on_reopen(s: &mut Mail, _visible: bool, _: &mut Tx) -> bool {
     cfg!(target_os = "linux") && s.bring_forward()
 }
 
-/// ⇧⌘B (and ⌃⌘S on macOS) shows and hides the sidebar, ⌘, opens the settings and Escape closes
-/// them (or the update announcement over them, or an account's settings with nothing unsaved),
-/// and ⌘N starts a new message. ⌘F searches the list, and Escape in the search field ends the
-/// search. With a message open, ⇧⌘U marks it read or unread, ⌘R and ⇧⌘R
-/// reply to the sender or everyone, and Escape goes back to the list. While writing, ⌘↩ sends,
-/// and ⌘K links the selected text, as it does in a signature.
-fn on_key(s: &mut Mail, ev: &KeyEvent, _: &mut Tx) -> bool {
-    if shell::is_sidebar_toggle(ev) {
-        s.sidebar.toggle();
+/// ⌘K opens the command palette, and closes it as Escape does. The shortcuts of the commands it
+/// lists (`commands`) run them where they apply: ⇧⌘B (and ⌃⌘S on macOS) shows and hides the
+/// sidebar, ⌘, opens the settings, C or ⌘N starts a new message and / or ⌘F searches the list.
+/// J and K (or ↓ and ↑) move the list's cursor and ↩ opens its message; with a message open, J
+/// and K open the next or previous one and Escape goes back to the list. On the message open or
+/// under the cursor, U or ⇧⌘U marks it read or unread, S or ⇧⌘L stars it, R or ⌘R and ⇧⌘R reply
+/// to the sender or everyone, F or ⇧⌘F forwards it, H snoozes it, V moves it, and E, # and ! or
+/// ⇧⌘J move it to the account's Archive, Trash or Junk mailbox. Z undoes the last of those,
+/// replies and forwards aside. G then I, T, E, H, #, ! or L goes to all inboxes, Sent, the
+/// account's Archive, Snoozed, Trash or Junk, or any mailbox. Keys on their own only count while
+/// no field takes what's typed. Escape also closes the settings (or the update announcement over
+/// them, or an account's settings with nothing unsaved), and in the search field ends the search
+/// and leaves the field. While writing, ⌘↩ sends, and ⌘K links the selected text, as it does in
+/// a signature.
+fn on_key(s: &mut Mail, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    let go = s.take_go();
+    let command_k = ev.is_command('k') && !ev.mods.shift;
+    if s.palette.open && (command_k || ev.key == Key::Escape) {
+        s.close_palette();
         return true;
     }
-    let link = ev.is_command('k') && !ev.mods.shift;
     let page = &mut s.account_settings;
-    if link && s.settings_open && page.open {
+    if command_k && s.settings_open && page.open {
         if page.signature.mode == Mode::Visual {
             page.signature.toggle_link();
-            return true;
         }
-    } else if link && s.compose.open && !s.settings_open && s.compose.body.mode == Mode::Visual {
-        s.compose.body.toggle_link();
+        return true;
+    }
+    if command_k && s.compose.open && !s.settings_open {
+        if s.compose.body.mode == Mode::Visual {
+            s.compose.body.toggle_link();
+        }
+        return true;
+    }
+    if command_k && !s.updater.dialog_open && s.services.is_ok() {
+        s.toggle_palette();
         return true;
     }
     if s.updater.dialog_open && ev.key == Key::Escape {
         s.close_update();
         return true;
     }
-    if ev.is_command(',') && !ev.mods.shift {
-        s.open_settings();
+    if s.run_keys(ev, go, tx) {
         return true;
     }
-    if s.settings_open {
-        if ev.key != Key::Escape {
-            return false;
-        }
+    if s.settings_open && ev.key == Key::Escape {
         // Escape doesn't throw away a signature being written.
         if s.account_settings.is_changed() {
             return false;
@@ -127,32 +139,6 @@ fn on_key(s: &mut Mail, ev: &KeyEvent, _: &mut Tx) -> bool {
             s.close_settings();
         }
         return true;
-    }
-    if s.form.open || s.compose.open {
-        return false;
-    }
-    if ev.is_command('n') && !ev.mods.shift {
-        s.compose();
-        return true;
-    }
-    if ev.is_command('f') && !ev.mods.shift && !s.accounts.is_empty() {
-        s.focus_search();
-        return true;
-    }
-    if s.reader.is_some() {
-        if ev.is_command('r') {
-            s.reply(ev.mods.shift);
-            return true;
-        }
-        // ⇧⌘U, as in Mail.
-        if ev.is_command('u') && ev.mods.shift {
-            s.toggle_seen();
-            return true;
-        }
-        if ev.key == Key::Escape {
-            s.close_reader();
-            return true;
-        }
     }
     false
 }

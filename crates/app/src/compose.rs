@@ -1,5 +1,6 @@
-//! Writing mail: a [`Draft`] as someone types it, started blank or as a reply, the [`Quote`]
-//! a reply carries of the message it answers, and the [`Signature`] below what's written.
+//! Writing mail: a [`Draft`] as someone types it, started blank, as a reply or as a forward, the
+//! [`Quote`] a reply or forward carries of the message it answers or passes on, and the
+//! [`Signature`] below what's written.
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -31,12 +32,15 @@ pub struct Draft {
     pub in_reply_to: Option<String>,
     /// The thread it continues, oldest first.
     pub references: Vec<String>,
+    /// It passes on the message it quotes.
+    pub forward: bool,
 }
 
-/// The message a reply answers, quoted below it.
+/// The message a reply answers, or a forward passes on, quoted below it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Quote {
-    /// "On Thu 12 Nov 2026 09:30, Ada <ada@example.com> wrote:"
+    /// "On Thu 12 Nov 2026 09:30, Ada <ada@example.com> wrote:", or a forward's lines saying
+    /// who it was from, when, what about and who to.
     pub header: String,
     /// The message's text.
     pub text: String,
@@ -72,7 +76,7 @@ impl Quote {
             .unwrap_or_else(|| postden_html::from_text(&self.text));
         format!(
             "<p>{}</p>\n<blockquote type=\"cite\" style=\"margin:0 0 0 0.8ex;border-left:1px solid #ccc;padding-left:1ex\">\n{quoted}\n</blockquote>",
-            postden_html::escape(&self.header)
+            postden_html::escape(&self.header).replace('\n', "<br>\n")
         )
     }
 }
@@ -151,6 +155,42 @@ impl Draft {
             quote: Some(quote(envelope, body, tz)),
             in_reply_to: envelope.message_id.clone(),
             references,
+            forward: false,
+        }
+    }
+
+    /// A forward from `account` of a message, quoted below what's written, to whoever it's sent
+    /// to. It doesn't continue the message's thread. Attachments aren't passed on.
+    #[must_use]
+    pub fn forward(account: &str, envelope: &Envelope, body: &Body, tz: &TimeZone) -> Self {
+        let subject = envelope.subject.as_deref().unwrap_or_default().trim();
+        let mut header = vec![
+            "---------- Forwarded message ----------".to_owned(),
+            format!("From: {}", envelope.from.full()),
+        ];
+        if let Some(when) = date(envelope, tz) {
+            header.push(format!("Date: {when}"));
+        }
+        header.push(format!("Subject: {subject}"));
+        if !body.to.is_empty() {
+            header.push(format!("To: {}", join(&body.to)));
+        }
+        if !body.cc.is_empty() {
+            header.push(format!("Cc: {}", join(&body.cc)));
+        }
+        Self {
+            account: account.to_owned(),
+            subject: if has_forward_prefix(subject) {
+                subject.to_owned()
+            } else {
+                format!("Fwd: {subject}")
+            },
+            quote: Some(Quote {
+                header: header.join("\n"),
+                ..quote(envelope, body, tz)
+            }),
+            forward: true,
+            ..Self::default()
         }
     }
 
@@ -251,6 +291,11 @@ fn has_reply_prefix(subject: &str) -> bool {
         .is_some_and(|p| p.eq_ignore_ascii_case("re:"))
 }
 
+fn has_forward_prefix(subject: &str) -> bool {
+    let lower = subject.to_ascii_lowercase();
+    lower.starts_with("fwd:") || lower.starts_with("fw:")
+}
+
 fn join(addresses: &[Address]) -> String {
     addresses
         .iter()
@@ -262,14 +307,7 @@ fn join(addresses: &[Address]) -> String {
 /// The original under "On Thu 12 Nov 2026 09:30, Ada wrote:".
 fn quote(envelope: &Envelope, body: &Body, tz: &TimeZone) -> Quote {
     let who = envelope.from.full();
-    let when = envelope
-        .date
-        .and_then(|d| Timestamp::from_second(d).ok())
-        .map(|d| {
-            d.to_zoned(tz.clone())
-                .strftime("%a %-d %b %Y %H:%M")
-                .to_string()
-        });
+    let when = date(envelope, tz);
     let header = when.map_or_else(
         || format!("{who} wrote:"),
         |when| format!("On {when}, {who} wrote:"),
@@ -283,6 +321,18 @@ fn quote(envelope: &Envelope, body: &Body, tz: &TimeZone) -> Quote {
             .map(postden_html::quotable)
             .filter(|h| !h.is_empty()),
     }
+}
+
+/// When the message was sent, as "Thu 12 Nov 2026 09:30" in `tz`.
+fn date(envelope: &Envelope, tz: &TimeZone) -> Option<String> {
+    envelope
+        .date
+        .and_then(|d| Timestamp::from_second(d).ok())
+        .map(|d| {
+            d.to_zoned(tz.clone())
+                .strftime("%a %-d %b %Y %H:%M")
+                .to_string()
+        })
 }
 
 #[cfg(test)]
@@ -324,6 +374,7 @@ mod tests {
             subject: Some("Lunch".into()),
             date: Some(1_794_475_800),
             seen: true,
+            flagged: false,
         }
     }
 
@@ -504,6 +555,37 @@ mod tests {
         let d = Draft::reply(&account(), &envelope, &body, true, &TimeZone::UTC);
         assert_eq!(d.to, "Ada <ada@example.com>");
         assert_eq!(d.cc, "", "nobody is copied twice");
+    }
+
+    #[test]
+    fn a_forward_quotes_the_message_under_who_it_was_from_and_starts_no_thread() {
+        let draft = Draft::forward("me@example.com", &envelope(), &body(), &TimeZone::UTC);
+        assert_eq!(draft.subject, "Fwd: Lunch");
+        assert!(draft.forward);
+        assert_eq!(draft.to, "");
+        assert_eq!(draft.in_reply_to, None);
+        assert_eq!(draft.references, Vec::<String>::new());
+        let text = draft.plain_text();
+        assert!(
+            text.contains(
+                "---------- Forwarded message ----------\n\
+                 From: Ada <ada@example.com>\n\
+                 Date: Thu 12 Nov 2026 09:30\n\
+                 Subject: Lunch\n\
+                 To: ME@example.com, Bob <bob@example.com>\n\
+                 Cc: carol@example.com, ada@example.com\n"
+            ),
+            "got {text:?}"
+        );
+        let html = draft.quote.as_ref().map(Quote::as_html).unwrap_or_default();
+        assert!(
+            html.contains("---------- Forwarded message ----------<br>\nFrom: Ada"),
+            "each line of the header on its own: {html}"
+        );
+        let mut again = envelope();
+        again.subject = Some("FW: Lunch".into());
+        let draft = Draft::forward("me@example.com", &again, &body(), &TimeZone::UTC);
+        assert_eq!(draft.subject, "FW: Lunch", "Fwd isn't doubled");
     }
 
     #[test]

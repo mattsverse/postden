@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use jiff::{Timestamp, Zoned};
 use postden_app::{
@@ -26,6 +26,7 @@ use rune::{
 use rune_kit::shell::PaneState;
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
+use crate::commands::{self, Command, Palette, PaletteMode, Shortcut};
 use crate::compose::{ComposeForm, Mode};
 use crate::form::{AccountForm, GoogleSignIn, Step};
 use crate::notifications::{self, Alert, Target};
@@ -55,6 +56,9 @@ pub(crate) struct Reader {
     pub(crate) body: Option<Result<Body, String>>,
     /// The body's HTML as Markdown, to show, converted once when it arrives.
     pub(crate) markdown: Option<String>,
+    /// The UIDVALIDITY its mailbox was cached under when it opened: a download made under
+    /// another is of another message.
+    uid_validity: Option<u32>,
 }
 
 impl Reader {
@@ -113,6 +117,11 @@ fn imap_owner(account: &Account) -> (String, u16, String) {
         account.imap.port,
         account.imap.username.clone(),
     )
+}
+
+/// What a notice adds when Z undoes what it tells of.
+const fn undo_hint(undoable: bool) -> &'static str {
+    if undoable { " · Z to undo" } else { "" }
 }
 
 /// What importing a profile did, in a sentence.
@@ -174,7 +183,7 @@ impl SettingsSection {
 }
 
 /// What the message list shows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Showing {
     /// Every account's mailbox with this role: all inboxes, or all Sent mailboxes.
     All(Role),
@@ -228,6 +237,77 @@ pub(crate) fn reopened() {
     CLOSES.fetch_add(1, Ordering::AcqRel);
 }
 
+/// How a message is answered: a reply to its sender or everyone, or a forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// A reply to the sender, or whoever the message asks replies to go to.
+    Reply,
+    /// A reply to everyone the message went to.
+    ReplyAll,
+    /// The message passed on to whoever it's sent to.
+    Forward,
+}
+
+/// A move asked for a message while a read mark or star asked for it was still unanswered: it's
+/// made once that's answered, as the change would be lost with the UID it was asked under.
+#[derive(Debug, Clone)]
+enum Deferred {
+    /// To the account's mailbox.
+    Move(String),
+    /// Snoozed until then.
+    Snooze(Box<StoredMessage>, Timestamp),
+}
+
+/// What Z undoes: the last thing done to a message from the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Undo {
+    /// The message `from` names was moved, or snoozed until `snoozed`, to its account's mailbox
+    /// `to`, where it's found again by its Message-ID. It can be moved back once the server
+    /// moved it: until then, `done` isn't set.
+    Moved {
+        from: MessageKey,
+        to: String,
+        message_id: String,
+        snoozed: Option<i64>,
+        done: bool,
+    },
+    /// The message was marked read or unread: `seen` is what it was. It's marked back once the
+    /// server marked it (`done`), and only while its mailbox is still under `uid_validity`, as its
+    /// UID names another message otherwise.
+    Seen {
+        message: MessageKey,
+        uid_validity: u32,
+        seen: bool,
+        done: bool,
+    },
+    /// The message was starred or unstarred: `flagged` is what it was. As [`Undo::Seen`].
+    Flagged {
+        message: MessageKey,
+        uid_validity: u32,
+        flagged: bool,
+        done: bool,
+    },
+}
+
+impl Undo {
+    /// The account of the message it's about.
+    fn account(&self) -> &str {
+        match self {
+            Self::Moved { from: key, .. }
+            | Self::Seen { message: key, .. }
+            | Self::Flagged { message: key, .. } => &key.0,
+        }
+    }
+}
+
+/// A message being moved back by undoing, to `mailbox`, found by its Message-ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Restoring {
+    account: String,
+    mailbox: String,
+    message_id: String,
+}
+
 /// How long a notice shows before it closes on its own.
 const NOTICE_SECS: u64 = 6;
 
@@ -235,6 +315,8 @@ const NOTICE_SECS: u64 = 6;
 const FIRST_UPDATE_CHECK: Duration = Duration::from_secs(10);
 /// How often updates are checked for while the app runs.
 const UPDATE_CHECK_EVERY: Duration = Duration::from_hours(24);
+/// How soon after G its second key must come.
+const GO_WITHIN: Duration = Duration::from_secs(2);
 /// How often snoozed messages are checked for being due, so one comes back within this of its time.
 const WAKE_EVERY: Duration = Duration::from_secs(30);
 
@@ -293,7 +375,7 @@ pub(crate) struct Mail {
     pub(crate) mailbox_menu: Option<MailboxMenu>,
     /// A reply asked for before its message was downloaded: the message, and whether to everyone.
     /// It starts once the message opens.
-    pending_reply: Option<(MessageKey, bool)>,
+    pending_reply: Option<(MessageKey, Answer)>,
     /// Messages being moved, left out of the list until the server answers.
     moving: HashSet<MessageKey>,
     /// Mailboxes being marked read, as asked with [`Mail::mark_all_seen`], until the server answers.
@@ -314,6 +396,39 @@ pub(crate) struct Mail {
     pub(crate) updater: Updater,
     /// Exporting or importing every account and setting, in the settings.
     pub(crate) transfer: Transfer,
+    /// The command palette (⌘K).
+    pub(crate) palette: Palette,
+    /// The message under the list's cursor, which J and K move.
+    pub(crate) cursor: Option<MessageKey>,
+    /// When G was pressed: the next key, soon after, says where to go.
+    go_pressed: Option<Instant>,
+    /// What Z undoes, if anything.
+    pub(crate) undo: Option<Undo>,
+    /// A message being moved back by undoing: the list's cursor goes to it once it's listed
+    /// there again, unless another mailbox is shown meanwhile.
+    restoring: Option<Restoring>,
+    /// Messages being moved back by undoing, which aren't announced as new mail when they arrive.
+    returning: Vec<Restoring>,
+    /// The moves being undone, which Z can undo again if moving the message back fails.
+    undoing: Vec<Undo>,
+    /// Messages opened while a mark to unread asked for them was on its way, as after U: they're
+    /// marked read once nothing asked for them is unanswered, under the UIDVALIDITY they were
+    /// opened under, whether still open or not.
+    read_later: HashMap<MessageKey, Option<u32>>,
+    /// Stars asked of the server and not answered yet, as asked: shown over what the cache
+    /// still says, which changes only once the server agrees.
+    starring: HashMap<MessageKey, bool>,
+    /// Messages whose last read mark asked of the server, still unanswered, was to unread.
+    unreading: HashSet<MessageKey>,
+    /// Moves waiting for a read mark or star to their message to be answered, by message, with
+    /// the UIDVALIDITY its mailbox was cached under then.
+    deferred: HashMap<MessageKey, (Deferred, Option<u32>)>,
+    /// Messages being moved back by undoing, by the mailbox they're leaving: they aren't changed
+    /// meanwhile, as the change would be lost with their UID there.
+    leaving: Vec<Restoring>,
+    /// How many read marks (`false`) or stars (`true`) asked of the server for a message it
+    /// hasn't answered yet: Z waits for them all.
+    unanswered: HashMap<(MessageKey, bool), usize>,
 }
 
 impl Mail {
@@ -362,6 +477,19 @@ impl Mail {
             images: None,
             updater: Updater::default(),
             transfer: Transfer::default(),
+            palette: Palette::default(),
+            cursor: None,
+            go_pressed: None,
+            undo: None,
+            restoring: None,
+            returning: Vec::new(),
+            undoing: Vec::new(),
+            leaving: Vec::new(),
+            deferred: HashMap::new(),
+            read_later: HashMap::new(),
+            unreading: HashSet::new(),
+            starring: HashMap::new(),
+            unanswered: HashMap::new(),
         }
     }
 
@@ -447,7 +575,17 @@ impl Mail {
         };
         let notify = handle.clone();
         let mailroom = Mailroom::start(&database, config, settings.prefetch, move |update| {
-            notify.update(move |s: &mut Self, tx| s.apply(update, tx));
+            notify.update(move |s: &mut Self, tx| {
+                // Mail coming in can add rows above the palette's highlight (Reply, once a
+                // message downloads), which the list's scroll anchor doesn't follow.
+                let before = s.palette_highlight();
+                s.apply(update, tx);
+                if let (Some((was, _)), Some((row, key))) = (before, s.palette_highlight())
+                    && was != row
+                {
+                    tx.scroll_into_view(key);
+                }
+            });
         })
         .map_err(|e| e.to_string())?;
         let services = Services {
@@ -473,11 +611,13 @@ impl Mail {
                 .map(|cached| self.search.merge(cached, self.list_limit))
                 .and_then(|mut merged| {
                     // A server match the cache holds but whose headers don't match (its text
-                    // did) shows as read or unread as the cache says, which follows the server.
+                    // did) shows as read or unread, and starred or not, as the cache says,
+                    // which follows the server.
                     for m in &mut merged {
                         let (a, b, uid) = (&m.account, &m.mailbox, m.envelope.uid);
-                        if let Some(seen) = services.store.seen(a, b, uid)? {
-                            m.envelope.seen = seen;
+                        if let Some(cached) = services.store.message(a, b, uid)? {
+                            m.envelope.seen = cached.envelope.seen;
+                            m.envelope.flagged = cached.envelope.flagged;
                         }
                     }
                     Ok(merged)
@@ -510,6 +650,9 @@ impl Mail {
                     .map(|(mailboxes, a)| (a.id.clone(), mailboxes.clone()))
                     .collect();
                 self.accounts = accounts.into_iter().map(|(_, a)| a).collect();
+                for m in &mut messages {
+                    self.shown_as_asked(m);
+                }
                 self.messages = messages;
                 self.listed = self.listed_mailboxes();
                 self.unread = unread;
@@ -523,12 +666,41 @@ impl Mail {
                         .find(|l| is_message(l, account, mailbox, uid))
                     {
                         reader.message = listed.clone();
+                    } else if let Some(&flagged) = self.starring.get(&message_key(&reader.message))
+                    {
+                        reader.message.envelope.flagged = flagged;
                     }
                 }
             }
             (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
                 self.notify(format!("couldn't read mail: {e}"));
             }
+        }
+    }
+
+    /// One of an account's mailboxes started over: what was older is to be fetched again, and
+    /// what a search found there is gone. A message open from there closes, and a star on its
+    /// way there isn't shown, as their UIDs may name other messages now.
+    fn started_over(&mut self, account: &str, mailbox: &str) {
+        self.no_older
+            .remove(&(account.to_owned(), mailbox.to_owned()));
+        self.search.forget_mailbox(account, mailbox);
+        self.starring
+            .retain(|key, _| key.0 != account || key.1 != mailbox);
+        if self
+            .reader
+            .as_ref()
+            .is_some_and(|r| r.message.account == account && r.message.mailbox == mailbox)
+        {
+            self.reader = None;
+            self.pending_reply = None;
+        }
+    }
+
+    /// Shows `m` with a star on its way as asked, until the server answers.
+    fn shown_as_asked(&self, m: &mut StoredMessage) {
+        if let Some(&flagged) = self.starring.get(&message_key(m)) {
+            m.envelope.flagged = flagged;
         }
     }
 
@@ -540,10 +712,7 @@ impl Mail {
             ..
         } = &update
         {
-            // Started over: what was older is to be fetched again, and what a search found there
-            // is gone.
-            self.no_older.remove(&(account.clone(), mailbox.clone()));
-            self.search.forget_mailbox(account, mailbox);
+            self.started_over(account, mailbox);
         }
         match update {
             Update::Status { account, status } => {
@@ -557,6 +726,7 @@ impl Mail {
                 first_sync,
                 uid_validity,
                 unread,
+                message_ids,
             } => {
                 let target = Target {
                     account,
@@ -564,7 +734,7 @@ impl Mail {
                     uid_validity,
                     uid: None,
                 };
-                self.inbox_mail(target, count, first_sync, &unread);
+                self.inbox_mail(target, count, first_sync, &unread, &message_ids);
             }
             Update::CopyFailed { account, error } => self.copy_failed(&account, &error),
             Update::SaveFailed { account, error } => {
@@ -573,21 +743,13 @@ impl Mail {
             Update::Opened {
                 account,
                 mailbox,
+                uid_validity,
                 uid,
                 body,
-            } => self.opened(&account, &mailbox, uid, body, tx),
+            } => self.opened(&(account, mailbox, uid), uid_validity, body, tx),
             // Sent mail is shown as it's listed, without a notice.
             Update::Mail { .. } => self.reload(),
             Update::Mailboxes { account } => self.mailboxes_listed(&account),
-            Update::Seen {
-                account,
-                mailbox,
-                uid,
-                seen,
-            } => {
-                self.search.settle(&account, &mailbox, uid, Some(seen));
-                self.reload();
-            }
             Update::Older {
                 account,
                 mailbox,
@@ -603,12 +765,6 @@ impl Mail {
                 self.notify(format!("{label}: couldn't fetch older mail: {error}"));
                 self.fetching_older.remove(&(account, mailbox));
             }
-            Update::SeenFailed {
-                account,
-                mailbox,
-                uid,
-                error,
-            } => self.seen_failed(&account, &mailbox, uid, &error),
             Update::AllSeen {
                 account,
                 mailbox,
@@ -634,7 +790,13 @@ impl Mail {
                 mailbox,
                 result,
             } => self.searched(id, &account, &mailbox, result),
+            update @ (Update::Seen { .. }
+            | Update::SeenFailed { .. }
+            | Update::Flagged { .. }
+            | Update::FlagsChanged { .. }
+            | Update::Restored { .. }) => self.message_changed(update),
         }
+        self.follow_restored(tx);
     }
 
     /// The server listed an account's mailboxes. What a search found in one deleted or renamed
@@ -710,8 +872,9 @@ impl Mail {
         to: &str,
         result: Result<bool, String>,
     ) {
-        self.moving
-            .remove(&(account.to_owned(), mailbox.to_owned(), uid));
+        let key = (account.to_owned(), mailbox.to_owned(), uid);
+        self.moving.remove(&key);
+        let undoable = self.moved_for_undo(&key, result.is_ok());
         let to = self.mailbox_label(account, to);
         match result {
             Ok(current) => {
@@ -720,7 +883,7 @@ impl Mail {
                 if current {
                     self.search.forget_message(account, mailbox, uid);
                 }
-                self.notify(format!("Moved to {to}"));
+                self.notify(format!("Moved to {to}{}", undo_hint(undoable)));
             }
             Err(error) => {
                 let label = self.label(account).to_owned();
@@ -735,19 +898,36 @@ impl Mail {
     /// A message asked for with [`Mail::open_message`] was downloaded, or couldn't be.
     fn opened(
         &mut self,
-        account: &str,
-        mailbox: &str,
-        uid: u32,
+        key: &MessageKey,
+        uid_validity: u32,
         body: Result<Body, String>,
         tx: &mut Tx,
     ) {
+        let (account, mailbox, uid) = (key.0.as_str(), key.1.as_str(), key.2);
         self.search
             .settle(account, mailbox, uid, body.is_ok().then_some(true));
+        // Not downloaded, it isn't read either.
+        if body.is_err() {
+            self.read_later.remove(key);
+        }
+        // Its read mark is answered; a download failing isn't a U refused, so the undo stays,
+        // and is done once nothing else is awaited, as a U refused would have dropped it.
+        if self.answered(key, false) == 0
+            && let Some(Undo::Seen { message, done, .. }) = &mut self.undo
+            && message == key
+        {
+            *done = true;
+        }
+        // Downloaded under another UIDVALIDITY, it's another message than the one open now.
         if let Some(reader) = &mut self.reader
             && reader.is(account, mailbox, uid)
+            && reader.uid_validity.is_none_or(|v| v == uid_validity)
         {
             reader.markdown = body.as_ref().ok().and_then(markdown);
             let downloaded = body.is_ok();
+            if downloaded {
+                reader.message.envelope.seen = true;
+            }
             reader.body = Some(body);
             // The server, not a click, brought it, which would land the text at once:
             // ask for its entrance anyway, so it fades in over the spinner.
@@ -757,8 +937,8 @@ impl Mail {
                 .take_if(|(key, _)| key.0 == account && key.1 == mailbox && key.2 == uid);
             // Failing to download, the reader says why, and a reply waits to be asked again. A
             // message started meanwhile isn't replaced.
-            if let (Some((_, all)), true, false) = (waiting, downloaded, self.compose.open) {
-                self.reply(all);
+            if let (Some((_, answer)), true, false) = (waiting, downloaded, self.compose.open) {
+                self.answer(answer);
             }
         }
         // Read now, or, if the download failed, unread again as the store still says.
@@ -839,6 +1019,241 @@ impl Mail {
     pub(crate) fn focus_search(&mut self) {
         self.reader = None;
         self.search.query.focused = true;
+    }
+
+    /// Opens the palette afresh, with nothing typed, or closes it.
+    pub(crate) fn toggle_palette(&mut self) {
+        if self.palette.open {
+            self.close_palette();
+        } else {
+            self.open_palette(PaletteMode::Commands);
+        }
+    }
+
+    /// Opens the palette afresh on `mode`, with nothing typed.
+    pub(crate) fn open_palette(&mut self, mode: PaletteMode) {
+        // Menus left open would sit over it.
+        self.actions_open = false;
+        self.message_menu = None;
+        self.mailbox_menu = None;
+        self.palette = Palette {
+            open: true,
+            mode,
+            query: TextEdit::new(""),
+            active: None,
+        };
+        self.palette.query.focused = true;
+    }
+
+    pub(crate) const fn close_palette(&mut self) {
+        self.palette.open = false;
+    }
+
+    /// What's typed in the palette changed: the best match is highlighted.
+    pub(crate) fn palette_changed(&mut self) {
+        self.palette.active = None;
+    }
+
+    /// Moves the highlight `by` rows, wrapping around the ends. Returns the row it's on.
+    pub(crate) fn move_palette(&mut self, by: isize) -> usize {
+        let shown = self.palette.shown(self);
+        if shown.is_empty() {
+            return 0;
+        }
+        let at = self.palette.active_row(&shown).cast_signed() + by;
+        let row = at.rem_euclid(shown.len().cast_signed()).cast_unsigned();
+        self.palette.active = shown.into_iter().nth(row).map(|e| e.command);
+        row
+    }
+
+    /// The palette's highlighted row and its key, while it's open with rows.
+    fn palette_highlight(&self) -> Option<(usize, String)> {
+        if !self.palette.open {
+            return None;
+        }
+        let shown = self.palette.shown(self);
+        let row = self.palette.active_row(&shown);
+        Some((row, shown.get(row)?.command.key()))
+    }
+
+    /// Runs `command` from the palette, or the highlighted one (Return) for `None`, closing it.
+    pub(crate) fn run_palette(&mut self, command: Option<Command>, tx: &mut Tx) {
+        let shown = self.palette.shown(self);
+        let row = self.palette.active_row(&shown);
+        let entry = match command {
+            Some(c) => shown.into_iter().find(|e| e.command == c),
+            None => shown.into_iter().nth(row),
+        };
+        let Some(entry) = entry else { return };
+        self.close_palette();
+        entry.command.run(self, tx);
+    }
+
+    #[cfg(test)]
+    /// Runs the command whose shortcut `ev` is, if one applies here. G on its own starts a
+    /// "go to", and the key after it is taken whether it goes anywhere or not.
+    pub(crate) fn run_shortcut(&mut self, ev: &rune::KeyEvent, tx: &mut Tx) -> bool {
+        let go = self.take_go();
+        self.run_keys(ev, go, tx)
+    }
+
+    /// Whether G was pressed just before this key, forgetting it: whatever handles the key, G
+    /// only says where the next one goes.
+    pub(crate) fn take_go(&mut self) -> bool {
+        self.go_pressed
+            .take()
+            .is_some_and(|at| at.elapsed() < GO_WITHIN)
+    }
+
+    /// Forgets a G pressed before, when the key after it went elsewhere.
+    pub(crate) const fn forget_go(&mut self) {
+        self.go_pressed = None;
+    }
+
+    /// [`Mail::run_shortcut`], `go` when G came just before. While a menu is open, only ⌘
+    /// shortcuts count: keys on their own are the menu's.
+    pub(crate) fn run_keys(&mut self, ev: &rune::KeyEvent, go: bool, tx: &mut Tx) -> bool {
+        let menu = self.actions_open || self.message_menu.is_some() || self.mailbox_menu.is_some();
+        let counts =
+            |k: &Shortcut| !menu || matches!(k, Shortcut::Command { .. } | Shortcut::Sidebar);
+        let commands = commands::available(self);
+        let pressed = commands.iter().find(|c| {
+            c.shortcuts(self)
+                .iter()
+                .any(|k| counts(k) && k.matches(ev, go))
+        });
+        if let Some(command) = pressed.cloned() {
+            // A menu open (⌘N over it) would come back once what the command shows closes.
+            self.actions_open = false;
+            self.message_menu = None;
+            self.mailbox_menu = None;
+            self.close_palette();
+            command.run(self, tx);
+            return true;
+        }
+        let goes = |c: &Command| {
+            c.shortcuts(self)
+                .iter()
+                .any(|k| matches!(k, Shortcut::Go(_)))
+        };
+        if !go && !menu && Shortcut::Key('g').matches(ev, false) && commands.iter().any(goes) {
+            self.go_pressed = Some(Instant::now());
+            return true;
+        }
+        go
+    }
+
+    /// The message the keyboard acts on: the open one, else the one under the list's cursor.
+    pub(crate) fn focused_message(&self) -> Option<&StoredMessage> {
+        match &self.reader {
+            Some(r) => Some(&r.message),
+            None => self.find_listed(self.cursor.as_ref()?),
+        }
+    }
+
+    fn find_listed(&self, key: &MessageKey) -> Option<&StoredMessage> {
+        self.shown().find(|m| message_key(m) == *key)
+    }
+
+    /// The message `key` names, open or listed.
+    pub(crate) fn find_message(&self, key: &MessageKey) -> Option<&StoredMessage> {
+        self.reader
+            .as_ref()
+            .map(|r| &r.message)
+            .filter(|m| message_key(m) == *key)
+            .or_else(|| self.find_listed(key))
+    }
+
+    /// Moves the list's cursor `by` rows, stopping at the ends; with nothing under it, it starts
+    /// at the top. While a message is open, the next or previous one opens instead.
+    pub(crate) fn move_cursor(&mut self, by: isize, tx: &mut Tx) {
+        let keys: Vec<MessageKey> = self.shown().map(message_key).collect();
+        let Some(last) = keys.len().checked_sub(1) else {
+            return;
+        };
+        let open = self.reader.as_ref().map(|r| message_key(&r.message));
+        let from = open.clone().or_else(|| self.cursor.clone());
+        let at = from.and_then(|k| keys.iter().position(|x| *x == k));
+        let row = match at {
+            Some(i) => i.saturating_add_signed(by).min(last),
+            // An open message the list doesn't show has no next one.
+            None if open.is_some() => return,
+            None => 0,
+        };
+        let Some(key) = keys.get(row).cloned() else {
+            return;
+        };
+        tx.scroll_into_view(row_key(&key));
+        if open.is_some() && at != Some(row) {
+            self.open_message(&key.0, &key.1, key.2);
+        }
+        self.cursor = Some(key);
+    }
+
+    /// Scrolls the list to its cursor, as the list shows again.
+    pub(crate) fn reveal_cursor(&self, tx: &mut Tx) {
+        if let Some(key) = &self.cursor {
+            tx.scroll_into_view(row_key(key));
+        }
+    }
+
+    /// Puts the list's cursor on its first row, if it has one.
+    pub(crate) fn cursor_to_first(&mut self, tx: &mut Tx) -> bool {
+        let Some(first) = self.shown().next().map(message_key) else {
+            return false;
+        };
+        tx.scroll_into_view(row_key(&first));
+        self.cursor = Some(first);
+        true
+    }
+
+    /// Opens the message under the list's cursor.
+    pub(crate) fn open_cursor(&mut self) {
+        if let Some(m) = self.focused_message() {
+            let (account, mailbox, uid) = (m.account.clone(), m.mailbox.clone(), m.envelope.uid);
+            self.open_message(&account, &mailbox, uid);
+        }
+    }
+
+    /// A message was moved, or snoozed, and leaves the list at once. A cursor on it (or on it
+    /// open) moves to the row after it, else the one before, and an open one closes.
+    pub(crate) fn left_list(&mut self, key: MessageKey) {
+        let open = self.reader.as_ref().map(|r| message_key(&r.message));
+        if self.cursor.as_ref() == Some(&key) || open.as_ref() == Some(&key) {
+            let keys: Vec<MessageKey> = self.shown().map(message_key).collect();
+            let at = keys.iter().position(|k| *k == key);
+            self.cursor = at
+                .and_then(|i| keys.get(i + 1).or_else(|| keys.get(i.checked_sub(1)?)))
+                .cloned();
+        }
+        if open.as_ref() == Some(&key) {
+            self.reader = None;
+        }
+        self.moving.insert(key);
+        self.reload();
+    }
+
+    /// Replies to or forwards the focused message: the open one once it's downloaded, or the one
+    /// under the list's cursor, which opens first.
+    pub(crate) fn answer_focused(&mut self, answer: Answer) {
+        if self.reader.is_some() {
+            return self.answer(answer);
+        }
+        if let Some(key) = self
+            .cursor
+            .clone()
+            .filter(|k| self.find_listed(k).is_some())
+        {
+            self.answer_message(&key.0, &key.1, key.2, answer);
+        }
+    }
+
+    /// Snoozes the message `key` names until `until`.
+    pub(crate) fn snooze_key(&mut self, key: &MessageKey, until: Timestamp) {
+        let Some(message) = self.find_message(key).cloned() else {
+            return;
+        };
+        self.snooze_message(&message, until);
     }
 
     /// Asks the server of each mailbox searched for what matches, beyond what's cached and in the
@@ -931,6 +1346,12 @@ impl Mail {
 
     /// Starts a reply to the open message, once it's downloaded.
     pub(crate) fn reply(&mut self, all: bool) {
+        self.answer(if all { Answer::ReplyAll } else { Answer::Reply });
+    }
+
+    /// Starts a reply to, or a forward of, the open message, once it's downloaded. Its
+    /// attachments aren't forwarded, and a notice says so.
+    pub(crate) fn answer(&mut self, answer: Answer) {
         let Some(Reader {
             message,
             body: Some(Ok(body)),
@@ -942,15 +1363,24 @@ impl Mail {
         let Some(account) = self.accounts.iter().find(|a| a.id == message.account) else {
             return;
         };
-        let mut draft = Draft::reply(
-            account,
-            &message.envelope,
-            body,
-            all,
-            &jiff::tz::TimeZone::system(),
-        );
+        let tz = jiff::tz::TimeZone::system();
+        let mut draft = match answer {
+            Answer::Forward => Draft::forward(&account.id, &message.envelope, body, &tz),
+            _ => Draft::reply(
+                account,
+                &message.envelope,
+                body,
+                answer == Answer::ReplyAll,
+                &tz,
+            ),
+        };
+        let left_behind = (answer == Answer::Forward && !body.attachments.is_empty())
+            .then(|| body.attachments.join(", "));
         draft.signature = self.signature_of(&draft.account);
         self.compose = ComposeForm::new(draft, self.images.as_ref());
+        if let Some(names) = left_behind {
+            self.notify(format!("Attachments aren't forwarded yet: {names}"));
+        }
     }
 
     /// Hands the message being written to the mailroom.
@@ -1015,6 +1445,10 @@ impl Mail {
     /// marking it read. One the list doesn't show, such as one a search leaves out, opens from
     /// the cache.
     pub(crate) fn open_message(&mut self, account: &str, mailbox: &str, uid: u32) {
+        // Opening marks it read, which would be lost once it's moved back.
+        if self.moving_back(&(account.to_owned(), mailbox.to_owned(), uid)) {
+            return;
+        }
         self.pending_reply = None;
         let listed = self
             .messages
@@ -1025,25 +1459,56 @@ impl Mail {
             let services = self.services.as_ref().ok()?;
             services.store.message(account, mailbox, uid).ok().flatten()
         };
-        let Some(message) = listed.or_else(cached) else {
+        let Some(mut message) = listed.or_else(cached) else {
             return;
         };
+        self.shown_as_asked(&mut message);
+        // Back in the list, the cursor is on it.
+        self.cursor = Some((account.to_owned(), mailbox.to_owned(), uid));
+        // A read mark already on its way isn't asked for twice: one failing would be taken for
+        // the other. One to unread, as after U, is followed by one to read once nothing for
+        // the message is awaited.
+        let key = (account.to_owned(), mailbox.to_owned(), uid);
+        let uid_validity = self.uid_validity(account, mailbox);
+        let mark = !self.unanswered.contains_key(&(key.clone(), false));
+        // Marked read now, an older note to do so later is superseded.
+        let later = self.unreading.contains(&key);
+        if mark {
+            self.read_later.remove(&key);
+        }
         let mut reader = Reader {
             message,
             body: None,
             markdown: None,
+            uid_validity,
         };
+        let mut started = true;
         if let Ok(services) = &self.services {
             let opened = services
                 .mailroom
-                .open(&services.store, account, mailbox, uid);
+                .open(&services.store, account, mailbox, uid, mark);
             if let Err(e) = opened {
                 reader.body = Some(Err(e.to_string()));
+                started = false;
             } else {
                 // Downloaded ahead, it shows at once; otherwise once it's downloaded.
-                if let Ok(Some(body)) = opened {
-                    reader.markdown = markdown(&body);
-                    reader.body = Some(Ok(body));
+                let key = (account.to_owned(), mailbox.to_owned(), uid);
+                match opened {
+                    Ok((Some(body), marking)) => {
+                        reader.markdown = markdown(&body);
+                        reader.body = Some(Ok(body));
+                        // Marked read on the server, which answers as for U.
+                        if marking {
+                            self.asked(&key, false);
+                            self.unreading.remove(&key);
+                        }
+                    }
+                    // Marked read once downloaded, which answers as `Update::Opened`.
+                    Ok((None, _)) => {
+                        self.asked(&key, false);
+                        self.unreading.remove(&key);
+                    }
+                    Err(_) => {}
                 }
                 // Shown read right away; the store catches up once the server agrees.
                 reader.message.envelope.seen = true;
@@ -1056,6 +1521,10 @@ impl Mail {
                 }
                 self.search.set_seen(account, mailbox, uid, true);
             }
+        }
+        // Not opened, it isn't read either.
+        if started && later {
+            self.read_later.insert(key, uid_validity);
         }
         self.reader = Some(reader);
     }
@@ -1117,24 +1586,369 @@ impl Mail {
         });
     }
 
-    /// Flips the open message between read and unread.
+    /// Flips the focused message between read and unread.
     pub(crate) fn toggle_seen(&mut self) {
-        let Some(reader) = &self.reader else { return };
-        let m = &reader.message;
-        let (account, mailbox, uid) = (m.account.clone(), m.mailbox.clone(), m.envelope.uid);
-        self.set_seen(&account, &mailbox, uid, !m.envelope.seen);
+        let Some(m) = self.focused_message() else {
+            return;
+        };
+        let (key, seen) = (message_key(m), m.envelope.seen);
+        self.mark_seen(key, !seen);
+    }
+
+    /// Marks a message read or unread, as asked from the window, so Z marks it back.
+    pub(crate) fn mark_seen(&mut self, key: MessageKey, seen: bool) {
+        if self.still_saving(&key, false) {
+            return;
+        }
+        let uid_validity = self.uid_validity(&key.0, &key.1);
+        if self.set_seen(&key.0, &key.1, key.2, seen, uid_validity) {
+            self.did(uid_validity.map(|uid_validity| Undo::Seen {
+                message: key,
+                uid_validity,
+                seen: !seen,
+                done: false,
+            }));
+        }
+    }
+
+    /// Stars a message or takes its star away, as asked from the window, so Z does the opposite.
+    pub(crate) fn star(&mut self, key: MessageKey, flagged: bool) {
+        if self.still_saving(&key, true) {
+            return;
+        }
+        let uid_validity = self.uid_validity(&key.0, &key.1);
+        if self.set_flagged(&key.0, &key.1, key.2, flagged, uid_validity) {
+            self.did(uid_validity.map(|uid_validity| Undo::Flagged {
+                message: key,
+                uid_validity,
+                flagged: !flagged,
+                done: false,
+            }));
+        }
+    }
+
+    /// Whether the server hasn't answered the last read mark, or with `star` star, asked for
+    /// `key`'s message: another isn't asked for until it has, so they're made in turn, and a
+    /// notice says so.
+    fn still_saving(&mut self, key: &MessageKey, star: bool) -> bool {
+        let waiting = self.unanswered.contains_key(&(key.clone(), star));
+        if waiting {
+            self.notify("Still waiting for the server about this message".into());
+        }
+        waiting || self.moving_back(key)
+    }
+
+    /// Something was done from the window, which Z undoes with `undo`, or can't: what was done
+    /// before, and moves back that fail, aren't undone any more.
+    fn did(&mut self, undo: Option<Undo>) {
+        self.undo = undo;
+        self.undoing.clear();
+        // Nor does the cursor go to a message being moved back; it isn't new mail all the same.
+        self.restoring = None;
+    }
+
+    /// The UIDVALIDITY a mailbox is cached under, if it's cached.
+    fn uid_validity(&self, account: &str, mailbox: &str) -> Option<u32> {
+        let services = self.services.as_ref().ok()?;
+        let state = services.store.mailbox_state(account, mailbox).ok()??;
+        Some(state.uid_validity)
+    }
+
+    /// The server starred the message `key` names, with `star`, or else marked it: `Ok` with
+    /// what it is now, or refused, `Err` with what it was asked to be. Once it answered every
+    /// change asked for, Z can change it back; the change Z undoes refused, there's nothing to
+    /// undo.
+    fn changed_for_undo(&mut self, key: &MessageKey, star: bool, answer: Result<bool, bool>) {
+        let waiting = self.answered(key, star);
+        if star != matches!(self.undo, Some(Undo::Flagged { .. })) {
+            return;
+        }
+        let Some(
+            Undo::Seen {
+                message,
+                done,
+                seen: was,
+                ..
+            }
+            | Undo::Flagged {
+                message,
+                done,
+                flagged: was,
+                ..
+            },
+        ) = &mut self.undo
+        else {
+            return;
+        };
+        if message != key {
+            return;
+        }
+        // Another change refused, such as opening it marking it read, isn't the one undone,
+        // which a refusal of would have dropped it: answered too, if nothing else is awaited.
+        let undone_refused = answer.is_err_and(|asked| asked != *was);
+        if undone_refused {
+            self.undo = None;
+        } else if waiting == 0 {
+            *done = true;
+        }
+    }
+
+    /// The open message, if it's in the account's `mailbox`, shows as read or unread and starred
+    /// or not as the store now says, unless a change to it is still on its way to the server.
+    fn reader_flags_changed(&mut self, account: &str, mailbox: &str) {
+        let open = self
+            .reader
+            .as_ref()
+            .filter(|r| r.message.account == account && r.message.mailbox == mailbox)
+            .map(|r| message_key(&r.message));
+        if let Some(key) = open {
+            self.settle_reader(&key);
+        }
+    }
+
+    /// The open message, if `key` names it, shows as the store says, once no change to it is on
+    /// its way to the server: one made elsewhere meanwhile isn't missed.
+    fn settle_reader(&mut self, key: &MessageKey) {
+        if self.pending(key) {
+            return;
+        }
+        let Some(reader) = self
+            .reader
+            .as_mut()
+            .filter(|r| message_key(&r.message) == *key)
+        else {
+            return;
+        };
+        let Ok(services) = &self.services else { return };
+        if let Ok(Some(cached)) = services.store.message(&key.0, &key.1, key.2) {
+            reader.message.envelope.seen = cached.envelope.seen;
+            reader.message.envelope.flagged = cached.envelope.flagged;
+        }
+    }
+
+    /// Whether `key`'s message is being moved back by undoing, so it isn't changed meanwhile,
+    /// and a notice says so.
+    fn moving_back(&mut self, key: &MessageKey) -> bool {
+        let id = self
+            .find_message(key)
+            .or_else(|| self.search.found.iter().find(|m| message_key(m) == *key))
+            .and_then(|m| m.envelope.message_id.clone());
+        let leaving = id.is_some_and(|id| {
+            self.leaving
+                .iter()
+                .any(|r| r.account == key.0 && r.mailbox == key.1 && r.message_id == id)
+        });
+        if leaving {
+            self.notify("The message is being moved back".into());
+        }
+        leaving
+    }
+
+    /// The server answered a read mark, or with `star` a star, asked for `key`'s message. Once
+    /// none is left, the open message shows as the store says, a read mark waiting to follow
+    /// is asked for, and then a move waiting for them is made. Returns how many of that kind are
+    /// still unanswered.
+    fn answered(&mut self, key: &MessageKey, star: bool) -> usize {
+        let asked = (key.clone(), star);
+        let waiting = self
+            .unanswered
+            .get(&asked)
+            .map_or(0, |n| n.saturating_sub(1));
+        if waiting == 0 {
+            self.unanswered.remove(&asked);
+            if !star {
+                self.unreading.remove(key);
+            }
+        } else {
+            self.unanswered.insert(asked, waiting);
+        }
+        self.settle_reader(key);
+        // Opened meanwhile, it's marked read now: asked whatever it shows, as one found only by
+        // searching the server has no cached copy to say. A move waiting goes once that's
+        // answered too.
+        if !self.pending(key)
+            && let Some(uid_validity) = self.read_later.remove(key)
+        {
+            self.set_seen(&key.0, &key.1, key.2, true, uid_validity);
+        }
+        if !self.pending(key) {
+            self.send_deferred(key);
+        }
+        waiting
+    }
+
+    /// Whether a read mark or star asked for `key`'s message hasn't been answered yet.
+    fn pending(&self, key: &MessageKey) -> bool {
+        self.unanswered.contains_key(&(key.clone(), false))
+            || self.unanswered.contains_key(&(key.clone(), true))
+    }
+
+    /// Makes the move that waited for `key`'s message, if any. Refused, or once its mailbox
+    /// started over (its UID may name another message now), the message is listed where it
+    /// was again, if it's still there.
+    fn send_deferred(&mut self, key: &MessageKey) {
+        let Some((deferred, asked_under)) = self.deferred.remove(key) else {
+            return;
+        };
+        let (account, mailbox, uid) = (&key.0, &key.1, key.2);
+        let current = self.uid_validity(account, mailbox);
+        let sent = match (&self.services, &deferred) {
+            (Err(e), _) => Err(e.clone()),
+            _ if current.is_none() || current != asked_under => Err(format!(
+                "{} changed on the server",
+                self.mailbox_label(account, mailbox)
+            )),
+            (Ok(services), Deferred::Move(to)) => services
+                .mailroom
+                .move_message(&services.store, account, mailbox, uid, to, asked_under)
+                .map_err(|e| e.to_string()),
+            (Ok(services), Deferred::Snooze(message, until)) => services
+                .mailroom
+                .snooze(
+                    &services.store,
+                    account,
+                    mailbox,
+                    &message.envelope,
+                    until.as_second(),
+                    asked_under,
+                )
+                .map_err(|e| e.to_string()),
+        };
+        if let Err(e) = sent {
+            let label = self.label(account).to_owned();
+            let what = match deferred {
+                Deferred::Move(_) => "move",
+                Deferred::Snooze(..) => "snooze",
+            };
+            self.notify(format!("{label}: couldn't {what} the message: {e}"));
+            self.moving.remove(key);
+            self.moved_for_undo(key, false);
+            self.reload();
+        }
+    }
+
+    /// Counts a read mark, or with `star` a star, asked of the server for `key`'s message.
+    fn asked(&mut self, key: &MessageKey, star: bool) {
+        *self.unanswered.entry((key.clone(), star)).or_default() += 1;
+    }
+
+    /// Stars the focused message, or takes its star away.
+    pub(crate) fn toggle_star(&mut self) {
+        let Some(m) = self.focused_message() else {
+            return;
+        };
+        let (key, flagged) = (message_key(m), m.envelope.flagged);
+        self.star(key, !flagged);
+    }
+
+    /// Stars a message, or takes its star away. It's shown so right away; the store catches up
+    /// once the server agrees. With `uid_validity`, as [`Mail::set_seen`]. Returns whether it
+    /// was asked of the server.
+    pub(crate) fn set_flagged(
+        &mut self,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        flagged: bool,
+        uid_validity: Option<u32>,
+    ) -> bool {
+        let Ok(services) = &self.services else {
+            return false;
+        };
+        if let Err(e) = services.mailroom.set_flagged(
+            &services.store,
+            account,
+            mailbox,
+            uid,
+            flagged,
+            uid_validity,
+        ) {
+            self.notify(e.to_string());
+            return false;
+        }
+        let key = (account.to_owned(), mailbox.to_owned(), uid);
+        self.asked(&key, true);
+        self.starring.insert(key, flagged);
+        if let Some(reader) = &mut self.reader
+            && reader.is(account, mailbox, uid)
+        {
+            reader.message.envelope.flagged = flagged;
+        }
+        if let Some(listed) = self
+            .messages
+            .iter_mut()
+            .find(|l| is_message(l, account, mailbox, uid))
+        {
+            listed.envelope.flagged = flagged;
+        }
+        self.search.set_flagged(account, mailbox, uid, flagged);
+        true
+    }
+
+    /// The server starred or unstarred a message, asked under `uid_validity`, or refused to,
+    /// which shows as the store says again; but not on a message its UID names since its
+    /// mailbox started over.
+    fn flagged(
+        &mut self,
+        key: &MessageKey,
+        uid_validity: u32,
+        flagged: bool,
+        result: Result<(), String>,
+    ) {
+        let (account, mailbox, uid) = (key.0.as_str(), key.1.as_str(), key.2);
+        // Answered: the store says what the server did. One star is on its way at a time.
+        self.starring.remove(key);
+        match result {
+            Ok(()) => self.changed_for_undo(key, true, Ok(flagged)),
+            Err(error) => {
+                self.changed_for_undo(key, true, Err(flagged));
+                let label = self.label(account).to_owned();
+                let what = if flagged { "star" } else { "unstar" };
+                self.notify(format!("{label}: couldn't {what} the message: {error}"));
+                if self.uid_validity(account, mailbox) == Some(uid_validity) {
+                    self.search.set_flagged(account, mailbox, uid, !flagged);
+                    if let Some(reader) = &mut self.reader
+                        && reader.is(account, mailbox, uid)
+                    {
+                        reader.message.envelope.flagged = !flagged;
+                    }
+                }
+            }
+        }
+        self.search.star_answered(account, mailbox, uid);
+        self.reload();
     }
 
     /// Marks a message read or unread. It's shown so right away; the store catches up once the
-    /// server agrees.
-    pub(crate) fn set_seen(&mut self, account: &str, mailbox: &str, uid: u32, seen: bool) {
-        let Ok(services) = &self.services else { return };
-        if let Err(e) = services
-            .mailroom
-            .set_seen(&services.store, account, mailbox, uid, seen)
+    /// server agrees. With `uid_validity`, the UIDVALIDITY the UID was known under, it's refused
+    /// if the mailbox started over since. Returns whether it was asked of the server.
+    pub(crate) fn set_seen(
+        &mut self,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        seen: bool,
+        uid_validity: Option<u32>,
+    ) -> bool {
+        // Asked for anew, a read mark waiting to follow an earlier one isn't wanted any more.
+        let key = (account.to_owned(), mailbox.to_owned(), uid);
+        self.read_later.remove(&key);
+        let Ok(services) = &self.services else {
+            return false;
+        };
+        if let Err(e) =
+            services
+                .mailroom
+                .set_seen(&services.store, account, mailbox, uid, seen, uid_validity)
         {
             self.notify(e.to_string());
-            return;
+            return false;
+        }
+        self.asked(&key, false);
+        if seen {
+            self.unreading.remove(&key);
+        } else {
+            self.unreading.insert(key);
         }
         if let Some(reader) = &mut self.reader
             && reader.is(account, mailbox, uid)
@@ -1149,6 +1963,7 @@ impl Mail {
             listed.envelope.seen = seen;
         }
         self.search.set_seen(account, mailbox, uid, seen);
+        true
     }
 
     /// Opens the menu of a message in the list at `point`, where it was right-clicked.
@@ -1159,6 +1974,7 @@ impl Mail {
         uid: u32,
         point: PointerPress,
     ) {
+        self.forget_go();
         self.message_menu = Some(MessageMenu {
             message: (account.to_owned(), mailbox.to_owned(), uid),
             point,
@@ -1169,6 +1985,8 @@ impl Mail {
 
     pub(crate) fn close_message_menu(&mut self) {
         self.message_menu = None;
+        // Escape in the menu doesn't reach the window: a G pressed before goes nowhere.
+        self.forget_go();
     }
 
     /// Shows or hides the message menu's "Move to" submenu.
@@ -1189,6 +2007,7 @@ impl Mail {
 
     /// Opens the menu of a mailbox in the sidebar at `point`, where it was right-clicked.
     pub(crate) fn open_mailbox_menu(&mut self, account: &str, mailbox: &str, point: PointerPress) {
+        self.forget_go();
         self.mailbox_menu = Some(MailboxMenu {
             mailbox: (account.to_owned(), mailbox.to_owned()),
             point,
@@ -1197,6 +2016,7 @@ impl Mail {
 
     pub(crate) fn close_mailbox_menu(&mut self) {
         self.mailbox_menu = None;
+        self.forget_go();
     }
 
     /// Marks every message in one of an account's mailboxes read, on the server too. It shows once
@@ -1215,6 +2035,8 @@ impl Mail {
             self.notify(format!("{label}: couldn't mark the mailbox as read: {e}"));
             return;
         }
+        // Z mustn't undo something done before this.
+        self.did(None);
         self.marking_seen.insert(key);
     }
 
@@ -1228,9 +2050,21 @@ impl Mail {
     /// Replies to a message, to its sender or everyone. It opens first, as the reply quotes it,
     /// and the reply starts once it's downloaded.
     pub(crate) fn reply_to(&mut self, account: &str, mailbox: &str, uid: u32, all: bool) {
+        let answer = if all { Answer::ReplyAll } else { Answer::Reply };
+        self.answer_message(account, mailbox, uid, answer);
+    }
+
+    /// Replies to or forwards a message, as [`Mail::reply_to`].
+    pub(crate) fn answer_message(
+        &mut self,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        answer: Answer,
+    ) {
         let open = self.reader.as_ref().filter(|r| r.is(account, mailbox, uid));
         match open.map(|r| &r.body) {
-            Some(Some(Ok(_))) => return self.reply(all),
+            Some(Some(Ok(_))) => return self.answer(answer),
             // Still downloading: it replies once that's done.
             Some(None) => {}
             _ => self.open_message(account, mailbox, uid),
@@ -1238,9 +2072,9 @@ impl Mail {
         let open = self.reader.as_ref().filter(|r| r.is(account, mailbox, uid));
         match open.map(|r| &r.body) {
             // Downloaded ahead, it opened at once.
-            Some(Some(Ok(_))) => self.reply(all),
+            Some(Some(Ok(_))) => self.answer(answer),
             Some(None) => {
-                self.pending_reply = Some(((account.to_owned(), mailbox.to_owned(), uid), all));
+                self.pending_reply = Some(((account.to_owned(), mailbox.to_owned(), uid), answer));
             }
             _ => {}
         }
@@ -1249,59 +2083,393 @@ impl Mail {
     /// Moves a message to another of its account's mailboxes. It leaves the list at once, and
     /// comes back if the server refuses.
     pub(crate) fn move_message(&mut self, account: &str, mailbox: &str, uid: u32, to: &str) {
+        let key = (account.to_owned(), mailbox.to_owned(), uid);
+        if self.moving_back(&key) {
+            return;
+        }
+        if self.pending(&key) {
+            let uid_validity = self.uid_validity(account, mailbox);
+            let deferred = (Deferred::Move(to.to_owned()), uid_validity);
+            self.deferred.insert(key.clone(), deferred);
+            self.undo_move(&key, to, None);
+            self.left_list(key);
+            return;
+        }
         let Ok(services) = &self.services else { return };
-        if let Err(e) = services
-            .mailroom
-            .move_message(&services.store, account, mailbox, uid, to)
+        if let Err(e) =
+            services
+                .mailroom
+                .move_message(&services.store, account, mailbox, uid, to, None)
         {
             let label = self.label(account).to_owned();
             self.notify(format!("{label}: couldn't move the message: {e}"));
             return;
         }
-        self.moving
-            .insert((account.to_owned(), mailbox.to_owned(), uid));
-        if self
-            .reader
-            .as_ref()
-            .is_some_and(|r| r.is(account, mailbox, uid))
-        {
+        let key = (account.to_owned(), mailbox.to_owned(), uid);
+        self.undo_move(&key, to, None);
+        self.left_list(key);
+    }
+
+    /// Moves the focused message to its account's mailbox with `role`: its Archive, Trash or Junk.
+    pub(crate) fn move_focused_to(&mut self, role: Role) {
+        let Some(m) = self.focused_message() else {
+            return;
+        };
+        let (account, mailbox, uid) = (m.account.clone(), m.mailbox.clone(), m.envelope.uid);
+        let Some(to) = self
+            .mailbox_with_role(&account, role)
+            .map(|b| b.name.clone())
+        else {
+            return;
+        };
+        if to != mailbox {
+            self.move_message(&account, &mailbox, uid, &to);
+        }
+    }
+
+    /// What Z will undo once the message `from` names has been moved to `to`, or snoozed until
+    /// `snoozed`: moving it back, if it has a Message-ID to find it by; otherwise nothing, as
+    /// what it would have undone isn't the last thing done any more.
+    pub(crate) fn undo_move(&mut self, from: &MessageKey, to: &str, snoozed: Option<i64>) {
+        let message_id = self
+            .find_message(from)
+            .and_then(|m| m.envelope.message_id.clone())
+            .filter(|id| postden_app::is_searchable(id));
+        self.did(message_id.map(|message_id| Undo::Moved {
+            from: from.clone(),
+            to: to.to_owned(),
+            message_id,
+            snoozed,
+            done: false,
+        }));
+    }
+
+    /// The server answered the move of the message `key` named: moved, Z can move it back; not,
+    /// there's nothing to undo. Returns whether Z undoes it.
+    pub(crate) fn moved_for_undo(&mut self, key: &MessageKey, moved: bool) -> bool {
+        let Some(Undo::Moved { from, done, .. }) = &mut self.undo else {
+            return false;
+        };
+        if from != key {
+            return false;
+        }
+        if moved {
+            *done = true;
+        } else {
+            self.undo = None;
+        }
+        moved
+    }
+
+    /// Undoes the last thing done to a message, as Z does: moves it back, marks it read or unread
+    /// again, or gives back or takes away its star.
+    pub(crate) fn undo(&mut self) {
+        let Some(undo) = self.undo.clone() else {
+            return;
+        };
+        match undo {
+            Undo::Moved { done: false, .. } => {
+                self.notify("Still moving the message; undo once it's moved".into());
+            }
+            Undo::Seen { done: false, .. } | Undo::Flagged { done: false, .. } => {
+                self.notify("Still waiting for the server; undo once it's answered".into());
+            }
+            Undo::Moved {
+                from,
+                to,
+                message_id,
+                snoozed,
+                done: true,
+            } => {
+                let (account, mailbox, _) = &from;
+                // A change to its copy there still on its way, or a move of it waiting for one,
+                // would be lost once it's moved: whichever message of that mailbox it's to.
+                let busy = |key: &MessageKey| key.0 == *account && key.1 == to;
+                if self.unanswered.keys().any(|(key, _)| busy(key))
+                    || self.deferred.keys().any(busy)
+                {
+                    self.notify("Still waiting for the server about a message there".into());
+                    return;
+                }
+                let Ok(services) = &self.services else { return };
+                if let Err(e) =
+                    services
+                        .mailroom
+                        .restore(account, &to, &message_id, mailbox, snoozed)
+                {
+                    let label = self.label(account).to_owned();
+                    self.notify(format!("{label}: couldn't move the message back: {e}"));
+                    return;
+                }
+                self.undoing.extend(self.undo.take());
+                self.leaving.push(Restoring {
+                    account: account.clone(),
+                    mailbox: to,
+                    message_id: message_id.clone(),
+                });
+                let restoring = Restoring {
+                    account: account.clone(),
+                    mailbox: mailbox.clone(),
+                    message_id,
+                };
+                // Only mail arriving in an inbox is announced.
+                if self
+                    .mailbox_with_role(account, Role::Inbox)
+                    .is_some_and(|b| b.name == *mailbox)
+                {
+                    self.returning.push(restoring.clone());
+                }
+                self.restoring = Some(restoring);
+                let back = self.mailbox_label(account, mailbox);
+                self.notify(format!("Moving the message back to {back}…"));
+            }
+            Undo::Seen {
+                message,
+                uid_validity,
+                seen,
+                ..
+            } => {
+                if self.still_saving(&message, false) {
+                    return;
+                }
+                self.undo = None;
+                if self.still_there(&message, uid_validity) {
+                    let (account, mailbox, uid) = (&message.0, &message.1, message.2);
+                    self.set_seen(account, mailbox, uid, seen, Some(uid_validity));
+                }
+            }
+            Undo::Flagged {
+                message,
+                uid_validity,
+                flagged,
+                ..
+            } => {
+                if self.still_saving(&message, true) {
+                    return;
+                }
+                self.undo = None;
+                if self.still_there(&message, uid_validity) {
+                    let (account, mailbox, uid) = (&message.0, &message.1, message.2);
+                    self.set_flagged(account, mailbox, uid, flagged, Some(uid_validity));
+                }
+            }
+        }
+    }
+
+    /// Whether the mailbox of the message `key` names is still cached under `uid_validity`, so
+    /// its UID still names it; if not, a notice says it can't be undone.
+    fn still_there(&mut self, key: &MessageKey, uid_validity: u32) -> bool {
+        if self.uid_validity(&key.0, &key.1) == Some(uid_validity) {
+            return true;
+        }
+        let name = self.mailbox_label(&key.0, &key.1);
+        self.notify(format!(
+            "{name} changed on the server, so this can't be undone"
+        ));
+        false
+    }
+
+    /// What Z undoes, as the palette offers it.
+    pub(crate) fn undo_title(&self) -> String {
+        match &self.undo {
+            Some(Undo::Moved {
+                snoozed: Some(_), ..
+            }) => "Undo snooze".into(),
+            Some(Undo::Moved { from, to, .. }) => {
+                format!("Undo move to {}", self.mailbox_label(&from.0, to))
+            }
+            Some(Undo::Seen { seen: true, .. }) => "Undo mark as unread".into(),
+            Some(Undo::Seen { .. }) => "Undo mark as read".into(),
+            Some(Undo::Flagged { flagged: true, .. }) => "Undo remove star".into(),
+            Some(Undo::Flagged { .. }) | None => "Undo star".into(),
+        }
+    }
+
+    /// The server marked a message read or unread, starred or unstarred it, or moved it back,
+    /// or refused to.
+    fn message_changed(&mut self, update: Update) {
+        match update {
+            Update::Seen {
+                account,
+                mailbox,
+                uid,
+                seen,
+            } => {
+                self.search.settle(&account, &mailbox, uid, Some(seen));
+                self.changed_for_undo(&(account, mailbox, uid), false, Ok(seen));
+                self.reload();
+            }
+            Update::SeenFailed {
+                account,
+                mailbox,
+                uid,
+                seen,
+                error,
+            } => {
+                let key = (account, mailbox, uid);
+                self.changed_for_undo(&key, false, Err(seen));
+                self.seen_failed(&key.0, &key.1, uid, &error);
+            }
+            Update::FlagsChanged { account, mailbox } => {
+                self.reader_flags_changed(&account, &mailbox);
+                self.reload();
+            }
+            Update::Flagged {
+                account,
+                mailbox,
+                uid_validity,
+                uid,
+                flagged,
+                result,
+            } => {
+                let key = (account, mailbox, uid);
+                self.flagged(&key, uid_validity, flagged, result);
+            }
+            Update::Restored {
+                account,
+                mailbox,
+                message_id,
+                uids,
+                to,
+                result,
+            } => {
+                let back = Restoring {
+                    account,
+                    mailbox: to,
+                    message_id,
+                };
+                self.restored(&back, &mailbox, &uids, result);
+            }
+            _ => {}
+        }
+    }
+
+    /// The server moved the message `back` names from `mailbox`, where it had `uids`, back where
+    /// it was, as asked by [`Mail::undo`], or refused to.
+    fn restored(
+        &mut self,
+        back: &Restoring,
+        mailbox: &str,
+        uids: &[u32],
+        result: Result<bool, String>,
+    ) {
+        let account = back.account.as_str();
+        for &uid in uids {
+            self.search.forget_message(account, mailbox, uid);
+        }
+        self.leaving.retain(|r| {
+            !(r.account == back.account && r.mailbox == mailbox && r.message_id == back.message_id)
+        });
+        // Its copy there is gone: one open, or under the cursor, isn't shown any more.
+        let left = |a: &str, m: &str, uid: u32| a == account && m == mailbox && uids.contains(&uid);
+        if self.reader.as_ref().is_some_and(|r| {
+            left(
+                &r.message.account,
+                &r.message.mailbox,
+                r.message.envelope.uid,
+            )
+        }) {
             self.reader = None;
         }
+        if self.cursor.as_ref().is_some_and(|c| left(&c.0, &c.1, c.2)) {
+            self.cursor = None;
+        }
+        let undone = self
+            .undoing
+            .extract_if(.., |u| {
+                matches!(u, Undo::Moved { from, message_id, .. }
+                    if from.0 == back.account && from.1 == back.mailbox
+                        && *message_id == back.message_id)
+            })
+            .next();
+        let to = self.mailbox_label(account, &back.mailbox);
+        let from = self.mailbox_label(account, mailbox);
+        match result {
+            Ok(true) => self.notify(format!("Moved back to {to}")),
+            Ok(false) => {
+                self.forget_restoring(back);
+                self.notify(format!("The message is no longer in {from}"));
+            }
+            Err(error) => {
+                self.forget_restoring(back);
+                // Z tries again, unless something else was done since.
+                if self.undo.is_none() {
+                    self.undo = undone;
+                }
+                let label = self.label(account).to_owned();
+                self.notify(format!(
+                    "{label}: couldn't move the message back to {to}: {error}"
+                ));
+            }
+        }
         self.reload();
+    }
+
+    /// Forgets a message being moved back, which won't arrive.
+    fn forget_restoring(&mut self, back: &Restoring) {
+        self.returning.retain(|r| r != back);
+        if self.restoring.as_ref() == Some(back) {
+            self.restoring = None;
+        }
+    }
+
+    /// Puts the list's cursor on a message moved back by undoing, once the list shows it.
+    fn follow_restored(&mut self, tx: &mut Tx) {
+        let Some(r) = &self.restoring else {
+            return;
+        };
+        let found = self
+            .shown()
+            .find(|m| {
+                m.account == r.account
+                    && m.mailbox == r.mailbox
+                    && m.envelope.message_id.as_deref() == Some(&r.message_id)
+            })
+            .map(message_key);
+        if let Some(key) = found {
+            tx.scroll_into_view(row_key(&key));
+            if self.reader.is_none() {
+                self.cursor = Some(key);
+            }
+            self.restoring = None;
+        }
     }
 
     /// Snoozes a message until `until`: it leaves the list at once, as when moved, and comes back
     /// to the inbox unread once it's due.
     pub(crate) fn snooze_message(&mut self, message: &StoredMessage, until: Timestamp) {
-        let (account, mailbox, uid) = (
-            message.account.as_str(),
-            message.mailbox.as_str(),
-            message.envelope.uid,
-        );
-        let message_id = message.envelope.message_id.as_deref();
+        let (account, mailbox) = (message.account.as_str(), message.mailbox.as_str());
+        let key = message_key(message);
+        if self.moving_back(&key) {
+            return;
+        }
+        let to = self
+            .mailbox_with_role(account, Role::Snoozed)
+            .map_or(postden_mail::imap::SNOOZED_NAME, |b| b.name.as_str())
+            .to_owned();
+        if self.pending(&key) {
+            let deferred = Deferred::Snooze(Box::new(message.clone()), until);
+            let uid_validity = self.uid_validity(account, mailbox);
+            self.deferred.insert(key.clone(), (deferred, uid_validity));
+            self.undo_move(&key, &to, Some(until.as_second()));
+            self.left_list(key);
+            return;
+        }
         let Ok(services) = &self.services else { return };
         if let Err(e) = services.mailroom.snooze(
             &services.store,
             account,
             mailbox,
-            uid,
-            message_id,
+            &message.envelope,
             until.as_second(),
+            None,
         ) {
             let label = self.label(account).to_owned();
             self.notify(format!("{label}: couldn't snooze the message: {e}"));
             return;
         }
-        self.moving
-            .insert((account.to_owned(), mailbox.to_owned(), uid));
-        if self
-            .reader
-            .as_ref()
-            .is_some_and(|r| r.is(account, mailbox, uid))
-        {
-            self.reader = None;
-        }
-        self.reload();
+        self.undo_move(&key, &to, Some(until.as_second()));
+        self.left_list(key);
     }
 
     /// The server moved a message asked for with [`Mail::snooze_message`] to its Snoozed mailbox,
@@ -1333,8 +2501,9 @@ impl Mail {
             return;
         };
         let (account, mailbox) = (account.as_str(), mailbox.as_str());
-        self.moving
-            .remove(&(account.to_owned(), mailbox.to_owned(), uid));
+        let key = (account.to_owned(), mailbox.to_owned(), uid);
+        self.moving.remove(&key);
+        let undoable = self.moved_for_undo(&key, result.is_ok());
         match result {
             Ok(current) => {
                 if current {
@@ -1342,8 +2511,9 @@ impl Mail {
                 }
                 let until = Timestamp::from_second(until).unwrap_or_default();
                 self.notify(format!(
-                    "Snoozed until {}",
-                    postden_app::format_snooze(until, &Zoned::now())
+                    "Snoozed until {}{}",
+                    postden_app::format_snooze(until, &Zoned::now()),
+                    undo_hint(undoable)
                 ));
             }
             Err(error) => {
@@ -1364,7 +2534,7 @@ impl Mail {
     }
 
     /// The name to show for one of the account's mailboxes.
-    fn mailbox_label(&self, account: &str, name: &str) -> String {
+    pub(crate) fn mailbox_label(&self, account: &str, name: &str) -> String {
         self.mailboxes
             .get(account)
             .and_then(|list| list.iter().find(|m| m.name == name))
@@ -1398,7 +2568,34 @@ impl Mail {
 
     /// Mail was saved in an inbox, `count` messages of which `unread` are new and unread: the
     /// notice says so, the list shows it, and a system notification announces it.
-    fn inbox_mail(&mut self, target: Target, count: usize, first_sync: bool, unread: &[Envelope]) {
+    fn inbox_mail(
+        &mut self,
+        target: Target,
+        count: usize,
+        first_sync: bool,
+        unread: &[Envelope],
+        message_ids: &[String],
+    ) {
+        // Messages moved back by undoing aren't new.
+        let mut unread = unread.to_vec();
+        let back: Vec<Restoring> = self
+            .returning
+            .extract_if(.., |r| {
+                r.account == target.account
+                    && r.mailbox == target.mailbox
+                    && message_ids.contains(&r.message_id)
+            })
+            .collect();
+        unread.retain(|e| {
+            !back
+                .iter()
+                .any(|r| e.message_id.as_ref() == Some(&r.message_id))
+        });
+        let count = count.saturating_sub(back.len());
+        self.reload();
+        if !back.is_empty() && count == 0 && !first_sync {
+            return;
+        }
         let label = self.label(&target.account).to_owned();
         self.notify(postden_app::mail_notice(
             &label,
@@ -1406,8 +2603,7 @@ impl Mail {
             first_sync,
             &Zoned::now(),
         ));
-        self.reload();
-        self.announce(&label, target, unread);
+        self.announce(&label, target, &unread);
     }
 
     /// Tells the user about mail that arrived unread in an inbox with a system notification,
@@ -1449,6 +2645,8 @@ impl Mail {
         if self.compose.open {
             return;
         }
+        // What the palette offered was for what the window showed, which this replaces.
+        self.close_palette();
         self.clear_search();
         let showing = if self.showing == ALL_INBOXES {
             ALL_INBOXES.clone()
@@ -1507,6 +2705,8 @@ impl Mail {
     /// Lists `showing`. A mailbox other than an inbox is also refreshed from the server, as those
     /// are otherwise only synced every few minutes.
     pub(crate) fn show(&mut self, showing: Showing) {
+        // A message being moved back no longer takes the cursor once it's listed.
+        self.restoring = None;
         self.form.open = false;
         self.settings_open = false;
         self.reader = None;
@@ -2537,11 +3737,22 @@ impl Mail {
                     a.latest.version
                 ));
             }
+        } else if manual && !self.updates_shown() {
+            // Asked for, its result shows somewhere: up to date, or why it failed.
+            let status = self.updater.status();
+            self.notify(status);
         }
         // A day after the last check, whichever started it; this replaces any timer running.
         if self.settings.check_updates {
             self.schedule_update_check(UPDATE_CHECK_EVERY);
         }
+    }
+
+    /// Whether the settings' updates are on screen, where a check's result shows.
+    fn updates_shown(&self) -> bool {
+        self.settings_open
+            && !self.account_settings.open
+            && self.settings_section == SettingsSection::General
     }
 
     /// Shows the announcement of the update found, with its changelog.
@@ -2654,6 +3865,28 @@ impl Mail {
     /// Stops showing account `id`'s mail, removed or now on another server or user, whose UIDs
     /// name other messages: its open message and menus, and what a server search found.
     fn forget_mail_of(&mut self, id: &str) {
+        if self.undo.as_ref().is_some_and(|u| u.account() == id) {
+            self.undo = None;
+        }
+        self.undoing.retain(|u| u.account() != id);
+        self.unanswered.retain(|(key, _), _| key.0 != id);
+        self.read_later.retain(|key, _| key.0 != id);
+        self.starring.retain(|key, _| key.0 != id);
+        self.unreading.retain(|key| key.0 != id);
+        self.leaving.retain(|r| r.account != id);
+        let dropped: Vec<MessageKey> = self
+            .deferred
+            .extract_if(|key, _| key.0 == id)
+            .map(|(key, _)| key)
+            .collect();
+        // No move of theirs will be answered to list them again.
+        for key in dropped {
+            self.moving.remove(&key);
+        }
+        self.returning.retain(|r| r.account != id);
+        if self.restoring.as_ref().is_some_and(|r| r.account == id) {
+            self.restoring = None;
+        }
         if self.showing.account() == Some(id) {
             self.showing = Showing::All(Role::Inbox);
         }
@@ -2682,6 +3915,18 @@ impl Mail {
             self.mailbox_menu = None;
         }
     }
+}
+
+/// A message's place in the store: its account, mailbox and UID.
+pub(crate) fn message_key(m: &StoredMessage) -> MessageKey {
+    (m.account.clone(), m.mailbox.clone(), m.envelope.uid)
+}
+
+/// The key of a message's row in the list. Hashed, as a mailbox's name can hold any character.
+pub(crate) fn row_key(key: &MessageKey) -> String {
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(key, &mut hasher);
+    format!("msg-{:016x}", std::hash::Hasher::finish(&hasher))
 }
 
 #[cfg(test)]
@@ -2768,5 +4013,509 @@ mod tests {
         s.close_account_settings();
         assert!(s.settings_open);
         assert_eq!(s.settings_section, SettingsSection::Accounts);
+    }
+
+    #[test]
+    fn a_check_for_updates_asked_where_its_result_cant_show_says_it_in_a_notice() {
+        let mut s = Mail::not_started();
+        s.updater.phase = Phase::Checking { manual: true };
+        s.update_checked(Ok(None));
+        assert!(
+            s.notice
+                .as_deref()
+                .is_some_and(|n| n.starts_with("Postden is up to date")),
+            "got {:?}",
+            s.notice
+        );
+        // With the updates on screen, they say it themselves.
+        s.dismiss_notice();
+        s.open_settings();
+        s.updater.phase = Phase::Checking { manual: true };
+        s.update_checked(Ok(None));
+        assert_eq!(s.notice, None);
+    }
+
+    fn ada(uid: u32) -> MessageKey {
+        ("ada@example.com".into(), "INBOX".into(), uid)
+    }
+
+    #[test]
+    fn a_star_is_undone_only_once_the_server_starred_it_and_its_uid_still_names_it() {
+        let mut s = Mail::not_started();
+        s.undo = Some(Undo::Flagged {
+            message: ada(1),
+            uid_validity: 7,
+            flagged: false,
+            done: false,
+        });
+        s.undo();
+        assert!(matches!(s.undo, Some(Undo::Flagged { done: false, .. })));
+        assert!(
+            s.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("Still waiting"))
+        );
+        // Being marked read, another message starred, or one of two stars answered, isn't it.
+        s.asked(&ada(1), true);
+        s.asked(&ada(1), true);
+        s.changed_for_undo(&ada(1), false, Ok(true));
+        s.changed_for_undo(&ada(2), true, Ok(true));
+        s.changed_for_undo(&ada(1), true, Ok(false));
+        assert!(matches!(s.undo, Some(Undo::Flagged { done: false, .. })));
+        s.changed_for_undo(&ada(1), true, Ok(true));
+        assert!(matches!(s.undo, Some(Undo::Flagged { done: true, .. })));
+        // The mailbox isn't cached under UIDVALIDITY 7 any more: UID 1 may be another message.
+        s.undo();
+        assert_eq!(s.undo, None);
+        assert!(
+            s.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("can't be undone"))
+        );
+    }
+
+    #[test]
+    fn a_star_pressed_again_and_again_is_undone_once_every_one_is_answered() {
+        let mut s = Mail::not_started();
+        // S three times: star, unstar, star; Z is to unstar.
+        for _ in 0..3 {
+            s.asked(&ada(1), true);
+        }
+        s.undo = Some(Undo::Flagged {
+            message: ada(1),
+            uid_validity: 7,
+            flagged: false,
+            done: false,
+        });
+        s.changed_for_undo(&ada(1), true, Ok(true));
+        s.changed_for_undo(&ada(1), true, Ok(false));
+        assert!(
+            matches!(s.undo, Some(Undo::Flagged { done: false, .. })),
+            "the last star isn't answered yet"
+        );
+        s.changed_for_undo(&ada(1), true, Ok(true));
+        assert!(matches!(s.undo, Some(Undo::Flagged { done: true, .. })));
+        assert!(s.unanswered.is_empty());
+    }
+
+    #[test]
+    fn a_star_waits_for_the_last_one_to_be_answered() {
+        let mut s = Mail::not_started();
+        s.asked(&ada(1), true);
+        s.star(ada(1), false);
+        assert_eq!(
+            s.unanswered.get(&(ada(1), true)),
+            Some(&1),
+            "not asked again"
+        );
+        assert!(
+            s.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("Still waiting"))
+        );
+    }
+
+    #[test]
+    fn a_failed_move_back_isnt_undone_again_once_something_else_was_done() {
+        let mut s = Mail::not_started();
+        let back = Restoring {
+            account: "ada@example.com".into(),
+            mailbox: "INBOX".into(),
+            message_id: "a@example.com".into(),
+        };
+        s.undoing = vec![Undo::Moved {
+            from: ada(1),
+            to: "Archive".into(),
+            message_id: "a@example.com".into(),
+            snoozed: None,
+            done: true,
+        }];
+        // Something else done, such as marking a mailbox read.
+        s.did(None);
+        s.restored(&back, "Archive", &[], Err("offline".into()));
+        assert_eq!(s.undo, None, "Z mustn't reach past marking all read");
+    }
+
+    #[test]
+    fn a_move_waits_for_a_change_to_its_message_on_its_way() {
+        let mut s = Mail::not_started();
+        s.asked(&ada(2), false);
+        s.move_message("ada@example.com", "INBOX", 2, "Archive");
+        // A read mark asked for under UID 2 would be lost once it's moved: it leaves the list,
+        // and goes once that's answered.
+        assert!(
+            matches!(s.deferred.get(&ada(2)), Some((Deferred::Move(to), _)) if to == "Archive")
+        );
+        assert!(s.moving.contains(&ada(2)));
+        s.answered(&ada(2), false);
+        assert!(s.deferred.is_empty(), "sent");
+        // Without the services, sending it fails: it's listed where it was again.
+        assert!(!s.moving.contains(&ada(2)));
+    }
+
+    #[test]
+    fn something_else_done_stops_following_a_message_moved_back_but_not_hiding_it() {
+        let mut s = Mail::not_started();
+        let back = Restoring {
+            account: "ada@example.com".into(),
+            mailbox: "INBOX".into(),
+            message_id: "a@example.com".into(),
+        };
+        s.restoring = Some(back.clone());
+        s.returning = vec![back.clone()];
+        s.did(None);
+        assert_eq!(s.restoring, None);
+        assert_eq!(s.returning, vec![back]);
+    }
+
+    #[test]
+    fn a_message_being_moved_back_isnt_changed_and_its_copy_closes_once_moved() {
+        let mut s = Mail::not_started();
+        let archived = StoredMessage {
+            account: "ada@example.com".into(),
+            mailbox: "Archive".into(),
+            envelope: Envelope {
+                uid: 3,
+                message_id: Some("a@example.com".into()),
+                from: postden_core::message::Address::default(),
+                to: Vec::new(),
+                subject: None,
+                date: None,
+                seen: true,
+                flagged: false,
+            },
+        };
+        s.reader = Some(Reader {
+            message: archived.clone(),
+            body: None,
+            markdown: None,
+            uid_validity: Some(1),
+        });
+        s.leaving = vec![Restoring {
+            account: "ada@example.com".into(),
+            mailbox: "Archive".into(),
+            message_id: "a@example.com".into(),
+        }];
+        let key = message_key(&archived);
+        s.star(key, true);
+        assert!(
+            s.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("being moved back"))
+        );
+        let back = Restoring {
+            account: "ada@example.com".into(),
+            mailbox: "INBOX".into(),
+            message_id: "a@example.com".into(),
+        };
+        s.restored(&back, "Archive", &[3], Ok(true));
+        assert!(s.reader.is_none(), "its copy in Archive is gone");
+        assert_eq!(s.leaving, vec![]);
+    }
+
+    #[test]
+    fn a_move_isnt_undone_while_a_change_in_the_mailbox_it_leaves_is_on_its_way() {
+        let mut s = Mail::not_started();
+        s.undo = Some(Undo::Moved {
+            from: ada(1),
+            to: "Archive".into(),
+            message_id: "a@example.com".into(),
+            snoozed: None,
+            done: true,
+        });
+        // Opened there, its read mark is on its way, whatever the window shows now.
+        s.asked(&("ada@example.com".into(), "Archive".into(), 9), false);
+        s.undo();
+        assert!(
+            s.undo.is_some(),
+            "Z can be pressed again once it's answered"
+        );
+        assert!(
+            s.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("Still waiting"))
+        );
+    }
+
+    #[test]
+    fn a_u_is_undoable_once_a_download_started_after_it_is_answered() {
+        let mut s = Mail::not_started();
+        // U, then the message opened again: its download marks it read too.
+        s.asked(&ada(1), false);
+        s.asked(&ada(1), false);
+        s.undo = Some(Undo::Seen {
+            message: ada(1),
+            uid_validity: 7,
+            seen: true,
+            done: false,
+        });
+        s.changed_for_undo(&ada(1), false, Ok(false));
+        assert!(matches!(s.undo, Some(Undo::Seen { done: false, .. })));
+        s.read_later.insert(ada(1), Some(1));
+        s.opened(&ada(1), 1, Err("offline".into()), &mut Tx::default());
+        assert!(matches!(s.undo, Some(Undo::Seen { done: true, .. })));
+        assert!(
+            s.read_later.is_empty(),
+            "not downloaded, it isn't read either"
+        );
+    }
+
+    #[test]
+    fn a_removed_account_lists_its_waiting_moves_again() {
+        let mut s = Mail::not_started();
+        let waiting = (Deferred::Move("Archive".into()), Some(1));
+        s.deferred.insert(ada(1), waiting);
+        s.moving.insert(ada(1));
+        s.forget_mail_of("ada@example.com");
+        assert!(!s.moving.contains(&ada(1)));
+        assert!(s.deferred.is_empty());
+    }
+
+    fn open(s: &mut Mail, mailbox: &str, uid: u32, seen: bool) {
+        s.reader = Some(Reader {
+            message: StoredMessage {
+                account: "ada@example.com".into(),
+                mailbox: mailbox.into(),
+                envelope: Envelope {
+                    uid,
+                    message_id: None,
+                    from: postden_core::message::Address::default(),
+                    to: Vec::new(),
+                    subject: None,
+                    date: None,
+                    seen,
+                    flagged: false,
+                },
+            },
+            body: None,
+            markdown: None,
+            uid_validity: Some(1),
+        });
+    }
+
+    #[test]
+    fn a_download_from_before_a_mailbox_started_over_isnt_shown_for_the_message_open_now() {
+        let mut s = Mail::not_started();
+        open(&mut s, "INBOX", 1, true);
+        if let Some(reader) = &mut s.reader {
+            reader.uid_validity = Some(2);
+        }
+        s.pending_reply = Some((ada(1), Answer::Forward));
+        s.opened(&ada(1), 1, Ok(Body::default()), &mut Tx::default());
+        let reader = s.reader.as_ref().unwrap();
+        assert!(reader.body.is_none(), "still waiting for its own download");
+        assert!(s.pending_reply.is_some(), "the forward waits for it too");
+        s.opened(&ada(1), 2, Ok(Body::default()), &mut Tx::default());
+        assert!(s.reader.as_ref().unwrap().body.is_some());
+    }
+
+    #[test]
+    fn a_star_refused_after_its_mailbox_started_over_leaves_the_message_found_now_be() {
+        let mut s = Mail::not_started();
+        // Found by searching the server after INBOX started over: UID 1 is another message,
+        // starred, and isn't cached (the store has no UIDVALIDITY to match the old star's).
+        let found = StoredMessage {
+            account: "ada@example.com".into(),
+            mailbox: "INBOX".into(),
+            envelope: Envelope {
+                uid: 1,
+                message_id: None,
+                from: postden_core::message::Address::default(),
+                to: Vec::new(),
+                subject: None,
+                date: None,
+                seen: true,
+                flagged: true,
+            },
+        };
+        s.search.found.push(found);
+        s.asked(&ada(1), true);
+        s.flagged(&ada(1), 1, true, Err("INBOX changed on the server".into()));
+        assert!(
+            s.search.found[0].envelope.flagged,
+            "not the message starred"
+        );
+    }
+
+    #[test]
+    fn a_mailbox_starting_over_closes_its_open_message_only() {
+        let mut s = Mail::not_started();
+        let started_over = |mailbox: &str| Update::Mail {
+            account: "ada@example.com".into(),
+            mailbox: mailbox.into(),
+            role: Role::Other,
+            count: 0,
+            first_sync: true,
+            uid_validity: 2,
+            unread: Vec::new(),
+            message_ids: Vec::new(),
+        };
+        open(&mut s, "Work", 5, true);
+        s.pending_reply = Some((("ada@example.com".into(), "Work".into(), 5), Answer::Reply));
+        let work = ("ada@example.com".to_owned(), "Work".to_owned(), 5);
+        s.starring.insert(work.clone(), true);
+        s.apply(started_over("Receipts"), &mut Tx::default());
+        assert!(s.reader.is_some(), "another mailbox started over");
+        assert!(s.starring.contains_key(&work));
+        s.apply(started_over("Work"), &mut Tx::default());
+        assert!(s.reader.is_none(), "UID 5 may name another message now");
+        assert!(s.pending_reply.is_none());
+        assert!(
+            s.starring.is_empty(),
+            "a star on its way isn't shown on the message UID 5 names now"
+        );
+    }
+
+    #[test]
+    fn a_message_opened_while_u_is_on_its_way_is_marked_read_once_nothing_is_awaited() {
+        let mut s = Mail::not_started();
+        // Opened, and closed again, while U and a star were on their way.
+        s.asked(&ada(1), false);
+        s.asked(&ada(1), true);
+        s.read_later.insert(ada(1), Some(1));
+        s.answered(&ada(1), false);
+        assert!(
+            s.read_later.contains_key(&ada(1)),
+            "the star is still awaited"
+        );
+        s.answered(&ada(1), true);
+        assert!(s.read_later.is_empty(), "asked for then");
+    }
+
+    #[test]
+    fn a_read_mark_asked_anew_replaces_one_waiting_to_follow() {
+        let mut s = Mail::not_started();
+        s.read_later.insert(ada(1), Some(1));
+        s.mark_seen(ada(1), false);
+        assert!(s.read_later.is_empty(), "U again is the last word");
+    }
+
+    #[test]
+    fn a_message_reopened_while_its_own_read_mark_is_on_its_way_isnt_marked_again() {
+        let mut s = Mail::not_started();
+        s.asked(&ada(1), false);
+        s.messages.push(StoredMessage {
+            account: "ada@example.com".into(),
+            mailbox: "INBOX".into(),
+            envelope: Envelope {
+                uid: 1,
+                message_id: None,
+                from: postden_core::message::Address::default(),
+                to: Vec::new(),
+                subject: None,
+                date: None,
+                seen: true,
+                flagged: false,
+            },
+        });
+        s.open_message("ada@example.com", "INBOX", 1);
+        assert!(s.read_later.is_empty(), "it's being marked read already");
+        s.unreading.insert(ada(1));
+        s.open_message("ada@example.com", "INBOX", 1);
+        assert!(
+            s.read_later.contains_key(&ada(1)),
+            "after U, it's marked read again"
+        );
+    }
+
+    #[test]
+    fn a_refused_change_leaves_nothing_to_undo() {
+        let mut s = Mail::not_started();
+        // U marked it unread; Z marks it read again.
+        s.undo = Some(Undo::Seen {
+            message: ada(1),
+            uid_validity: 7,
+            seen: true,
+            done: false,
+        });
+        s.changed_for_undo(&ada(1), true, Err(true));
+        assert!(s.undo.is_some(), "a star refused isn't the read mark");
+        s.asked(&ada(1), false);
+        s.asked(&ada(1), false);
+        // A read mark refused the other way isn't the one undone, so the undo stays.
+        s.changed_for_undo(&ada(1), false, Err(true));
+        assert!(matches!(s.undo, Some(Undo::Seen { done: false, .. })));
+        s.changed_for_undo(&ada(1), false, Err(false));
+        assert_eq!(s.undo, None, "the U itself refused");
+    }
+
+    #[test]
+    fn a_move_back_that_failed_can_be_undone_again_and_only_its_own() {
+        let mut s = Mail::not_started();
+        let moved = |uid, id: &str| Undo::Moved {
+            from: ada(uid),
+            to: "Archive".into(),
+            message_id: id.into(),
+            snoozed: None,
+            done: true,
+        };
+        let back = |id: &str| Restoring {
+            account: "ada@example.com".into(),
+            mailbox: "INBOX".into(),
+            message_id: id.into(),
+        };
+        // A and B are both being moved back.
+        s.undoing = vec![moved(1, "a@example.com"), moved(2, "b@example.com")];
+        s.returning = vec![back("a@example.com"), back("b@example.com")];
+        s.restored(
+            &back("a@example.com"),
+            "Archive",
+            &[],
+            Err("offline".into()),
+        );
+        assert_eq!(s.undo, Some(moved(1, "a@example.com")), "A, not B");
+        assert_eq!(s.undoing, vec![moved(2, "b@example.com")]);
+        assert_eq!(s.returning, vec![back("b@example.com")]);
+        // B back, its own move is done with; Z still undoes A's.
+        s.restored(&back("b@example.com"), "Archive", &[5], Ok(true));
+        assert_eq!(s.undoing, vec![]);
+        assert_eq!(s.undo, Some(moved(1, "a@example.com")));
+        // Something else done meanwhile is what Z undoes then.
+        s.undoing = vec![moved(1, "a@example.com")];
+        s.undo = Some(Undo::Seen {
+            message: ada(2),
+            uid_validity: 1,
+            seen: true,
+            done: true,
+        });
+        s.restored(
+            &back("a@example.com"),
+            "Archive",
+            &[],
+            Err("offline".into()),
+        );
+        assert!(matches!(s.undo, Some(Undo::Seen { .. })));
+    }
+
+    #[test]
+    fn a_message_moved_back_isnt_announced_as_new_mail() {
+        let mut s = Mail::not_started();
+        let back = |id: &str| Restoring {
+            account: "ada@example.com".into(),
+            mailbox: "INBOX".into(),
+            message_id: id.into(),
+        };
+        s.returning = vec![back("m@example.com")];
+        let target = || Target {
+            account: "ada@example.com".into(),
+            mailbox: "INBOX".into(),
+            uid_validity: 1,
+            uid: None,
+        };
+        // New mail saved before it isn't taken for it.
+        s.inbox_mail(target(), 1, false, &[], &["n@example.com".into()]);
+        assert!(
+            s.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("1 new message"))
+        );
+        assert_eq!(s.returning, vec![back("m@example.com")]);
+        s.dismiss_notice();
+        s.inbox_mail(target(), 1, false, &[], &["m@example.com".into()]);
+        assert_eq!(s.notice, None, "it isn't new");
+        assert_eq!(s.returning, vec![]);
+        // Arriving again later, as when moved back by hand, it's new.
+        s.inbox_mail(target(), 1, false, &[], &["m@example.com".into()]);
+        assert!(s.notice.is_some());
     }
 }

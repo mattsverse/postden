@@ -69,7 +69,7 @@ pub(crate) struct ComposeForm {
     pub(crate) signature_preview: Preview,
     /// The features the signature's markup uses, found once.
     signature_features: BTreeSet<String>,
-    /// The message replied to, quoted below.
+    /// The message replied to, or forwarded, quoted below.
     pub(crate) quote: Option<Quote>,
     /// The features the quote's markup uses, found once.
     quote_features: BTreeSet<String>,
@@ -82,6 +82,8 @@ pub(crate) struct ComposeForm {
     pub(crate) expanded: Expanded,
     in_reply_to: Option<String>,
     references: Vec<String>,
+    /// It passes on the message it quotes.
+    forward: bool,
     /// The mailroom is sending it.
     pub(crate) sending: bool,
     /// Why it couldn't be sent.
@@ -119,6 +121,7 @@ impl ComposeForm {
             expanded: Expanded::default(),
             in_reply_to: draft.in_reply_to,
             references: draft.references,
+            forward: draft.forward,
             sending: false,
             error: None,
         };
@@ -139,6 +142,11 @@ impl ComposeForm {
 
     pub(crate) const fn is_reply(&self) -> bool {
         self.in_reply_to.is_some()
+    }
+
+    /// Whether it passes on a message.
+    pub(crate) const fn is_forward(&self) -> bool {
+        self.forward
     }
 
     /// Scores the markup again, after an edit.
@@ -173,6 +181,7 @@ impl ComposeForm {
             quote: self.quote.clone(),
             in_reply_to: self.in_reply_to.clone(),
             references: self.references.clone(),
+            forward: self.forward,
         }
     }
 
