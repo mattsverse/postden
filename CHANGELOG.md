@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0](https://github.com/mattsverse/postden/compare/v0.5.0...v0.6.0) (2026-11-17)
+
+
+### Features
+
+* **desktop:** add a command palette ([0aa4fea](https://github.com/mattsverse/postden/commit/0aa4fea6a3e0e0164388d244962258c599ad742f))
+* **desktop:** archive, delete, star and forward mail, and undo ([a1660d1](https://github.com/mattsverse/postden/commit/a1660d1c00c1623e6f96c2ae1da8a269e0cba8bd))
+* **desktop:** move through mail with single keys ([24b227d](https://github.com/mattsverse/postden/commit/24b227d5b50ab07d0faec09b1df9d21d1d8e5f62))
+* **desktop:** split the settings into General, Accounts and Advanced sections ([656ae23](https://github.com/mattsverse/postden/commit/656ae233a0f6561a259a9aa8dc6ad244fca74dbf))
+* **desktop:** triage mail from the keyboard, with undo ([f5c7db7](https://github.com/mattsverse/postden/commit/f5c7db7e89f0b6249a13eaa7b60b10a57bdd0fb7))
+* snooze messages until later ([2ea941f](https://github.com/mattsverse/postden/commit/2ea941f94e11611e560595c0ae891a348bb70101))
+
 ## [0.5.0](https://github.com/mattsverse/postden/compare/v0.4.0...v0.5.0) (2026-11-16)
 
 
