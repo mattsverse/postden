@@ -26,7 +26,8 @@ use crate::form::{AccountForm, SECURITY, Step, security_index};
 use crate::rich::RichEditor;
 use crate::search::{SERVER_PAGE, ServerSearch};
 use crate::state::{
-    Answer, INBOX as INBOX_NAME, Mail, MailboxMenu, MessageMenu, Reader, SettingsSection, Showing,
+    AccountMenu, Answer, INBOX as INBOX_NAME, Mail, MailboxMenu, MessageMenu, NewMailbox, Reader,
+    SettingsSection, Showing,
 };
 use crate::transfer::{self as moving, Transfer};
 use crate::update::{self, Phase};
@@ -156,6 +157,7 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
     }
     let toolbar = toolbar.trailing(trailing);
     update_dialog(s, &k, &mut layer);
+    new_mailbox_dialog(s, &k, &mut layer);
     palette(s, &k, &mut layer);
     let window = SplitView::new(main)
         .sidebar(
@@ -392,7 +394,7 @@ fn sidebar(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
                 ),
         );
     for account in &s.accounts {
-        sidebar = sidebar.child(account_row(s, account, k));
+        sidebar = sidebar.child(account_row(s, account, k, layer));
         if !s.collapsed.contains(&account.id) {
             let listed = s.mailboxes.get(&account.id).map_or(&[][..], Vec::as_slice);
             // The inbox first, so it stands out from the rest.
@@ -493,7 +495,8 @@ fn mailbox_menu(menu: &MailboxMenu, marking: bool, row: El, k: &Kit, layer: &mut
     .w_full()
 }
 
-fn account_row(s: &Mail, account: &Account, k: &Kit) -> El {
+/// An account, standing for its inbox, over its mailboxes. Right-clicking it opens its menu.
+fn account_row(s: &Mail, account: &Account, k: &Kit, layer: &mut Vec<El>) -> El {
     let status = s.statuses.get(&account.id);
     let confirming = s.confirm_remove.as_deref() == Some(account.id.as_str());
     let (subtitle, row_status) = if confirming {
@@ -561,7 +564,103 @@ fn account_row(s: &Mail, account: &Account, k: &Kit) -> El {
     if unread > 0 {
         r = r.badge(unread.to_string());
     }
-    r.build(k).key(format!("account-{}", account.id))
+    let menu_account = account.id.clone();
+    let r = r
+        .build(k)
+        .key(format!("account-{}", account.id))
+        .on_secondary_press(move |s: &mut Mail, point, _| {
+            s.open_account_menu(&menu_account, point);
+        });
+    match &s.account_menu {
+        Some(menu) if menu.account == account.id => account_menu(menu, r, k, layer),
+        _ => r,
+    }
+}
+
+/// An account's menu, open at where it was right-clicked: creating a mailbox on it.
+fn account_menu(menu: &AccountMenu, row: El, k: &Kit, layer: &mut Vec<El>) -> El {
+    let account = menu.account.clone();
+    context_menu(
+        format!("account-menu-{}", menu.account),
+        row,
+        Some(menu.point),
+    )
+    .min_width(200.0)
+    .on_close(Mail::close_account_menu)
+    .item(MenuItem::new("New mailbox…").on_select(move |s: &mut Mail| s.open_new_mailbox(&account)))
+    .build(k, layer)
+    .w_full()
+}
+
+/// The dialog naming a mailbox to create on an account: a field, why the server refused the
+/// last name, and Create, busy until the server answers.
+fn new_mailbox_dialog(s: &Mail, k: &Kit, layer: &mut Vec<El>) {
+    let d = &s.new_mailbox;
+    if !d.open {
+        return;
+    }
+    let creating = d.creating.is_some();
+    let input = TextInput::new(&d.name)
+        .label("Mailbox name")
+        .placeholder("Name")
+        .width(None)
+        .disabled(creating)
+        .on_edit(|s: &mut Mail| &mut s.new_mailbox.name)
+        .on_submit(|s: &mut Mail, _| s.create_mailbox());
+    let mut body = col()
+        .w_full()
+        .gap(12.0)
+        .padding(16.0)
+        .pt(0.0)
+        .child(input.build(k).key("new-mailbox-name"));
+    if let Some(error) = &d.error {
+        body = body.child(
+            text(error.clone())
+                .key("new-mailbox-error")
+                .font(k.ty.small)
+                .color(k.c.danger.fg)
+                .wrap()
+                .selectable(true),
+        );
+    }
+    body = body.child(new_mailbox_actions(d, k));
+    Dialog::new("new-mailbox", "New mailbox")
+        .description(format!("Create a mailbox on {}.", s.label(&d.account)))
+        .width(400.0)
+        .fit()
+        .on_close(Mail::close_new_mailbox)
+        .child(body)
+        .open(true)
+        .build(k, layer);
+}
+
+/// Cancel and Create, which needs a name and waits on the server.
+fn new_mailbox_actions(d: &NewMailbox, k: &Kit) -> El {
+    let creating = d.creating.is_some();
+    row()
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(el().grow(1.0))
+        .child(
+            Button::new("Cancel")
+                .variant(ButtonVariant::Neutral)
+                .on_press(Mail::close_new_mailbox)
+                .build(k)
+                .key("new-mailbox-cancel"),
+        )
+        .child(
+            Button::new(if creating { "Creating…" } else { "Create" })
+                .variant(if creating {
+                    ButtonVariant::Loading
+                } else {
+                    ButtonVariant::Contrast
+                })
+                .disabled(d.name.text.trim().is_empty())
+                .on_press(Mail::create_mailbox)
+                .build(k)
+                .key("new-mailbox-create"),
+        )
 }
 
 /// A rounded square with the account's initial.

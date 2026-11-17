@@ -116,18 +116,20 @@ pub struct Mailbox {
 }
 
 impl Mailbox {
-    /// The name to show: its levels joined with " / ", and the inbox as "Inbox".
+    /// The name to show: read from modified UTF-7 if it's spelled so, its levels joined with
+    /// " / ", and the inbox as "Inbox".
     #[must_use]
     pub fn label(&self) -> String {
         if self.role == Role::Inbox {
             return "Inbox".to_owned();
         }
+        let name = crate::mutf7::decode(&self.name).unwrap_or_else(|| self.name.clone());
         self.delimiter
             .as_deref()
             .filter(|d| !d.is_empty())
             .map_or_else(
-                || self.name.clone(),
-                |d| self.name.split(d).collect::<Vec<_>>().join(" / "),
+                || name.clone(),
+                |d| name.split(d).collect::<Vec<_>>().join(" / "),
             )
     }
 }
@@ -222,5 +224,11 @@ mod tests {
             "[Gmail] / Sent Mail"
         );
         assert_eq!(mailbox("Receipts", Role::Other).label(), "Receipts");
+        assert_eq!(
+            mailbox("R&-D/R&AOk-unions", Role::Other).label(),
+            "R&D / Réunions"
+        );
+        // A server that doesn't encode names shows them as they are.
+        assert_eq!(mailbox("R&D-2026", Role::Other).label(), "R&D-2026");
     }
 }

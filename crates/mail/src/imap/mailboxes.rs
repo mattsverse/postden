@@ -1,12 +1,15 @@
-//! Listing an account's mailboxes, and telling which is for what.
+//! Listing an account's mailboxes, creating them, and telling which is for what.
 
 use async_imap::types::NameAttribute;
 use futures::TryStreamExt as _;
+use postden_core::account::Server;
 use postden_core::message::{Mailbox, Role};
+use postden_core::mutf7;
 
-use super::connection::Session;
+use super::connection::{Session, connect};
+use super::message::logout;
 use super::watch::with_timeout;
-use crate::Result;
+use crate::{Credentials, Result};
 
 /// What a Sent mailbox is called when the server doesn't mark one, in order of preference, compared
 /// without regard to case against a mailbox's whole name and then its last part.
@@ -64,6 +67,21 @@ pub(crate) async fn list_mailboxes(session: &mut Session) -> Result<Vec<Mailbox>
 /// comes as an extension; attributes ignore case (RFC 3501 section 9).
 fn is_snoozed(attribute: &NameAttribute<'_>) -> bool {
     matches!(attribute, NameAttribute::Extension(a) if a.eq_ignore_ascii_case(SNOOZED_ATTRIBUTE))
+}
+
+/// Creates a mailbox called `name` on the account, sent in modified UTF-7 as IMAP spells mailbox
+/// names. One that has the server's hierarchy delimiter in it is made inside another, as the
+/// server sees fit.
+///
+/// # Errors
+///
+/// Returns an error when the connection fails or the server refuses, as when the mailbox exists
+/// already or the name isn't one it allows.
+pub async fn create_mailbox(server: &Server, credentials: &Credentials, name: &str) -> Result<()> {
+    let mut session = connect(server, credentials).await?;
+    let result = with_timeout(session.create(mutf7::encode(name))).await;
+    logout(session).await;
+    result
 }
 
 /// The name of the account's Sent mailbox, if it has one.

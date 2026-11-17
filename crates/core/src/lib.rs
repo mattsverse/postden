@@ -2,6 +2,7 @@
 
 pub mod account;
 pub mod message;
+pub mod mutf7;
 pub mod secrets;
 
 /// Errors shared across Postden crates.

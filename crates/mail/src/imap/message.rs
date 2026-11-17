@@ -19,7 +19,7 @@ const LOGOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Logs out of `session`, waiting [`LOGOUT_TIMEOUT`] at most: the work done is answered soon
 /// after, as what's waiting on it (more changes to the same message) waits for that.
-async fn logout(mut session: Session) {
+pub(super) async fn logout(mut session: Session) {
     let _ignored = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
 }
 

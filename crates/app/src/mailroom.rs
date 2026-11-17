@@ -14,10 +14,10 @@ use postden_core::account::{Account, Server};
 use postden_core::message::{Body, Envelope, Mailbox, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
-    Event, Flags, Found, Older, Prefetched, SNOOZED_NAME, Status, WatchConfig, download_message,
-    fetch_older, mark_all_seen, move_message, open_message, prefetch_messages, refresh,
-    restore_message, save_sent_copy, search, set_flagged, set_seen, snooze_message, wake_message,
-    watch,
+    Event, Flags, Found, Older, Prefetched, SNOOZED_NAME, Status, WatchConfig, create_mailbox,
+    download_message, fetch_older, mark_all_seen, move_message, open_message, prefetch_messages,
+    refresh, restore_message, save_sent_copy, search, set_flagged, set_seen, snooze_message,
+    wake_message, watch,
 };
 use postden_mail::{Credentials, smtp};
 use postden_store::{Snooze, Store, Written};
@@ -206,6 +206,13 @@ pub enum Update {
     },
     /// A sent message couldn't be filed in the account's Sent mailbox. It was still sent.
     CopyFailed { account: String, error: String },
+    /// A mailbox asked for with [`Mailroom::create_mailbox`] was made on the server, to be listed
+    /// with the account's mailboxes as [`Update::Mailboxes`] next; or it wasn't.
+    MailboxCreated {
+        account: String,
+        name: String,
+        result: Result<(), String>,
+    },
 }
 
 /// Marks a mailbox read in the store once the server did, up to the UIDNEXT it was marked under.
@@ -1434,6 +1441,34 @@ impl Mailroom {
         if let Some(w) = self.watchers.get(account) {
             w.inbox_nudge.notify_one();
         }
+    }
+
+    /// Creates a mailbox called `name` on `account`'s server in the background, then lists the
+    /// account's mailboxes so it shows. The result arrives as [`Update::MailboxCreated`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, and creates nothing, when the account isn't watched.
+    pub fn create_mailbox(&self, account: &str, name: &str) -> Result<()> {
+        let watched = self.watched(account)?;
+        let (server, credentials) = (watched.server.clone(), watched.credentials.clone());
+        let nudge = Arc::clone(&watched.nudge);
+        let (account, name) = (account.to_owned(), name.to_owned());
+        let jobs = self.jobs.clone();
+        self.handle.spawn(async move {
+            let result = create_mailbox(&server, &credentials, &name)
+                .await
+                .map_err(|e| e.to_string());
+            if result.is_ok() {
+                nudge.notify_one();
+            }
+            let _ignored = jobs.send(Job::Done(Update::MailboxCreated {
+                account,
+                name,
+                result,
+            }));
+        });
+        Ok(())
     }
 
     /// Sends `message` from `account` in the background, then files it in the account's Sent mailbox.

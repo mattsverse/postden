@@ -101,6 +101,26 @@ impl MailboxMenu {
     }
 }
 
+/// The menu of an account in the sidebar, opened by right-clicking it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AccountMenu {
+    pub(crate) account: String,
+    /// Where it was right-clicked, which the menu opens at.
+    pub(crate) point: PointerPress,
+}
+
+/// The dialog naming a mailbox to create on an account, opened from the account's menu.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct NewMailbox {
+    pub(crate) open: bool,
+    pub(crate) account: String,
+    pub(crate) name: TextEdit,
+    /// The name asked for, while the server hasn't answered.
+    pub(crate) creating: Option<String>,
+    /// Why the server refused the last name asked for.
+    pub(crate) error: Option<String>,
+}
+
 /// A body's HTML as Markdown, to show, if it has HTML with something in it.
 fn markdown(body: &Body) -> Option<String> {
     body.html
@@ -373,6 +393,10 @@ pub(crate) struct Mail {
     pub(crate) message_menu: Option<MessageMenu>,
     /// The menu of a mailbox in the sidebar, while it's open.
     pub(crate) mailbox_menu: Option<MailboxMenu>,
+    /// The menu of an account in the sidebar, while it's open.
+    pub(crate) account_menu: Option<AccountMenu>,
+    /// The dialog creating a mailbox.
+    pub(crate) new_mailbox: NewMailbox,
     /// A reply asked for before its message was downloaded: the message, and whether to everyone.
     /// It starts once the message opens.
     pending_reply: Option<(MessageKey, Answer)>,
@@ -466,6 +490,8 @@ impl Mail {
             actions_open: false,
             message_menu: None,
             mailbox_menu: None,
+            account_menu: None,
+            new_mailbox: NewMailbox::default(),
             pending_reply: None,
             moving: HashSet::new(),
             marking_seen: HashSet::new(),
@@ -746,12 +772,7 @@ impl Mail {
             Update::SaveFailed { account, error } => {
                 self.notify(format!("{account}: couldn't save new mail: {error}"));
             }
-            Update::Cleared(cleared) => self.notify(match cleared {
-                Ok(0) => "No downloaded messages to clear.".to_owned(),
-                Ok(1) => "Cleared 1 downloaded message.".to_owned(),
-                Ok(n) => format!("Cleared {n} downloaded messages."),
-                Err(e) => format!("Couldn't clear the downloaded messages: {e}"),
-            }),
+            Update::Cleared(cleared) => self.cleared(cleared),
             Update::ReleaseFailed(error) => {
                 self.notify(format!("Couldn't drop the opened messages kept: {error}"));
             }
@@ -799,6 +820,11 @@ impl Mail {
                 result,
             } => self.exported(&account, &path, result),
             Update::Sent { account, result } => self.sent(&account, result),
+            Update::MailboxCreated {
+                account,
+                name,
+                result,
+            } => self.mailbox_created(&account, &name, result),
             Update::Searched {
                 id,
                 account,
@@ -812,6 +838,16 @@ impl Mail {
             | Update::Restored { .. }) => self.message_changed(update),
         }
         self.follow_restored(tx);
+    }
+
+    /// Every downloaded message was dropped, or couldn't be.
+    fn cleared(&mut self, cleared: Result<usize, String>) {
+        self.notify(match cleared {
+            Ok(0) => "No downloaded messages to clear.".to_owned(),
+            Ok(1) => "Cleared 1 downloaded message.".to_owned(),
+            Ok(n) => format!("Cleared {n} downloaded messages."),
+            Err(e) => format!("Couldn't clear the downloaded messages: {e}"),
+        });
     }
 
     /// The server listed an account's mailboxes. What a search found in one deleted or renamed
@@ -1051,6 +1087,7 @@ impl Mail {
         self.actions_open = false;
         self.message_menu = None;
         self.mailbox_menu = None;
+        self.account_menu = None;
         self.palette = Palette {
             open: true,
             mode,
@@ -1128,7 +1165,10 @@ impl Mail {
     /// [`Mail::run_shortcut`], `go` when G came just before. While a menu is open, only ⌘
     /// shortcuts count: keys on their own are the menu's.
     pub(crate) fn run_keys(&mut self, ev: &rune::KeyEvent, go: bool, tx: &mut Tx) -> bool {
-        let menu = self.actions_open || self.message_menu.is_some() || self.mailbox_menu.is_some();
+        let menu = self.actions_open
+            || self.message_menu.is_some()
+            || self.mailbox_menu.is_some()
+            || self.account_menu.is_some();
         let counts =
             |k: &Shortcut| !menu || matches!(k, Shortcut::Command { .. } | Shortcut::Sidebar);
         let commands = commands::available(self);
@@ -1142,6 +1182,7 @@ impl Mail {
             self.actions_open = false;
             self.message_menu = None;
             self.mailbox_menu = None;
+            self.account_menu = None;
             self.close_palette();
             command.run(self, tx);
             return true;
@@ -2032,6 +2073,83 @@ impl Mail {
     pub(crate) fn close_mailbox_menu(&mut self) {
         self.mailbox_menu = None;
         self.forget_go();
+    }
+
+    /// Opens the menu of an account in the sidebar at `point`, where it was right-clicked.
+    pub(crate) fn open_account_menu(&mut self, account: &str, point: PointerPress) {
+        self.forget_go();
+        self.account_menu = Some(AccountMenu {
+            account: account.to_owned(),
+            point,
+        });
+    }
+
+    pub(crate) fn close_account_menu(&mut self) {
+        self.account_menu = None;
+        self.forget_go();
+    }
+
+    /// Opens the dialog naming a mailbox to create on `account`, with nothing typed.
+    pub(crate) fn open_new_mailbox(&mut self, account: &str) {
+        self.close_account_menu();
+        let mut name = TextEdit::new("");
+        name.focused = true;
+        self.new_mailbox = NewMailbox {
+            open: true,
+            account: account.to_owned(),
+            name,
+            creating: None,
+            error: None,
+        };
+    }
+
+    /// Closes the mailbox dialog. A mailbox already asked for is still made, and a notice says so.
+    pub(crate) fn close_new_mailbox(&mut self) {
+        self.new_mailbox = NewMailbox::default();
+    }
+
+    /// Asks the account's server for a mailbox called what's typed in the dialog. The dialog
+    /// stays open, and says it's busy, until the server answers.
+    pub(crate) fn create_mailbox(&mut self) {
+        let dialog = &mut self.new_mailbox;
+        let name = dialog.name.text.trim().to_owned();
+        if !dialog.open || name.is_empty() || dialog.creating.is_some() {
+            return;
+        }
+        let Ok(services) = &self.services else { return };
+        match services.mailroom.create_mailbox(&dialog.account, &name) {
+            Ok(()) => {
+                dialog.creating = Some(name);
+                dialog.error = None;
+            }
+            Err(e) => dialog.error = Some(e.to_string()),
+        }
+    }
+
+    /// The server made the mailbox `name` asked for with [`Mail::create_mailbox`], or refused to.
+    /// Made, the dialog closes and the mailbox shows once the account's mailboxes are listed
+    /// again; refused, the dialog says why, so another name can be tried.
+    fn mailbox_created(&mut self, account: &str, name: &str, result: Result<(), String>) {
+        let d = &mut self.new_mailbox;
+        let asked = d.open && d.account == account && d.creating.as_deref() == Some(name);
+        match (asked, result) {
+            (true, Ok(())) => self.close_new_mailbox(),
+            (true, Err(e)) => {
+                d.creating = None;
+                d.error = Some(e);
+                // Back to the name, to fix it.
+                d.name.focused = true;
+            }
+            // The dialog was closed meanwhile.
+            (false, Ok(())) => {
+                let label = self.label(account).to_owned();
+                self.notify(format!("{label}: created the mailbox {name}"));
+            }
+            (false, Err(e)) => {
+                let label = self.label(account).to_owned();
+                self.notify(format!("{label}: couldn't create the mailbox {name}: {e}"));
+            }
+        }
     }
 
     /// Syncs one of an account's mailboxes with the server now, rather than waiting for the server
@@ -3963,6 +4081,12 @@ impl Mail {
         {
             self.mailbox_menu = None;
         }
+        if self.account_menu.as_ref().is_some_and(|m| m.account == id) {
+            self.account_menu = None;
+        }
+        if self.new_mailbox.account == id {
+            self.close_new_mailbox();
+        }
     }
 }
 
@@ -3981,6 +4105,34 @@ pub(crate) fn row_key(key: &MessageKey) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_mailbox_closes_its_dialog_once_made_and_says_why_it_was_refused() {
+        let created = |name: &str, result: Result<(), String>| Update::MailboxCreated {
+            account: "me@example.com".into(),
+            name: name.into(),
+            result,
+        };
+        let mut s = Mail::not_started();
+        s.open_new_mailbox("me@example.com");
+        s.new_mailbox.creating = Some("Work".into());
+        s.apply(created("Work", Err("exists".into())), &mut Tx::default());
+        assert!(s.new_mailbox.open);
+        assert_eq!(s.new_mailbox.creating, None);
+        assert_eq!(s.new_mailbox.error.as_deref(), Some("exists"));
+
+        s.new_mailbox.creating = Some("Work 2".into());
+        s.apply(created("Work 2", Ok(())), &mut Tx::default());
+        assert!(!s.new_mailbox.open);
+        assert_eq!(s.notice, None);
+
+        // Closed before the server answered, a notice tells.
+        s.apply(created("Later", Ok(())), &mut Tx::default());
+        assert_eq!(
+            s.notice.as_deref(),
+            Some("me@example.com: created the mailbox Later")
+        );
+    }
 
     #[test]
     fn switching_settings_sections_forgets_a_pending_remove() {
