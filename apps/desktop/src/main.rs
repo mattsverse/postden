@@ -88,13 +88,15 @@ fn on_reopen(s: &mut Mail, _visible: bool, _: &mut Tx) -> bool {
 /// sidebar, ⌘, opens the settings, C or ⌘N starts a new message and / or ⌘F searches the list.
 /// J and K (or ↓ and ↑) move the list's cursor and ↩ opens its message; with a message open, J
 /// and K open the next or previous one and Escape goes back to the list. On the message open or
-/// under the cursor, U or ⇧⌘U marks it read or unread, R or ⌘R and ⇧⌘R reply to the sender or
-/// everyone, H snoozes it and V moves it. G then I, T, E, H, # or L goes to all inboxes, Sent,
-/// the account's Archive, Snoozed or Trash, or any mailbox. Keys on their own only count while
-/// no field takes what's typed. Escape also closes the settings (or the update announcement
-/// over them, or an account's settings with nothing unsaved), and in the search field ends the
-/// search and leaves the field. While writing, ⌘↩ sends, and ⌘K links the selected text, as it
-/// does in a signature.
+/// under the cursor, U or ⇧⌘U marks it read or unread, S or ⇧⌘L stars it, R or ⌘R and ⇧⌘R reply
+/// to the sender or everyone, F or ⇧⌘F forwards it, H snoozes it, V moves it, and E, # and ! or
+/// ⇧⌘J move it to the account's Archive, Trash or Junk mailbox. Z undoes the last of those,
+/// replies and forwards aside. G then I, T, E, H, #, ! or L goes to all inboxes, Sent, the
+/// account's Archive, Snoozed, Trash or Junk, or any mailbox. Keys on their own only count while
+/// no field takes what's typed. Escape also closes the settings (or the update announcement over
+/// them, or an account's settings with nothing unsaved), and in the search field ends the search
+/// and leaves the field. While writing, ⌘↩ sends, and ⌘K links the selected text, as it does in
+/// a signature.
 fn on_key(s: &mut Mail, ev: &KeyEvent, tx: &mut Tx) -> bool {
     let go = s.take_go();
     let command_k = ev.is_command('k') && !ev.mods.shift;

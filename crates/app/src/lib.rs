@@ -36,7 +36,7 @@ pub use accounts::{
 pub use compose::{Draft, Quote};
 pub use google::{finish_google_sign_in, google_account, start_google_sign_in};
 use jiff::{Timestamp, Zoned};
-pub use mailroom::{Mailroom, Update};
+pub use mailroom::{Mailroom, Update, is_searchable};
 use postden_core::message::Envelope;
 use postden_secrets::Backend;
 pub use profile::{
@@ -348,6 +348,7 @@ mod tests {
             subject: subject.map(str::to_owned),
             date: None,
             seen: false,
+            flagged: false,
         };
         let alert = |unread: &[Envelope]| new_mail_alert("Work", unread);
         let pair = |title: &str, body: &str| Some((title.to_owned(), body.to_owned()));

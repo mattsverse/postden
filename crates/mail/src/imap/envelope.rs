@@ -12,17 +12,16 @@ pub(super) const QUERY: &str =
 pub(super) fn from_fetch(fetch: &Fetch) -> Option<Envelope> {
     let uid = fetch.uid?;
     let seen = fetch.flags().any(|f| f == Flag::Seen);
+    let flagged = fetch.flags().any(|f| f == Flag::Flagged);
     let received = fetch.internal_date().map(|d| d.timestamp());
-    Some(from_header(
-        uid,
-        seen,
-        fetch.header().unwrap_or_default(),
-        received,
-    ))
+    Some(Envelope {
+        flagged,
+        ..from_header(uid, seen, fetch.header().unwrap_or_default(), received)
+    })
 }
 
 /// Builds an envelope from raw header bytes. Missing or unparsable headers are left empty, except the
-/// date, which falls back to `received`: when the server got the message.
+/// date, which falls back to `received`: when the server got the message. It isn't starred.
 pub(super) fn from_header(uid: u32, seen: bool, header: &[u8], received: Option<i64>) -> Envelope {
     let parsed = MessageParser::default().parse_headers(header);
     let parsed = parsed.as_ref();
@@ -50,6 +49,7 @@ pub(super) fn from_header(uid: u32, seen: bool, header: &[u8], received: Option<
             .map(|d| d.to_timestamp())
             .or(received),
         seen,
+        flagged: false,
     }
 }
 
@@ -87,6 +87,7 @@ mod tests {
                 subject: Some("Café?".into()),
                 date: Some(1_794_475_800),
                 seen: true,
+                flagged: false,
             }
         );
     }

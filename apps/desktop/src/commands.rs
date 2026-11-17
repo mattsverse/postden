@@ -11,7 +11,7 @@ use rune::{Key, KeyEvent, TextEdit, Tx};
 use rune_kit::shell;
 
 use crate::search::MessageKey;
-use crate::state::{Mail, SettingsSection, Showing};
+use crate::state::{Answer, Mail, SettingsSection, Showing};
 
 /// A key, or chord, that runs a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +108,18 @@ pub(crate) enum Command {
     Search,
     Reply,
     ReplyAll,
+    Forward,
     ToggleSeen,
+    /// Stars the focused message, or takes its star away.
+    ToggleStar,
+    /// Moves the focused message to its account's Archive.
+    Archive,
+    /// Deletes the focused message: moves it to its account's Trash.
+    Trash,
+    /// Moves the focused message to its account's Junk mailbox.
+    Spam,
+    /// Undoes the last thing done to a message.
+    Undo,
     ExportMessage,
     CloseReader,
     /// Moves the list's cursor down, or opens the next message while one is open.
@@ -167,7 +178,13 @@ impl Command {
             Self::Search => vec![Key('/'), Shortcut::cmd('f')],
             Self::Reply => vec![Key('r'), Shortcut::cmd('r')],
             Self::ReplyAll => vec![Shortcut::shift_cmd('r')],
+            Self::Forward => vec![Key('f'), Shortcut::shift_cmd('f')],
             Self::ToggleSeen => vec![Key('u'), Shortcut::shift_cmd('u')],
+            Self::ToggleStar => vec![Key('s'), Shortcut::shift_cmd('l')],
+            Self::Archive => vec![Key('e')],
+            Self::Trash => vec![Key('#')],
+            Self::Spam => vec![Key('!'), Shortcut::shift_cmd('j')],
+            Self::Undo => vec![Key('z')],
             Self::CloseReader => vec![Escape],
             // ↑ and ↓ move the cursor in the list; an open message steps with J and K alone.
             Self::NextMessage if s.reader.is_none() => vec![Key('j'), Down],
@@ -192,6 +209,7 @@ impl Command {
                     Some(Role::Archive) => vec![Go('e')],
                     Some(Role::Snoozed) => vec![Go('h')],
                     Some(Role::Trash) => vec![Go('#')],
+                    Some(Role::Junk) => vec![Go('!')],
                     _ => Vec::new(),
                 }
             }
@@ -226,10 +244,19 @@ impl Command {
             Self::Search => "Search mail".into(),
             Self::Reply => "Reply".into(),
             Self::ReplyAll => "Reply all".into(),
+            Self::Forward => "Forward".into(),
             Self::ToggleSeen => match s.focused_message() {
                 Some(m) if m.envelope.seen => "Mark as unread".into(),
                 _ => "Mark as read".into(),
             },
+            Self::ToggleStar => match s.focused_message() {
+                Some(m) if m.envelope.flagged => "Remove star".into(),
+                _ => "Star".into(),
+            },
+            Self::Archive => "Archive".into(),
+            Self::Trash => "Delete".into(),
+            Self::Spam => "Mark as spam".into(),
+            Self::Undo => s.undo_title(),
             Self::ExportMessage => "Export as .eml…".into(),
             Self::CloseReader => "Back to the list".into(),
             Self::NextMessage => "Next message".into(),
@@ -277,9 +304,15 @@ impl Command {
         match self {
             Self::Compose => s.compose(),
             Self::Search => s.focus_search(),
-            Self::Reply => s.reply_focused(false),
-            Self::ReplyAll => s.reply_focused(true),
+            Self::Reply => s.answer_focused(Answer::Reply),
+            Self::ReplyAll => s.answer_focused(Answer::ReplyAll),
+            Self::Forward => s.answer_focused(Answer::Forward),
             Self::ToggleSeen => s.toggle_seen(),
+            Self::ToggleStar => s.toggle_star(),
+            Self::Archive => s.move_focused_to(Role::Archive),
+            Self::Trash => s.move_focused_to(Role::Trash),
+            Self::Spam => s.move_focused_to(Role::Junk),
+            Self::Undo => s.undo(),
             Self::ExportMessage => {
                 if let Some(message) = s.focused_message() {
                     Mail::export_message(tx, message);
@@ -335,6 +368,12 @@ fn snoozable(s: &Mail, m: &StoredMessage) -> bool {
         .is_none_or(|b| b.name != m.mailbox)
 }
 
+/// Whether `m` can be moved to its account's mailbox with `role`: it has one, and `m` isn't there.
+fn can_move_to(s: &Mail, m: &StoredMessage, role: Role) -> bool {
+    s.mailbox_with_role(&m.account, role)
+        .is_some_and(|b| b.name != m.mailbox)
+}
+
 /// Where `message` can be moved to: its account's other mailboxes, the inbox first.
 fn destinations(s: &Mail, message: &MessageKey) -> Vec<Command> {
     let listed = s.mailboxes.get(&message.0).map_or(&[][..], Vec::as_slice);
@@ -372,11 +411,17 @@ pub(crate) fn available(s: &Mail) -> Vec<Command> {
         let key = (m.account.clone(), m.mailbox.clone(), m.envelope.uid);
         add(replies, Command::Reply);
         add(replies, Command::ReplyAll);
+        add(replies, Command::Forward);
+        add(can_move_to(s, m, Role::Archive), Command::Archive);
         add(true, Command::ToggleSeen);
+        add(true, Command::ToggleStar);
         add(snoozable(s, m), Command::PickSnooze);
         add(!destinations(s, &key).is_empty(), Command::PickMove);
+        add(can_move_to(s, m, Role::Trash), Command::Trash);
+        add(can_move_to(s, m, Role::Junk), Command::Spam);
         add(true, Command::ExportMessage);
     }
+    add(browsing && s.undo.is_some(), Command::Undo);
     add(browsing && s.reader.is_some(), Command::CloseReader);
     let listed = s.shown().next().is_some();
     add(
@@ -546,6 +591,7 @@ impl Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::Undo;
 
     #[test]
     fn words_match_the_start_of_words_in_any_order() {
@@ -717,8 +763,18 @@ mod tests {
                     subject: None,
                     date: None,
                     seen: false,
+                    flagged: false,
                 },
             });
+        }
+        s
+    }
+
+    /// [`listing`], each message with a Message-ID.
+    fn with_ids() -> Mail {
+        let mut s = listing();
+        for m in &mut s.messages {
+            m.envelope.message_id = Some(format!("{}@example.com", m.envelope.uid));
         }
         s
     }
@@ -859,5 +915,100 @@ mod tests {
         s.close_message_menu();
         assert!(s.run_shortcut(&key("c"), &mut tx));
         assert!(s.compose.open);
+    }
+
+    #[test]
+    fn a_message_is_archived_deleted_or_marked_spam_only_where_it_can_go() {
+        let mut s = listing();
+        s.cursor = Some(at(1));
+        let commands = available(&s);
+        for command in [
+            Command::Archive,
+            Command::Trash,
+            Command::ToggleStar,
+            Command::Forward,
+        ] {
+            assert!(commands.contains(&command), "{command:?}");
+        }
+        assert!(
+            !commands.contains(&Command::Spam),
+            "Ada has no Junk mailbox"
+        );
+        s.mailboxes
+            .get_mut(ADA)
+            .unwrap()
+            .push(postden_core::message::Mailbox {
+                name: "Spam".into(),
+                delimiter: None,
+                role: Role::Junk,
+            });
+        assert!(available(&s).contains(&Command::Spam));
+        // Already in the Archive, it isn't archived again.
+        for m in &mut s.messages {
+            m.mailbox = "Archive".into();
+        }
+        s.cursor = Some((ADA.into(), "Archive".into(), 1));
+        let commands = available(&s);
+        assert!(!commands.contains(&Command::Archive));
+        assert!(commands.contains(&Command::Trash));
+    }
+
+    #[test]
+    fn new_keys_run_their_commands() {
+        let s = listing();
+        let shortcut = |c: Command, k: &str, shift: bool| {
+            let mut ev = key(k);
+            ev.mods.shift = shift;
+            c.shortcuts(&s).iter().any(|x| x.matches(&ev, false))
+        };
+        assert!(shortcut(Command::Archive, "e", false));
+        assert!(shortcut(Command::Trash, "#", true));
+        assert!(shortcut(Command::Spam, "!", true));
+        assert!(shortcut(Command::ToggleStar, "s", false));
+        assert!(shortcut(Command::Forward, "f", false));
+        assert!(shortcut(Command::Undo, "z", false));
+        assert!(!shortcut(Command::Undo, "Z", true), "⇧Z isn't Z");
+        assert_eq!(Command::Spam.hint(&s), "⇧⌘J");
+        assert_eq!(Command::ToggleStar.hint(&s), "⇧⌘L");
+        assert_eq!(Command::Forward.hint(&s), "⇧⌘F");
+    }
+
+    #[test]
+    fn a_move_is_undone_only_once_the_server_moved_it() {
+        let mut s = with_ids();
+        assert!(!available(&s).contains(&Command::Undo));
+        s.undo_move(&at(2), "Archive", None);
+        assert!(available(&s).contains(&Command::Undo));
+        assert_eq!(Command::Undo.title(&s), "Undo move to Archive");
+        // Z before the server answered keeps it, and says to wait.
+        s.undo();
+        assert!(matches!(s.undo, Some(Undo::Moved { done: false, .. })));
+        assert!(
+            s.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("Still moving"))
+        );
+        // Another message's move answered leaves it be.
+        assert!(!s.moved_for_undo(&at(3), true));
+        assert!(s.moved_for_undo(&at(2), true));
+        assert!(matches!(s.undo, Some(Undo::Moved { done: true, .. })));
+        // A move refused leaves nothing to undo.
+        s.undo_move(&at(1), "Trash", None);
+        assert!(!s.moved_for_undo(&at(1), false));
+        assert_eq!(s.undo, None);
+    }
+
+    #[test]
+    fn a_move_without_a_message_id_cant_be_undone_nor_leave_an_older_undo() {
+        let mut s = with_ids();
+        s.undo_move(&at(2), "Archive", None);
+        s.messages[0].envelope.message_id = None;
+        s.undo_move(&at(1), "Archive", None);
+        assert_eq!(
+            s.undo, None,
+            "Z mustn't undo something before the last thing done"
+        );
+        s.undo_move(&at(3), "Snoozed", Some(100));
+        assert_eq!(Command::Undo.title(&s), "Undo snooze");
     }
 }

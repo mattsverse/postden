@@ -10,7 +10,7 @@ use postden_mail::imap::Status;
 use postden_store::StoredMessage;
 use rune::{
     Block, Color, Cx, El, GrowthSpec, Icon, Mark, ScrollSpec, TextEdit, TextStyle, Transition, Tx,
-    col, el, row, text,
+    col, el, icon, row, text,
 };
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow, SplitView, Toolbar};
 use rune_kit::{
@@ -26,7 +26,7 @@ use crate::form::{AccountForm, SECURITY, Step, security_index};
 use crate::rich::RichEditor;
 use crate::search::{SERVER_PAGE, ServerSearch};
 use crate::state::{
-    INBOX as INBOX_NAME, Mail, MailboxMenu, MessageMenu, Reader, SettingsSection, Showing,
+    Answer, INBOX as INBOX_NAME, Mail, MailboxMenu, MessageMenu, Reader, SettingsSection, Showing,
 };
 use crate::transfer::{self as moving, Transfer};
 use crate::update::{self, Phase};
@@ -69,6 +69,12 @@ static PICTURE: Icon = Icon {
     name: "postden-picture",
     view: 16.0,
     body: r#"<rect x="2.5" y="3" width="11" height="10" rx="1.5" stroke="currentColor" stroke-width="1.2" fill="none"/><circle cx="6" cy="6.5" r="1.1" fill="currentColor"/><path d="M3 11.5L6.5 8.5L9 10.5L10.75 9L13 11" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/>"#,
+};
+/// A starred message.
+static STAR: Icon = Icon {
+    name: "postden-star",
+    view: 16.0,
+    body: r#"<path d="M8 2.25L9.69 5.83L13.5 6.31L10.7 8.97L11.4 12.75L8 10.9L4.6 12.75L5.3 8.97L2.5 6.31L6.31 5.83Z" fill="currentColor" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/>"#,
 };
 static PLUS: Icon = Icon {
     name: "postden-plus",
@@ -227,12 +233,33 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
                     }),
             )
             .item(
+                MenuItem::new("Forward")
+                    .shortcut(Command::Forward.hint(s))
+                    .disabled(!downloaded)
+                    .on_select(|s: &mut Mail| {
+                        s.actions_open = false;
+                        s.answer(Answer::Forward);
+                    }),
+            )
+            .item(
                 MenuItem::new(seen)
                     .shortcut(Command::ToggleSeen.hint(s))
                     .on_select(|s: &mut Mail| {
                         s.actions_open = false;
                         s.toggle_seen();
                     }),
+            )
+            .item(
+                MenuItem::new(if reader.message.envelope.flagged {
+                    "Remove star"
+                } else {
+                    "Star"
+                })
+                .shortcut(Command::ToggleStar.hint(s))
+                .on_select(|s: &mut Mail| {
+                    s.actions_open = false;
+                    s.toggle_star();
+                }),
             )
             .item(
                 MenuItem::new("Export as .eml…").on_select_tx(|s: &mut Mail, tx| {
@@ -264,6 +291,8 @@ fn title(s: &Mail) -> String {
     if s.compose.open {
         return if s.compose.is_reply() {
             "Reply"
+        } else if s.compose.is_forward() {
+            "Forward"
         } else {
             "New message"
         }
@@ -765,7 +794,13 @@ fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
                     .truncate()
                     .grow(1.0)
                     .min_w(0.0),
-            );
+            )
+            // A slot whether starred or not, so the dates line up.
+            .child(if e.flagged {
+                icon(&STAR, 14.0).color(k.c.text_accent).label("Starred")
+            } else {
+                el().w(14.0)
+            });
         if multiple_accounts {
             line = line.child(
                 text(s.label(&m.account).to_owned())
@@ -815,9 +850,9 @@ fn messages_column() -> El {
         })
 }
 
-/// A message's menu, open at where it was right-clicked: marking it read or unread, replying,
-/// exporting it as an `.eml` file, snoozing it, and moving it to another of its account's
-/// mailboxes.
+/// A message's menu, open at where it was right-clicked: marking it read or unread, starring
+/// it, replying to or forwarding it, exporting it as an `.eml` file, snoozing it, archiving it,
+/// marking it as spam, moving it to another of its account's mailboxes, and deleting it.
 fn message_menu(
     s: &Mail,
     m: &StoredMessage,
@@ -835,13 +870,6 @@ fn message_menu(
             f(s, &account, &mailbox, uid);
         }
     };
-    let move_to = |to: &str| {
-        let (account, mailbox, to) = (account.to_owned(), mailbox.to_owned(), to.to_owned());
-        move |s: &mut Mail| {
-            s.close_message_menu();
-            s.move_message(&account, &mailbox, uid, &to);
-        }
-    };
     let seen = m.envelope.seen;
     let mut items = context_menu(
         format!("message-{account}-{mailbox}-{uid}"),
@@ -857,14 +885,29 @@ fn message_menu(
             "Mark as read"
         })
         .on_select(act(if seen {
-            |s, a, b, uid| s.set_seen(a, b, uid, false)
+            |s, a, b, uid| s.mark_seen((a.to_owned(), b.to_owned(), uid), false)
         } else {
-            |s, a, b, uid| s.set_seen(a, b, uid, true)
+            |s, a, b, uid| s.mark_seen((a.to_owned(), b.to_owned(), uid), true)
+        })),
+    )
+    .item(
+        MenuItem::new(if m.envelope.flagged {
+            "Remove star"
+        } else {
+            "Star"
+        })
+        .on_select(act(if m.envelope.flagged {
+            |s, a, b, uid| s.star((a.to_owned(), b.to_owned(), uid), false)
+        } else {
+            |s, a, b, uid| s.star((a.to_owned(), b.to_owned(), uid), true)
         })),
     )
     .separator()
     .item(MenuItem::new("Reply").on_select(act(|s, a, b, uid| s.reply_to(a, b, uid, false))))
     .item(MenuItem::new("Reply all").on_select(act(|s, a, b, uid| s.reply_to(a, b, uid, true))))
+    .item(MenuItem::new("Forward").on_select(act(|s, a, b, uid| {
+        s.answer_message(a, b, uid, Answer::Forward);
+    })))
     .separator()
     .item(MenuItem::new("Export as .eml…").on_select_tx({
         let message = m.clone();
@@ -873,11 +916,26 @@ fn message_menu(
             Mail::export_message(tx, &message);
         }
     }));
+    items = message_menu_moves(s, m, menu, items);
+    items.build(k, layer).w_full()
+}
+
+/// The end of a message's menu: snoozing it, and moving it to another of its account's mailboxes.
+fn message_menu_moves(s: &Mail, m: &StoredMessage, menu: &MessageMenu, mut items: Menu) -> Menu {
+    let (account, mailbox, uid) = (m.account.as_str(), m.mailbox.as_str(), m.envelope.uid);
+    let move_to = |to: &str| {
+        let (account, mailbox, to) = (account.to_owned(), mailbox.to_owned(), to.to_owned());
+        move |s: &mut Mail| {
+            s.close_message_menu();
+            s.move_message(&account, &mailbox, uid, &to);
+        }
+    };
     let elsewhere = |role| {
         s.mailbox_with_role(account, role)
             .filter(|b| b.name != mailbox)
     };
     let archive = elsewhere(Role::Archive);
+    let junk = elsewhere(Role::Junk);
     // A snoozed message waits in the Snoozed mailbox; one already there isn't snoozed again.
     let snoozable = s
         .mailbox_with_role(account, Role::Snoozed)
@@ -890,7 +948,7 @@ fn message_menu(
         .filter(|b| b.name != mailbox)
         .map(|b| MenuEntry::item(MenuItem::new(b.label()).on_select(move_to(&b.name))))
         .collect();
-    if archive.is_some() || !destinations.is_empty() || snoozable {
+    if archive.is_some() || junk.is_some() || !destinations.is_empty() || snoozable {
         items = items.separator();
     }
     if snoozable {
@@ -914,6 +972,9 @@ fn message_menu(
     if let Some(archive) = archive {
         items = items.item(MenuItem::new("Archive").on_select(move_to(&archive.name)));
     }
+    if let Some(junk) = junk {
+        items = items.item(MenuItem::new("Mark as spam").on_select(move_to(&junk.name)));
+    }
     if !destinations.is_empty() {
         items = items.item(
             MenuItem::new("Move to")
@@ -928,7 +989,7 @@ fn message_menu(
                 .on_select(move_to(&trash.name)),
         );
     }
-    items.build(k, layer).w_full()
+    items
 }
 
 /// The list's end, which loads older mail as it comes on screen, and spins while it's fetched.
@@ -977,14 +1038,25 @@ fn message(r: &Reader, k: &Kit) -> El {
     let subject = e.subject.clone().unwrap_or_else(|| "(no subject)".into());
     let mut header = col()
         .gap(6.0)
-        .child(
-            text(subject)
+        .child({
+            let subject = text(subject)
                 .key("subject")
                 .font(SUBJECT)
                 .color(k.c.text_base)
                 .wrap()
-                .selectable(true),
-        )
+                .selectable(true)
+                .grow(1.0)
+                .min_w(0.0);
+            let star = e.flagged.then(|| {
+                icon(&STAR, 18.0)
+                    .color(k.c.text_accent)
+                    .label("Starred")
+                    .mt(4.0)
+            });
+            row()
+                .gap(8.0)
+                .children(std::iter::once(subject).chain(star))
+        })
         .child(header_line(k, "From", std::slice::from_ref(&e.from)));
     if let Ok(body) = body {
         if !body.to.is_empty() {

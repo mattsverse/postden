@@ -75,17 +75,8 @@ async fn round<T: From<Event>, S: BuildHasher>(
                     if let Some(state) = state {
                         cached.insert(mailbox.name.clone(), state);
                     }
-                    if let Some((uid_validity, messages)) = synced {
-                        send(
-                            events,
-                            Event::Messages {
-                                account: account.id.clone(),
-                                mailbox: mailbox.name,
-                                role: mailbox.role,
-                                uid_validity,
-                                messages,
-                            },
-                        )?;
+                    for event in synced.events(&account.id, &mailbox.name, mailbox.role) {
+                        send(events, event)?;
                     }
                 }
                 // The server refused this mailbox; the others may still work.

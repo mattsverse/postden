@@ -11,6 +11,9 @@ use super::envelope;
 use super::watch::with_timeout;
 use crate::{Credentials, Error, Result};
 
+/// How long to wait for the server to answer a logout before dropping the connection.
+const LOGOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Messages fetched by [`fetch_older`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Older {
@@ -78,7 +81,9 @@ pub async fn fetch_older(
         Ok(Older { messages, done })
     }
     .await;
-    let _ignored = session.logout().await;
+    // Bounded, so the result arrives soon after it's read: what was changed meanwhile is kept
+    // only so long for it (the store's `KEEP_WRITTEN`).
+    let _ignored = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
     result
 }
 

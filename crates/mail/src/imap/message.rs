@@ -14,8 +14,14 @@ use super::search::quote;
 use super::watch::with_timeout;
 use crate::{Credentials, Error, Result};
 
-/// How long to wait for the server to answer a logout after a wake, before dropping the connection.
+/// How long to wait for the server to answer a logout, before dropping the connection.
 const LOGOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Logs out of `session`, waiting [`LOGOUT_TIMEOUT`] at most: the work done is answered soon
+/// after, as what's waiting on it (more changes to the same message) waits for that.
+async fn logout(mut session: Session) {
+    let _ignored = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
+}
 
 /// Downloads message `uid` from `mailbox` and marks it read.
 ///
@@ -37,12 +43,12 @@ pub async fn open_message(
         select(&mut session, mailbox, uid_validity).await?;
         // PEEK, then an explicit STORE: a plain BODY[] marks the message read only on some servers.
         let body = parse_body(&fetch_raw(&mut session, uid).await?);
-        store_seen(&mut session, uid, true).await?;
+        store_flag(&mut session, uid, "\\Seen", true).await?;
         Ok(body)
     }
     .await;
     // The work is done or failed already; a failed goodbye doesn't change that.
-    let _ignored = session.logout().await;
+    logout(session).await;
     result
 }
 
@@ -66,7 +72,7 @@ pub async fn download_message(
         fetch_raw(&mut session, uid).await
     }
     .await;
-    let _ignored = session.logout().await;
+    logout(session).await;
     result
 }
 
@@ -141,7 +147,7 @@ pub async fn prefetch_messages(
         Ok(Prefetched { bodies, too_big })
     }
     .await;
-    let _ignored = session.logout().await;
+    logout(session).await;
     result
 }
 
@@ -187,10 +193,34 @@ pub async fn set_seen(
     let mut session = connect(server, credentials).await?;
     let result = async {
         select(&mut session, mailbox, uid_validity).await?;
-        store_seen(&mut session, uid, seen).await
+        store_flag(&mut session, uid, "\\Seen", seen).await
     }
     .await;
-    let _ignored = session.logout().await;
+    logout(session).await;
+    result
+}
+
+/// Stars message `uid` in `mailbox`, flagging it `\Flagged`, or takes its star away. See
+/// [`open_message`] for `uid_validity`.
+///
+/// # Errors
+///
+/// As [`set_seen`].
+pub async fn set_flagged(
+    server: &Server,
+    credentials: &Credentials,
+    mailbox: &str,
+    uid_validity: u32,
+    uid: u32,
+    flagged: bool,
+) -> Result<()> {
+    let mut session = connect(server, credentials).await?;
+    let result = async {
+        select(&mut session, mailbox, uid_validity).await?;
+        store_flag(&mut session, uid, "\\Flagged", flagged).await
+    }
+    .await;
+    logout(session).await;
     result
 }
 
@@ -235,7 +265,7 @@ pub async fn mark_all_seen(
         Ok(up_to)
     }
     .await;
-    let _ignored = session.logout().await;
+    logout(session).await;
     result
 }
 
@@ -265,7 +295,7 @@ pub async fn move_message(
         move_selected(&mut session, &capabilities, &uid.to_string(), to).await
     }
     .await;
-    let _ignored = session.logout().await;
+    logout(session).await;
     result
 }
 
@@ -299,12 +329,30 @@ pub async fn snooze_message(
         move_selected(&mut session, &capabilities, &uid.to_string(), to).await
     }
     .await;
-    let _ignored = session.logout().await;
+    logout(session).await;
     result
 }
 
 /// Brings a snoozed message back: finds it in `mailbox` by `message_id`, marks it unread and
-/// moves it to `to`.
+/// moves it to `to`. As [`restore_message`] otherwise.
+///
+/// # Errors
+///
+/// As [`restore_message`].
+pub async fn wake_message(
+    server: &Server,
+    credentials: &Credentials,
+    mailbox: &str,
+    message_id: &str,
+    to: &str,
+) -> Result<Option<(u32, Vec<u32>)>> {
+    bring_back(server, credentials, mailbox, message_id, to, true).await
+}
+
+/// Moves a message back where it was, as when a move is undone: finds it in `mailbox` by
+/// `message_id`, as its UID there isn't known, and moves it to `to`, read or unread as it is.
+///
+/// With several copies there, only the one moved there last, with the highest UID, goes back.
 ///
 /// Returns the mailbox's UIDVALIDITY and the UIDs it had there, none if it was no longer there,
 /// as when moved elsewhere by hand; or `None` when the server has no `mailbox` that can hold
@@ -313,12 +361,25 @@ pub async fn snooze_message(
 /// # Errors
 ///
 /// Returns an error when the connection fails, the server can't move messages, or it refused to.
-pub async fn wake_message(
+pub async fn restore_message(
     server: &Server,
     credentials: &Credentials,
     mailbox: &str,
     message_id: &str,
     to: &str,
+) -> Result<Option<(u32, Vec<u32>)>> {
+    bring_back(server, credentials, mailbox, message_id, to, false).await
+}
+
+/// Finds a message in `mailbox` by `message_id` and moves it to `to`, unread with `unread` set:
+/// see [`restore_message`].
+async fn bring_back(
+    server: &Server,
+    credentials: &Credentials,
+    mailbox: &str,
+    message_id: &str,
+    to: &str,
+    unread: bool,
 ) -> Result<Option<(u32, Vec<u32>)>> {
     let mut session = connect(server, credentials).await?;
     let result = async {
@@ -361,15 +422,22 @@ pub async fn wake_message(
             return Ok(Some((uid_validity, uids)));
         }
         uids.sort_unstable();
+        // Moved back, it's the copy moved there last, which has the highest UID: another copy
+        // there before stays.
+        if !unread {
+            uids.drain(..uids.len() - 1);
+        }
         let set = uid_set(&uids);
-        with_timeout(async {
-            session
-                .uid_store(&set, "-FLAGS.SILENT (\\Seen)")
-                .await?
-                .try_for_each(|_fetch| async { Ok(()) })
-                .await
-        })
-        .await?;
+        if unread {
+            with_timeout(async {
+                session
+                    .uid_store(&set, "-FLAGS.SILENT (\\Seen)")
+                    .await?
+                    .try_for_each(|_fetch| async { Ok(()) })
+                    .await
+            })
+            .await?;
+        }
         move_selected(&mut session, &capabilities, &set, to).await?;
         Ok(Some((uid_validity, uids)))
     }
@@ -425,9 +493,10 @@ async fn select(session: &mut Session, mailbox: &str, uid_validity: u32) -> Resu
     }
 }
 
-async fn store_seen(session: &mut Session, uid: u32, seen: bool) -> Result<()> {
-    let change = if seen { '+' } else { '-' };
-    let query = format!("{change}FLAGS.SILENT (\\Seen)");
+/// Adds `flag` to message `uid` of the selected mailbox, or with `on` unset, takes it away.
+async fn store_flag(session: &mut Session, uid: u32, flag: &str, on: bool) -> Result<()> {
+    let change = if on { '+' } else { '-' };
+    let query = format!("{change}FLAGS.SILENT ({flag})");
     with_timeout(async {
         session
             .uid_store(uid.to_string(), query)

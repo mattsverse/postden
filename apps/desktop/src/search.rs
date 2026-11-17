@@ -66,6 +66,10 @@ pub(crate) struct Search {
     /// Mailboxes marked read below a UID while a search was still out, which may bring their
     /// messages back unread as they were before. Kept until every search out came back.
     read_below: HashMap<MailboxKey, u32>,
+    /// Messages among what the server found that were starred or unstarred from the window, as
+    /// shown, and whether the server answered. Kept, as `unconfirmed` is, while a search out may
+    /// bring one back as it was before.
+    starred: HashMap<MessageKey, (bool, bool)>,
     /// What the server found, cached or not.
     pub(crate) found: Vec<StoredMessage>,
     /// A mailbox had more matches on the server than it sent.
@@ -85,6 +89,7 @@ impl Default for Search {
             unconfirmed: HashMap::new(),
             moved: HashSet::new(),
             read_below: HashMap::new(),
+            starred: HashMap::new(),
             found: Vec::new(),
             more: false,
         }
@@ -129,6 +134,8 @@ impl Search {
         self.failed.clear();
         self.moved.clear();
         self.read_below.clear();
+        // Stars answered can't be undone by a search no longer out.
+        self.starred.retain(|_, &mut (_, answered)| !answered);
         self.found.clear();
         self.more = false;
     }
@@ -165,6 +172,9 @@ impl Search {
                     if let Some(change) = self.unconfirmed.get(&key) {
                         m.envelope.seen = change.shown;
                     }
+                    if let Some(&(flagged, _)) = self.starred.get(&key) {
+                        m.envelope.flagged = flagged;
+                    }
                     m
                 }));
                 self.searched.insert(key);
@@ -177,6 +187,7 @@ impl Search {
             // Every search out came back, so none can still bring a message as it was before a
             // change the server answered.
             drop_answered(&mut self.unconfirmed);
+            self.starred.retain(|_, &mut (_, answered)| !answered);
             self.moved.clear();
             self.read_below.clear();
         }
@@ -219,6 +230,7 @@ impl Search {
     fn drop_results(&mut self, gone: impl Fn(&str, &str) -> bool) {
         self.found.retain(|m| !gone(&m.account, &m.mailbox));
         self.unconfirmed.retain(|(a, m, _), _| !gone(a, m));
+        self.starred.retain(|(a, m, _), _| !gone(a, m));
     }
 
     /// Shows a message read or unread among what the server found, before the server agrees.
@@ -238,6 +250,35 @@ impl Search {
                 change.shown = seen;
                 m.envelope.seen = seen;
             }
+        }
+    }
+
+    /// Shows a message found starred or not. A search running still brings it back as the
+    /// server had it when searched.
+    pub(crate) fn set_flagged(&mut self, account: &str, mailbox: &str, uid: u32, flagged: bool) {
+        let key = (account.to_owned(), mailbox.to_owned(), uid);
+        // One starred before a search started again may not be found yet.
+        if !self.starred.contains_key(&key) && !self.found.iter().any(|m| message_key_of(m) == key)
+        {
+            return;
+        }
+        for m in &mut self.found {
+            if message_key_of(m) == key {
+                m.envelope.flagged = flagged;
+            }
+        }
+        self.starred.insert(key, (flagged, false));
+    }
+
+    /// The server answered a star asked for a message found, whatever it said: it's forgotten
+    /// once no search out can bring the message back as it was before.
+    pub(crate) fn star_answered(&mut self, account: &str, mailbox: &str, uid: u32) {
+        let key = (account.to_owned(), mailbox.to_owned(), uid);
+        if let Some((_, answered)) = self.starred.get_mut(&key) {
+            *answered = true;
+        }
+        if self.pending.is_empty() {
+            self.starred.retain(|_, &mut (_, answered)| !answered);
         }
     }
 
@@ -335,6 +376,11 @@ impl Search {
     }
 }
 
+/// The message `m` is, by account, mailbox and UID.
+fn message_key_of(m: &StoredMessage) -> MessageKey {
+    (m.account.clone(), m.mailbox.clone(), m.envelope.uid)
+}
+
 /// Drops the changes the server has answered.
 fn drop_answered(unconfirmed: &mut HashMap<MessageKey, Unconfirmed>) {
     unconfirmed.retain(|_, change| change.pending > 0);
@@ -386,6 +432,7 @@ mod tests {
             subject: Some("Quarterly Invoice".into()),
             date,
             seen: false,
+            flagged: false,
         }
     }
 
@@ -605,6 +652,44 @@ mod tests {
         assert!(search.answered("a", "INBOX", Ok((vec![stored("a", 1, Some(10))], false))));
         assert!(seen(&search, 1), "read, though the search saw it unread");
         assert_eq!(search.unconfirmed.len(), 0, "and forgotten after");
+    }
+
+    #[test]
+    fn a_star_awaited_survives_searching_again_and_is_forgotten_once_answered() {
+        let starred = |s: &Search| s.found.iter().any(|m| m.envelope.flagged);
+        let mut search = asked(vec![stored("a", 1, Some(10))]);
+        search.set_flagged("a", "INBOX", 1, true);
+        search.forget_server();
+        search.asked = Some("invoice".into());
+        search.pending.insert(("a".into(), "INBOX".into()));
+        // The new search saw it before the server starred it.
+        assert!(search.answered("a", "INBOX", Ok((vec![stored("a", 1, Some(10))], false))));
+        assert!(starred(&search), "shows the star awaited");
+        search.star_answered("a", "INBOX", 1);
+        assert!(
+            search.starred.is_empty(),
+            "no search is out to bring it back"
+        );
+    }
+
+    #[test]
+    fn a_star_refused_after_searching_again_is_taken_back_and_answered_ones_go_with_the_search() {
+        let starred = |s: &Search| s.found.iter().any(|m| m.envelope.flagged);
+        let mut search = asked(vec![stored("a", 1, Some(10))]);
+        search.set_flagged("a", "INBOX", 1, true);
+        search.forget_server();
+        // Refused before the new search came back.
+        search.set_flagged("a", "INBOX", 1, false);
+        search.star_answered("a", "INBOX", 1);
+        search.pending.insert(("a".into(), "INBOX".into()));
+        assert!(search.answered("a", "INBOX", Ok((vec![stored("a", 1, Some(10))], false))));
+        assert!(!starred(&search), "not starred, as the server refused");
+        // Answered while another search is out, then that search is dropped.
+        search.set_flagged("a", "INBOX", 1, true);
+        search.pending.insert(("b".into(), "INBOX".into()));
+        search.star_answered("a", "INBOX", 1);
+        search.forget_server();
+        assert!(search.starred.is_empty());
     }
 
     fn asked(found: Vec<StoredMessage>) -> Search {
