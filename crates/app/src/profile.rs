@@ -141,6 +141,10 @@ pub struct ProfileSettings {
     /// from profiles exported before Postden had it, which keep this computer's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefetch: Option<usize>,
+    /// Whether opened messages stay downloaded. Absent from profiles exported before Postden had
+    /// it, which keep this computer's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_opened: Option<bool>,
     pub notify_new_mail: bool,
     pub keep_running: bool,
     pub check_updates: bool,
@@ -555,6 +559,7 @@ impl From<&Settings> for ProfileSettings {
             theme: settings.theme,
             poll_interval_secs: settings.poll_interval.as_secs(),
             prefetch: Some(settings.prefetch),
+            keep_opened: Some(settings.keep_opened),
             notify_new_mail: settings.notify_new_mail,
             keep_running: settings.keep_running,
             check_updates: settings.check_updates,
@@ -571,6 +576,9 @@ impl ProfileSettings {
         }
         if let Some(prefetch) = self.prefetch.filter(|n| PREFETCH_COUNTS.contains(n)) {
             settings.prefetch = prefetch;
+        }
+        if let Some(keep_opened) = self.keep_opened {
+            settings.keep_opened = keep_opened;
         }
         settings.notify_new_mail = self.notify_new_mail;
         settings.keep_running = self.keep_running;
@@ -691,6 +699,7 @@ mod tests {
             theme: Theme::Dark,
             poll_interval: Duration::from_mins(5),
             prefetch: 50,
+            keep_opened: true,
             notify_new_mail: false,
             ..Settings::default()
         };
@@ -724,11 +733,13 @@ mod tests {
         .unwrap();
         let mut settings = Settings {
             prefetch: 100,
+            keep_opened: true,
             ..Settings::default()
         };
         older.apply(&mut settings);
         assert_eq!(settings.theme, Theme::Dark);
         assert_eq!(settings.prefetch, 100, "kept");
+        assert!(settings.keep_opened, "kept");
 
         let odd = ProfileSettings {
             prefetch: Some(7),
@@ -767,6 +778,7 @@ mod tests {
         assert_eq!(settings.theme, Theme::Dark);
         assert_eq!(settings.poll_interval, Duration::from_mins(5));
         assert_eq!(settings.prefetch, 50);
+        assert!(settings.keep_opened);
         assert!(!settings.notify_new_mail);
     }
 

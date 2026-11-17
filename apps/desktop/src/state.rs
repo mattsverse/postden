@@ -574,19 +574,25 @@ impl Mail {
             ..WatchConfig::default()
         };
         let notify = handle.clone();
-        let mailroom = Mailroom::start(&database, config, settings.prefetch, move |update| {
-            notify.update(move |s: &mut Self, tx| {
-                // Mail coming in can add rows above the palette's highlight (Reply, once a
-                // message downloads), which the list's scroll anchor doesn't follow.
-                let before = s.palette_highlight();
-                s.apply(update, tx);
-                if let (Some((was, _)), Some((row, key))) = (before, s.palette_highlight())
-                    && was != row
-                {
-                    tx.scroll_into_view(key);
-                }
-            });
-        })
+        let mailroom = Mailroom::start(
+            &database,
+            config,
+            settings.prefetch,
+            settings.keep_opened,
+            move |update| {
+                notify.update(move |s: &mut Self, tx| {
+                    // Mail coming in can add rows above the palette's highlight (Reply, once a
+                    // message downloads), which the list's scroll anchor doesn't follow.
+                    let before = s.palette_highlight();
+                    s.apply(update, tx);
+                    if let (Some((was, _)), Some((row, key))) = (before, s.palette_highlight())
+                        && was != row
+                    {
+                        tx.scroll_into_view(key);
+                    }
+                });
+            },
+        )
         .map_err(|e| e.to_string())?;
         let services = Services {
             store,
@@ -739,6 +745,15 @@ impl Mail {
             Update::CopyFailed { account, error } => self.copy_failed(&account, &error),
             Update::SaveFailed { account, error } => {
                 self.notify(format!("{account}: couldn't save new mail: {error}"));
+            }
+            Update::Cleared(cleared) => self.notify(match cleared {
+                Ok(0) => "No downloaded messages to clear.".to_owned(),
+                Ok(1) => "Cleared 1 downloaded message.".to_owned(),
+                Ok(n) => format!("Cleared {n} downloaded messages."),
+                Err(e) => format!("Couldn't clear the downloaded messages: {e}"),
+            }),
+            Update::ReleaseFailed(error) => {
+                self.notify(format!("Couldn't drop the opened messages kept: {error}"));
             }
             Update::Opened {
                 account,
@@ -3422,6 +3437,7 @@ impl Mail {
         self.set_theme(settings.theme);
         self.set_poll_interval(settings.poll_interval);
         self.set_prefetch(settings.prefetch);
+        self.set_keep_opened(settings.keep_opened);
         self.set_notify_new_mail(settings.notify_new_mail);
         self.set_keep_running(settings.keep_running);
         self.set_check_updates(settings.check_updates);
@@ -3547,6 +3563,27 @@ impl Mail {
         services.mailroom.set_prefetch(count);
         self.settings.prefetch = count;
         self.save_settings();
+    }
+
+    /// Keeps messages downloaded once opened, or stops, dropping those kept.
+    pub(crate) fn set_keep_opened(&mut self, on: bool) {
+        let Ok(services) = &self.services else {
+            return;
+        };
+        if services.mailroom.keep_opened() == on {
+            return;
+        }
+        services.mailroom.set_keep_opened(on);
+        self.settings.keep_opened = on;
+        self.save_settings();
+    }
+
+    /// Drops every message downloaded, ahead or once opened, to download them again as needed.
+    /// How many arrives as [`Update::Cleared`].
+    pub(crate) fn clear_downloaded(&mut self) {
+        if let Ok(services) = &self.services {
+            services.mailroom.clear_downloaded();
+        }
     }
 
     /// Checks mail every `every` on servers that can't push it, reconnecting every account.

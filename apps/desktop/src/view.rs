@@ -1833,7 +1833,8 @@ fn settings_accounts(s: &Mail, k: &Kit) -> El {
     accounts
 }
 
-/// How many of each inbox's newest messages are downloaded ahead of their opening.
+/// How many of each inbox's newest messages are downloaded ahead of their opening, whether
+/// opened ones stay downloaded, and a button to drop all of them.
 fn prefetch_setting(s: &Mail, k: &Kit) -> El {
     let counts: Vec<String> = PREFETCH_COUNTS
         .iter()
@@ -1860,15 +1861,30 @@ fn prefetch_setting(s: &Mail, k: &Kit) -> El {
     })
     .build(k)
     .key("prefetch");
+    let keep_opened = Switch::new(s.settings.keep_opened)
+        .label("Keep opened messages downloaded")
+        .on_toggle(|s: &mut Mail| s.set_keep_opened(!s.settings.keep_opened))
+        .build(k)
+        .key("keep-opened");
+    let clear = Button::new("Clear downloaded messages")
+        .on_press(Mail::clear_downloaded)
+        .build(k)
+        .key("clear-downloaded");
     setting_section(
         k,
         "Downloading ahead",
         Some(
             "Postden can download your newest messages as they arrive, so they open without \
              waiting for the server. Off, a message is downloaded only once you open it. \
-             Messages over 5 MB are always downloaded when opened.",
+             Messages over 5 MB are always downloaded when opened. Kept, a message you opened \
+             opens again without waiting, in any mailbox. Clearing drops every downloaded \
+             message; the newest are downloaded ahead again.",
         ),
-        row().child(prefetch),
+        col()
+            .gap(12.0)
+            .child(row().child(prefetch))
+            .child(keep_opened)
+            .child(row().child(clear)),
     )
 }
 
