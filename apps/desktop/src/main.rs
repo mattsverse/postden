@@ -93,16 +93,25 @@ fn on_reopen(s: &mut Mail, _visible: bool, _: &mut Tx) -> bool {
 /// ⇧⌘J move it to the account's Archive, Trash or Junk mailbox. Z undoes the last of those,
 /// replies and forwards aside. G then I, T, E, H, #, ! or L goes to all inboxes, Sent, the
 /// account's Archive, Snoozed, Trash or Junk, or any mailbox. Keys on their own only count while
-/// no field takes what's typed. Escape also closes the settings (or the update announcement over
-/// them, or an account's settings with nothing unsaved), and in the search field ends the search
-/// and leaves the field. While writing, ⌘↩ sends, and ⌘K links the selected text, as it does in
-/// a signature.
+/// no field takes what's typed, and none at all while a mailbox is being named, whose dialog Escape
+/// closes. Escape also closes the settings (or the update announcement over them, or an account's
+/// settings with nothing unsaved), and in the search field ends the search and leaves the field.
+/// While writing, ⌘↩ sends, and ⌘K links the selected text, as it does in a signature.
 fn on_key(s: &mut Mail, ev: &KeyEvent, tx: &mut Tx) -> bool {
     let go = s.take_go();
     let command_k = ev.is_command('k') && !ev.mods.shift;
     if s.palette.open && (command_k || ev.key == Key::Escape) {
         s.close_palette();
         return true;
+    }
+    // Naming a mailbox, the keys are the dialog's: with its button focused, they'd otherwise run
+    // the list's shortcuts behind it.
+    if s.new_mailbox.open {
+        if ev.key == Key::Escape {
+            s.close_new_mailbox();
+            return true;
+        }
+        return false;
     }
     let page = &mut s.account_settings;
     if command_k && s.settings_open && page.open {
