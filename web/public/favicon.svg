@@ -1,11 +1,88 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="100 100 824 824">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="60 60 904 904">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#26324A"/>
-      <stop offset="1" stop-color="#0F1522"/>
+    <linearGradient id="rock" x1="0.6" y1="0.1" x2="0.3" y2="1">
+      <stop offset="0" stop-color="#9566F7"/>
+      <stop offset="0.55" stop-color="#6A3BEA"/>
+      <stop offset="1" stop-color="#4A22CC"/>
     </linearGradient>
+    <linearGradient id="ridge" x1="0" y1="0" x2="1" y2="0.6">
+      <stop offset="0" stop-color="#A47BFA"/>
+      <stop offset="1" stop-color="#C9A6FF"/>
+    </linearGradient>
+    <linearGradient id="wall" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5C30DD"/>
+      <stop offset="1" stop-color="#4420C2"/>
+    </linearGradient>
+    <radialGradient id="hollow" cx="0.5" cy="0.3" r="0.75">
+      <stop offset="0" stop-color="#3A1585"/>
+      <stop offset="1" stop-color="#21094F"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="545" cy="470" r="290" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFB547" stop-opacity="1"/>
+      <stop offset="0.25" stop-color="#F28A2C" stop-opacity="0.85"/>
+      <stop offset="0.55" stop-color="#A2449A" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#5A1FA0" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFE38A"/>
+      <stop offset="1" stop-color="#F4A83A"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#D6C8FA"/>
+    </linearGradient>
+    <linearGradient id="flap" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9C6CF2"/>
+      <stop offset="1" stop-color="#6A36DA"/>
+    </linearGradient>
+    <linearGradient id="leaf" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#C9A4FF"/>
+      <stop offset="1" stop-color="#8A58EE"/>
+    </linearGradient>
+    <clipPath id="rockClip"><path d="M465 196 C500 180 545 178 585 191 L742 242 C790 258 815 282 832 312 L942 540 C955 568 960 592 960 622 L960 762 C960 810 924 842 874 842 L160 842 C100 842 65 806 65 752 L65 690 C65 645 74 612 90 580 L190 392 C204 365 224 347 252 330 Z"/></clipPath>
+    <clipPath id="envClip"><rect x="340" y="556" width="410" height="260" rx="34"/></clipPath>
+    <clipPath id="inside">
+      <path d="M200 842 L203 650 C206 560 245 470 300 420 C322 400 345 390 385 377 L540 326 C562 318 580 320 597 330 L835 472 C858 486 870 505 874 528 L898 842 Z"/>
+    </clipPath>
   </defs>
-  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
-  <rect x="262" y="332" width="500" height="360" rx="56" fill="none" stroke="#FFFFFF" stroke-width="48"/>
-  <path d="M310 390 L512 540 L714 390" fill="none" stroke="#FFFFFF" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g clip-path="url(#rockClip)">
+  <!-- The rock -->
+  <path d="M465 196 C500 180 545 178 585 191 L742 242 C790 258 815 282 832 312 L942 540 C955 568 960 592 960 622 L960 762 C960 810 924 842 874 842 L160 842 C100 842 65 806 65 752 L65 690 C65 645 74 612 90 580 L190 392 C204 365 224 347 252 330 Z" fill="url(#rock)"/>
+  <!-- Lit ridge along the top -->
+  <path d="M500 186 C530 178 560 180 585 191 L742 242 C790 258 815 282 832 312 L846 340 C800 312 760 306 715 300 C660 290 620 265 585 235 C560 214 530 196 500 186 Z" fill="url(#ridge)"/>
+  <!-- Inner wall, a step lighter than the hollow -->
+  <path d="M150 842 L160 640 C168 545 215 455 280 408 C305 390 330 380 370 368 L540 312 C565 304 585 306 605 318 L855 465 C882 482 895 505 900 530 L925 842 Z" fill="url(#wall)"/>
+
+  <!-- The hollow and the lantern's glow inside it -->
+  <g clip-path="url(#inside)">
+    <rect x="150" y="300" width="780" height="560" fill="url(#hollow)"/>
+    <rect x="150" y="300" width="780" height="560" fill="url(#glow)"/>
+    <rect x="150" y="818" width="780" height="30" fill="#4A20B8"/>
+  </g>
+
+  <!-- Lantern -->
+  <rect x="538" y="322" width="14" height="44" rx="4" fill="#C9813F"/>
+  <path d="M520 394 L520 376 Q520 358 545 358 Q570 358 570 376 L570 394" fill="none" stroke="#4A2639" stroke-width="11" stroke-linecap="round"/>
+  <path d="M526 392 Q545 378 564 392 L584 416 L506 416 Z" fill="#4A2639"/>
+  <rect x="483" y="416" width="124" height="16" rx="8" fill="#4A2639"/>
+  <rect x="506" y="432" width="78" height="70" rx="6" fill="url(#glass)" stroke="#4A2639" stroke-width="10"/>
+  <ellipse cx="545" cy="467" rx="17" ry="29" fill="#FFF7CF"/>
+  <rect x="497" y="502" width="96" height="15" rx="7.5" fill="#4A2639"/>
+  <rect x="516" y="515" width="58" height="10" rx="5" fill="#4A2639"/>
+
+  <!-- Envelope -->
+  <rect x="340" y="556" width="410" height="260" rx="34" fill="url(#paper)"/>
+  <g clip-path="url(#envClip)">
+    <path d="M350 800 L500 680 M740 800 L590 680" stroke="#E4DAFB" stroke-width="10" stroke-linecap="round" opacity="0.7"/>
+    <path d="M330 578 L522 700 Q545 714 568 700 L760 578" fill="none" stroke="url(#flap)" stroke-width="28" stroke-linejoin="round"/>
+  </g>
+
+  <!-- Leaves -->
+  <path d="M222 842 C150 805 112 728 136 684 C200 688 252 762 240 842 Z" fill="url(#leaf)"/>
+  <path d="M222 842 C200 790 170 735 140 690" fill="none" stroke="#D8BEFF" stroke-width="4" opacity="0.6"/>
+  <path d="M244 842 C238 792 272 750 322 745 C332 792 302 832 258 842 Z" fill="url(#leaf)"/>
+  <path d="M778 846 C762 778 806 718 868 714 C902 760 868 828 800 846 Z" fill="url(#leaf)"/>
+  <path d="M848 846 C856 790 896 760 936 762 C952 804 924 840 870 846 Z" fill="url(#leaf)"/>
+  </g>
 </svg>
