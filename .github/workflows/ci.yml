@@ -39,6 +39,9 @@ jobs:
       - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
         with:
           version: 2026.11.6
+          # Only what this job runs: rust everywhere, plus python for the release helpers (Linux)
+          # and the bundle's Info.plist (macOS). The hooks' tools and the website's bun stay local.
+          install_args: ${{ runner.os == 'Windows' && 'rust' || 'rust python' }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
