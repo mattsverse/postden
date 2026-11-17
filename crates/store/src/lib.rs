@@ -103,8 +103,8 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS messages_by_date ON messages(date DESC);
 
--- Messages downloaded ahead of their opening. Address lists are encoded as in messages.to_list;
--- references and attachment names are separated by U+001E.
+-- Messages downloaded ahead of their opening, or kept once opened. Address lists are encoded as
+-- in messages.to_list; references and attachment names are separated by U+001E.
 CREATE TABLE IF NOT EXISTS bodies (
     account      TEXT NOT NULL,
     mailbox      TEXT NOT NULL,
@@ -116,6 +116,8 @@ CREATE TABLE IF NOT EXISTS bodies (
     text         TEXT NOT NULL,
     html         TEXT,
     attachments  TEXT NOT NULL,
+    -- 1 when kept because it was opened: only downloading ahead's own are dropped as they age.
+    kept         INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account, mailbox, uid),
     FOREIGN KEY (account, mailbox, uid) REFERENCES messages(account, mailbox, uid)
         ON DELETE CASCADE
@@ -166,11 +168,11 @@ CREATE TABLE IF NOT EXISTS snoozes (
 ";
 
 /// The schema version [`SCHEMA`] creates, kept in `PRAGMA user_version`.
-const VERSION: i64 = 4;
+const VERSION: i64 = 5;
 
 /// Columns added since version 0, for databases created before them. Tables added since are
 /// created by [`SCHEMA`] itself.
-const MIGRATIONS: [(&str, &str, &str); 5] = [
+const MIGRATIONS: [(&str, &str, &str); 6] = [
     ("mailboxes", "role", "TEXT NOT NULL DEFAULT 'inbox'"),
     ("messages", "to_list", "TEXT"),
     // Version 2.
@@ -179,6 +181,8 @@ const MIGRATIONS: [(&str, &str, &str); 5] = [
     ("accounts", "label", "TEXT"),
     // Version 4.
     ("messages", "flagged", "INTEGER NOT NULL DEFAULT 0"),
+    // Version 5.
+    ("bodies", "kept", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 const MESSAGE_COLUMNS: &str = "m.account, m.mailbox, m.uid, m.message_id, m.from_name, m.from_email, m.subject, m.date, m.seen, m.to_list, m.flagged";
@@ -888,21 +892,33 @@ impl Store {
         Ok(removed)
     }
 
-    /// Caches a message's downloaded body. Returns whether it was cached: not when the message
-    /// itself isn't, such as one moved away meanwhile.
+    /// Caches a message's downloaded body, `kept` when that's because it was opened: then
+    /// [`Store::trim_bodies`] leaves it, and it stays kept once downloaded ahead again. Returns
+    /// whether it was cached: not when the message itself isn't, such as one moved away
+    /// meanwhile.
     ///
     /// # Errors
     ///
     /// Returns an error when the write fails.
-    pub fn save_body(&self, account: &str, mailbox: &str, uid: u32, body: &Body) -> Result<bool> {
+    pub fn save_body(
+        &self,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        body: &Body,
+        kept: bool,
+    ) -> Result<bool> {
         Ok(self.conn.execute(
             "INSERT INTO bodies
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+                (account, mailbox, uid, to_list, cc_list, reply_to, refs, text, html, attachments,
+                 kept)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
              WHERE EXISTS (SELECT 1 FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3)
              ON CONFLICT(account, mailbox, uid) DO UPDATE SET
                 to_list = excluded.to_list, cc_list = excluded.cc_list,
                 reply_to = excluded.reply_to, refs = excluded.refs, text = excluded.text,
-                html = excluded.html, attachments = excluded.attachments",
+                html = excluded.html, attachments = excluded.attachments,
+                kept = max(kept, excluded.kept)",
             params![
                 account,
                 mailbox,
@@ -914,11 +930,62 @@ impl Store {
                 body.text,
                 body.html,
                 body.attachments.join("\u{1e}"),
+                kept,
             ],
         )? > 0)
     }
 
-    /// A message's cached body, or `None` when it wasn't downloaded ahead.
+    /// Keeps a message's cached body as one opened, so [`Store::trim_bodies`] leaves it. Returns
+    /// whether its body is cached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub fn keep_body(&self, account: &str, mailbox: &str, uid: u32) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE bodies SET kept = 1 WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+            params![account, mailbox, uid],
+        )? > 0)
+    }
+
+    /// Stops keeping the bodies of opened messages, of every account: all are dropped but those
+    /// among the `newest` most recent of each account's mailbox `ahead`, whose newest are
+    /// downloaded ahead, which stay as if downloaded ahead. Every body outside `ahead` goes,
+    /// kept or not: only keeping opened messages caches those. Returns how many were dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, having changed nothing, when the write fails.
+    pub fn release_kept_bodies(&mut self, ahead: &str, newest: usize) -> Result<usize> {
+        let newest = i64::try_from(newest).unwrap_or(i64::MAX);
+        let tx = self.conn.transaction()?;
+        let dropped = tx.execute(
+            "DELETE FROM bodies WHERE mailbox <> ?1 OR (kept = 1 AND (account, uid) NOT IN (
+                SELECT account, uid FROM (
+                    SELECT account, uid, row_number() OVER (
+                        PARTITION BY account ORDER BY date IS NULL, date DESC, uid DESC
+                    ) AS position
+                    FROM messages WHERE mailbox = ?1
+                ) WHERE position <= ?2
+             ))",
+            params![ahead, newest],
+        )?;
+        tx.execute("UPDATE bodies SET kept = 0 WHERE kept = 1", [])?;
+        tx.commit()?;
+        Ok(dropped)
+    }
+
+    /// Drops every cached body, downloaded ahead or kept once opened, of every account. Returns
+    /// how many were dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub fn clear_bodies(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM bodies", [])?)
+    }
+
+    /// A message's cached body, or `None` when it wasn't downloaded ahead or kept.
     ///
     /// # Errors
     ///
@@ -974,8 +1041,8 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Drops the cached bodies in `mailbox` but those of its `newest` most recent messages.
-    /// Returns how many were dropped.
+    /// Drops the cached bodies in `mailbox` but those of its `newest` most recent messages and
+    /// those kept once opened. Returns how many were dropped.
     ///
     /// # Errors
     ///
@@ -983,7 +1050,7 @@ impl Store {
     pub fn trim_bodies(&self, account: &str, mailbox: &str, newest: usize) -> Result<usize> {
         let newest = i64::try_from(newest).unwrap_or(i64::MAX);
         Ok(self.conn.execute(
-            "DELETE FROM bodies WHERE account = ?1 AND mailbox = ?2 AND uid NOT IN (
+            "DELETE FROM bodies WHERE account = ?1 AND mailbox = ?2 AND kept = 0 AND uid NOT IN (
                 SELECT uid FROM messages WHERE account = ?1 AND mailbox = ?2
                 ORDER BY date IS NULL, date DESC, uid DESC LIMIT ?3
              )",
@@ -1582,7 +1649,7 @@ mod tests {
                 .save_messages(&mine.id, "INBOX", Role::Inbox, 1, &[envelope(1, 10)])
                 .unwrap();
             store
-                .save_body(&mine.id, "INBOX", 1, &Body::default())
+                .save_body(&mine.id, "INBOX", 1, &Body::default(), false)
                 .unwrap();
             store
                 .snooze(&Snooze {
@@ -1737,10 +1804,10 @@ mod tests {
             attachments: vec!["report.pdf".into()],
         };
         assert_eq!(store.body(me, "INBOX", 1).unwrap(), None);
-        assert!(store.save_body(me, "INBOX", 1, &body).unwrap());
+        assert!(store.save_body(me, "INBOX", 1, &body, false).unwrap());
         assert_eq!(store.body(me, "INBOX", 1).unwrap(), Some(body.clone()));
         assert!(
-            !store.save_body(me, "INBOX", 2, &body).unwrap(),
+            !store.save_body(me, "INBOX", 2, &body, false).unwrap(),
             "not cached, so its body isn't either"
         );
         // Updated in place, the message keeps its body.
@@ -1763,7 +1830,9 @@ mod tests {
             .unwrap();
         assert_eq!(store.missing_bodies(me, "INBOX", 2).unwrap(), [4, 3]);
         for uid in [1, 3] {
-            store.save_body(me, "INBOX", uid, &Body::default()).unwrap();
+            store
+                .save_body(me, "INBOX", uid, &Body::default(), false)
+                .unwrap();
         }
         assert_eq!(store.missing_bodies(me, "INBOX", 3).unwrap(), [4, 2]);
         assert_eq!(store.trim_bodies(me, "INBOX", 3).unwrap(), 1, "UID 1");
@@ -1773,6 +1842,115 @@ mod tests {
             store.missing_bodies(me, "INBOX", 0).unwrap(),
             Vec::<u32>::new()
         );
+    }
+
+    #[test]
+    fn opened_bodies_are_kept_until_released_or_cleared() {
+        let mut store = Store::open_in_memory().unwrap();
+        let me = "me@example.com";
+        store.save_account(&account(me)).unwrap();
+        let messages: Vec<_> = (1..=3).map(|uid| envelope(uid, i64::from(uid))).collect();
+        store
+            .save_messages(me, "INBOX", Role::Inbox, 1, &messages)
+            .unwrap();
+        store
+            .save_messages(me, "Archive", Role::Archive, 1, &messages[..1])
+            .unwrap();
+        let cached = |store: &Store, mailbox, uid| store.body(me, mailbox, uid).unwrap().is_some();
+        // Another account's inbox, whose newest are counted apart.
+        let you = "you@example.com";
+        store.save_account(&account(you)).unwrap();
+        store
+            .save_messages(you, "INBOX", Role::Inbox, 1, &messages[..1])
+            .unwrap();
+        store
+            .save_body(you, "INBOX", 1, &Body::default(), true)
+            .unwrap();
+
+        store
+            .save_body(me, "INBOX", 1, &Body::default(), true)
+            .unwrap();
+        store
+            .save_body(me, "INBOX", 2, &Body::default(), false)
+            .unwrap();
+        assert!(
+            store.keep_body(me, "INBOX", 2).unwrap(),
+            "opened once downloaded ahead"
+        );
+        assert!(!store.keep_body(me, "INBOX", 3).unwrap(), "not cached");
+        store
+            .save_body(me, "INBOX", 3, &Body::default(), false)
+            .unwrap();
+        // Saved as not kept, outside the inbox: released all the same.
+        store
+            .save_body(me, "Archive", 1, &Body::default(), false)
+            .unwrap();
+        // Downloaded ahead again, it stays kept.
+        store
+            .save_body(me, "INBOX", 1, &Body::default(), false)
+            .unwrap();
+        assert_eq!(store.trim_bodies(me, "INBOX", 0).unwrap(), 1, "UID 3");
+        assert!(cached(&store, "INBOX", 1) && cached(&store, "INBOX", 2));
+
+        assert_eq!(
+            store.release_kept_bodies("INBOX", 2).unwrap(),
+            2,
+            "the archived one, and UID 1, past the newest two"
+        );
+        assert!(!cached(&store, "Archive", 1) && !cached(&store, "INBOX", 1));
+        assert!(cached(&store, "INBOX", 2), "among the newest");
+        assert!(
+            store.body(you, "INBOX", 1).unwrap().is_some(),
+            "its own newest"
+        );
+        assert_eq!(
+            store.trim_bodies(me, "INBOX", 1).unwrap(),
+            1,
+            "no longer kept, UID 2 goes as one downloaded ahead"
+        );
+
+        store
+            .save_body(me, "Archive", 1, &Body::default(), true)
+            .unwrap();
+        assert_eq!(store.clear_bodies().unwrap(), 2, "and the other account's");
+        assert!(!cached(&store, "Archive", 1));
+    }
+
+    #[test]
+    fn a_version_4_database_keeps_its_bodies_as_downloaded_ahead() {
+        let dir = std::env::temp_dir().join(format!("postden-store-v4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v4.db");
+        let _ignored = std::fs::remove_file(&path);
+        let me = "me@example.com";
+        {
+            let mut store = Store::open(&path).unwrap();
+            store.save_account(&account(me)).unwrap();
+            store
+                .save_messages(me, "INBOX", Role::Inbox, 1, &[envelope(1, 1)])
+                .unwrap();
+            store
+                .save_body(me, "INBOX", 1, &Body::default(), false)
+                .unwrap();
+            // As version 4 left it: bodies without `kept`.
+            store
+                .conn
+                .execute_batch("ALTER TABLE bodies DROP COLUMN kept; PRAGMA user_version = 4;")
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert!(
+            store.body(me, "INBOX", 1).unwrap().is_some(),
+            "kept through"
+        );
+        assert_eq!(
+            store.trim_bodies(me, "INBOX", 0).unwrap(),
+            1,
+            "as one downloaded ahead"
+        );
+        drop(store);
+        Store::open(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

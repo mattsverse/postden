@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -192,6 +192,12 @@ pub enum Update {
         to: String,
         result: Result<bool, String>,
     },
+    /// Every downloaded message was dropped, as asked with [`Mailroom::clear_downloaded`]: how
+    /// many, or why they couldn't be.
+    Cleared(Result<usize, String>),
+    /// The opened messages kept couldn't be dropped once [`Mailroom::set_keep_opened`] stopped
+    /// keeping them.
+    ReleaseFailed(String),
     /// A message handed to [`Mailroom::send`] was accepted by the account's SMTP server, or wasn't.
     /// On success, it's the `Message-ID` it was sent with.
     Sent {
@@ -270,6 +276,9 @@ enum Job {
         body: Result<Body, String>,
         /// When it was answered, as [`WatchConfig::changes`] counts: downloaded, it's read.
         at: u64,
+        /// How many times downloaded messages were cleared when it was asked: cleared since,
+        /// it's shown but not kept.
+        cleared: u64,
     },
     Seen {
         account: String,
@@ -328,6 +337,10 @@ enum Job {
         uid_validity: u32,
         result: Result<Found, String>,
     },
+    /// Drop every downloaded message, then download ahead anew.
+    Clear,
+    /// Stop keeping opened messages, unless they're kept again by then.
+    Release,
     /// Download the account's newest inbox messages not downloaded yet, as many as asked, and
     /// drop the others downloaded before.
     Prefetch {
@@ -443,6 +456,7 @@ impl Job {
                 uid_validity,
                 uid,
                 at,
+                cleared,
                 ..
             } => Self::Opened {
                 account,
@@ -451,6 +465,7 @@ impl Job {
                 uid,
                 body: replaced(),
                 at,
+                cleared,
             },
             Self::Seen {
                 account,
@@ -588,6 +603,10 @@ pub struct Mailroom {
     config: WatchConfig,
     /// How many of each inbox's newest messages to download ahead.
     prefetch: Arc<AtomicUsize>,
+    /// Whether messages, once opened, stay downloaded.
+    keep_opened: Arc<AtomicBool>,
+    /// How many times downloaded messages were cleared: see [`Job::Opened`].
+    cleared: Arc<AtomicU64>,
     /// Each watched account's IMAP server and credentials, for downloading ahead, with the
     /// watch they're for: one lookup gets both, so a download is never numbered as a watch
     /// on other servers.
@@ -608,7 +627,8 @@ type Watches = Arc<Mutex<HashMap<String, u64>>>;
 
 impl Mailroom {
     /// Starts the background runtime and the thread that saves mail into the database at `database`.
-    /// The newest `prefetch` messages of each inbox are downloaded ahead of their opening.
+    /// The newest `prefetch` messages of each inbox are downloaded ahead of their opening, and
+    /// with `keep_opened`, any message opened stays downloaded.
     ///
     /// # Errors
     ///
@@ -617,6 +637,7 @@ impl Mailroom {
         database: &Path,
         config: WatchConfig,
         prefetch: usize,
+        keep_opened: bool,
         notify: impl Fn(Update) + Send + 'static,
     ) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -628,6 +649,8 @@ impl Mailroom {
         let mut store = Store::open(database)?;
         let (jobs, mut received) = unbounded_channel();
         let prefetch = Arc::new(AtomicUsize::new(prefetch));
+        let keep_opened = Arc::new(AtomicBool::new(keep_opened));
+        let cleared = Arc::new(AtomicU64::new(0));
         let logins = Logins::default();
         let watches = Watches::default();
         let mut prefetcher = Prefetcher {
@@ -636,6 +659,8 @@ impl Mailroom {
             logins: Arc::clone(&logins),
             watches: Arc::clone(&watches),
             count: Arc::clone(&prefetch),
+            keep_opened: Arc::clone(&keep_opened),
+            cleared: Arc::clone(&cleared),
             busy: HashSet::new(),
             skipped: HashSet::new(),
         };
@@ -655,6 +680,8 @@ impl Mailroom {
             watchers: HashMap::new(),
             config,
             prefetch,
+            keep_opened,
+            cleared,
             logins,
             watches,
             last_watch: 0,
@@ -677,6 +704,32 @@ impl Mailroom {
         for account in self.watchers.keys() {
             self.prefetch_for(account);
         }
+    }
+
+    /// Whether messages, once opened, stay downloaded.
+    #[must_use]
+    pub fn keep_opened(&self) -> bool {
+        self.keep_opened.load(Ordering::Relaxed)
+    }
+
+    /// Keeps messages downloaded once they're opened, or stops: then, in the background, those
+    /// kept are dropped but for those among the newest downloaded ahead. Failing, that arrives
+    /// as [`Update::ReleaseFailed`].
+    pub fn set_keep_opened(&self, on: bool) {
+        self.keep_opened.store(on, Ordering::Relaxed);
+        if !on {
+            // On the store thread, after any opened message it's keeping meanwhile.
+            let _ignored = self.jobs.send(Job::Release);
+        }
+    }
+
+    /// Drops every downloaded message, of every account, whether downloaded ahead or kept once
+    /// opened, in the background, then downloads ahead anew as the setting says. Messages
+    /// being opened meanwhile are shown but not kept. How many were dropped arrives as
+    /// [`Update::Cleared`].
+    pub fn clear_downloaded(&self) {
+        self.cleared.fetch_add(1, Ordering::Relaxed);
+        let _ignored = self.jobs.send(Job::Clear);
     }
 
     /// Has the store thread download ahead what `account`'s inbox lacks.
@@ -850,6 +903,11 @@ impl Mailroom {
         uid: u32,
         mark: bool,
     ) -> Result<(Option<Body>, bool)> {
+        // Downloaded ahead, it's kept now it's opened, past its turn among the newest: before
+        // it's read, so it isn't trimmed in between.
+        if self.keep_opened() {
+            store.keep_body(account, mailbox, uid)?;
+        }
         if let Some(body) = store.body(account, mailbox, uid)? {
             // Shown all the same while disconnected; it stays unread until opened online.
             let marking = mark
@@ -862,6 +920,7 @@ impl Mailroom {
         let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
         let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
         let changes = self.config.changes.clone();
+        let cleared = self.cleared.load(Ordering::Relaxed);
         self.handle.spawn(async move {
             let body = open_message(&server, &credentials, &mailbox, uid_validity, uid)
                 .await
@@ -874,6 +933,7 @@ impl Mailroom {
                 uid,
                 body,
                 at: changes.answered(),
+                cleared,
             });
         });
         Ok((None, false))
@@ -1473,6 +1533,10 @@ struct Prefetcher {
     logins: Logins,
     watches: Watches,
     count: Arc<AtomicUsize>,
+    /// Whether messages, once opened, stay downloaded, in any mailbox.
+    keep_opened: Arc<AtomicBool>,
+    /// How many times downloaded messages were cleared: see [`Job::Opened`].
+    cleared: Arc<AtomicU64>,
     /// The accounts with a batch being downloaded ahead: one at a time each, so only one
     /// connection per account downloads ahead, and nothing is asked for twice.
     busy: HashSet<String>,
@@ -1496,6 +1560,8 @@ impl Prefetcher {
         let watches = Arc::clone(&self.watches);
         let current = watches.lock().unwrap_or_else(PoisonError::into_inner);
         let is_current = |account: &str, watch| current.get(account) == Some(&watch);
+        // Read once, so whether an opened message is kept and how agree, however it's switched.
+        let keep = self.keep_opened.load(Ordering::Relaxed);
         let job = match job {
             Job::Asked { watch, job } if job.account().is_some_and(|a| !is_current(a, watch)) => {
                 job.superseded()
@@ -1508,6 +1574,8 @@ impl Prefetcher {
             job => job,
         };
         let (account, updates) = match job {
+            Job::Clear => return self.clear(store),
+            Job::Release => return self.release(store),
             Job::Prefetch { account } => (account, Vec::new()),
             Job::Prefetched {
                 account,
@@ -1541,16 +1609,19 @@ impl Prefetcher {
                 uid,
                 body: Ok(body),
                 at,
-            } if mailbox == INBOX && self.count.load(Ordering::Relaxed) > 0 => {
+                cleared,
+            } if self.keeps_opened(&mailbox, keep)
+                && cleared == self.cleared.load(Ordering::Relaxed) =>
+            {
                 let mut updates = Vec::new();
-                // Kept like one downloaded ahead, so it opens again without waiting; unless the
-                // mailbox started over meanwhile, as its UID names another message now.
+                // Kept, or kept like one downloaded ahead, so it opens again without waiting;
+                // unless the mailbox started over meanwhile, as its UID names another message now.
                 let kept = store
                     .mailbox_state(&account, &mailbox)
                     .map_err(Error::from)
                     .and_then(|state| {
                         if state.is_some_and(|s| s.uid_validity == uid_validity) {
-                            store.save_body(&account, &mailbox, uid, &body)?;
+                            store.save_body(&account, &mailbox, uid, &body, keep)?;
                         }
                         Ok(())
                     });
@@ -1567,6 +1638,7 @@ impl Prefetcher {
                     uid,
                     body: Ok(body),
                     at,
+                    cleared,
                 };
                 updates.extend(save(store, opened));
                 (account, updates)
@@ -1581,6 +1653,48 @@ impl Prefetcher {
             });
         }
         updates
+    }
+
+    /// Drops every downloaded message, then downloads ahead anew for each account logged in.
+    fn clear(&mut self, store: &Store) -> Vec<Update> {
+        let mut updates = vec![Update::Cleared(
+            store.clear_bodies().map_err(|e| e.to_string()),
+        )];
+        let accounts: Vec<String> = self
+            .logins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        for account in accounts {
+            if let Err(e) = self.prefetch(store, &account) {
+                updates.push(Update::SaveFailed {
+                    account,
+                    error: e.to_string(),
+                });
+            }
+        }
+        updates
+    }
+
+    /// Stops keeping opened messages, of every account, logged in or not: all are dropped but
+    /// those among each inbox's newest downloaded ahead. Unless they're kept again by now.
+    fn release(&self, store: &mut Store) -> Vec<Update> {
+        if self.keep_opened.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        let count = self.count.load(Ordering::Relaxed);
+        match store.release_kept_bodies(INBOX, count) {
+            Ok(_) => Vec::new(),
+            Err(e) => vec![Update::ReleaseFailed(e.to_string())],
+        }
+    }
+
+    /// Whether a message opened in `mailbox` is to stay downloaded: when opened messages are
+    /// `kept`, or, in the inbox, while its newest are downloaded ahead.
+    fn keeps_opened(&self, mailbox: &str, kept: bool) -> bool {
+        kept || (mailbox == INBOX && self.count.load(Ordering::Relaxed) > 0)
     }
 
     fn save_prefetched(
@@ -1599,7 +1713,7 @@ impl Prefetcher {
                 return Ok(());
             }
             for (uid, body) in &prefetched.bodies {
-                store.save_body(account, INBOX, *uid, body)?;
+                store.save_body(account, INBOX, *uid, body, false)?;
             }
             let downloaded: HashSet<u32> = prefetched.bodies.iter().map(|(uid, _)| *uid).collect();
             self.skipped.extend(
@@ -1759,6 +1873,7 @@ fn save_answered(store: &Store, job: Job) -> Vec<Update> {
             uid,
             body,
             at,
+            ..
         } => opened(store, (account, mailbox, uid_validity), uid, body, at),
         Job::Seen {
             account,
@@ -2412,6 +2527,8 @@ mod tests {
                 1,
             )]))),
             count: Arc::new(AtomicUsize::new(count)),
+            keep_opened: Arc::new(AtomicBool::new(false)),
+            cleared: Arc::new(AtomicU64::new(0)),
             busy: HashSet::new(),
             skipped: HashSet::new(),
         };
@@ -2643,6 +2760,7 @@ mod tests {
             uid: 1,
             body: Ok(Body::default()),
             at: 0,
+            cleared: 0,
         };
         let (_runtime, mut off) = prefetcher(0);
         off.save(&mut store, messages(1, &[1]));
@@ -2663,14 +2781,111 @@ mod tests {
     }
 
     #[test]
+    fn opened_messages_are_kept_in_any_mailbox_past_the_newest() {
+        let (mut store, _runtime, mut prefetcher) = keeping();
+        prefetcher.save(&mut store, opening("Archive", 0));
+        assert!(cached(&store, "Archive"), "not only the inbox's");
+        // UID 1 isn't among the one newest downloaded ahead, but stays.
+        prefetcher.save(&mut store, opening("INBOX", 0));
+        assert!(cached(&store, "INBOX"));
+        prefetcher.save(
+            &mut store,
+            Job::Prefetch {
+                account: "me@example.com".into(),
+            },
+        );
+        assert!(cached(&store, "INBOX"), "not trimmed");
+    }
+
+    /// The store, with an archived message 1 and inbox messages 1 and 2, and a prefetcher
+    /// downloading the newest one ahead and keeping opened messages.
+    fn keeping() -> (Store, (Runtime, UnboundedSender<Job>), Prefetcher) {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        let (runtime, mut prefetcher) = prefetcher(1);
+        prefetcher.keep_opened.store(true, Ordering::Relaxed);
+        let mut archived = messages(1, &[1]);
+        if let Job::Watched(Event::Messages { mailbox, role, .. }) = &mut archived {
+            *mailbox = "Archive".into();
+            *role = Role::Archive;
+        }
+        prefetcher.save(&mut store, archived);
+        prefetcher.save(&mut store, messages(1, &[1, 2]));
+        (store, runtime, prefetcher)
+    }
+
+    /// Message 1 of `mailbox` downloaded, asked for before `cleared` clears.
+    fn opening(mailbox: &str, cleared: u64) -> Job {
+        Job::Opened {
+            account: "me@example.com".into(),
+            mailbox: mailbox.into(),
+            uid_validity: 1,
+            uid: 1,
+            body: Ok(Body::default()),
+            at: 0,
+            cleared,
+        }
+    }
+
+    fn cached(store: &Store, mailbox: &str) -> bool {
+        store.body("me@example.com", mailbox, 1).unwrap().is_some()
+    }
+
+    #[test]
+    fn opened_messages_are_released_after_those_being_kept() {
+        let (mut store, _runtime, mut prefetcher) = keeping();
+        // Kept as the setting was when its turn came, then turned off: released after.
+        prefetcher.save(&mut store, opening("Archive", 0));
+        prefetcher.save(&mut store, opening("INBOX", 0));
+        prefetcher.keep_opened.store(false, Ordering::Relaxed);
+        assert_eq!(prefetcher.save(&mut store, Job::Release), []);
+        assert!(!cached(&store, "Archive"));
+        assert!(!cached(&store, "INBOX"), "not among the newest one");
+
+        // Turned on again before the release's turn: still kept.
+        prefetcher.keep_opened.store(true, Ordering::Relaxed);
+        prefetcher.save(&mut store, opening("Archive", 0));
+        prefetcher.save(&mut store, Job::Release);
+        assert!(cached(&store, "Archive"));
+    }
+
+    #[test]
+    fn a_message_opened_before_a_clear_is_shown_but_not_kept() {
+        let (mut store, _runtime, mut prefetcher) = keeping();
+        prefetcher.save(&mut store, opening("Archive", 0));
+        prefetcher.cleared.fetch_add(1, Ordering::Relaxed);
+        let updates = prefetcher.save(&mut store, Job::Clear);
+        assert!(
+            matches!(updates.as_slice(), [Update::Cleared(Ok(1))]),
+            "got {updates:?}"
+        );
+        assert!(!cached(&store, "Archive"));
+
+        let updates = prefetcher.save(&mut store, opening("Archive", 0));
+        assert!(
+            matches!(updates.as_slice(), [Update::Opened { body: Ok(_), .. }]),
+            "got {updates:?}"
+        );
+        assert!(!cached(&store, "Archive"), "asked before the clear");
+        prefetcher.save(&mut store, opening("Archive", 1));
+        assert!(cached(&store, "Archive"), "asked after");
+    }
+
+    #[test]
     fn dropping_the_mailroom_ends_the_store_thread() {
         let dir = std::env::temp_dir().join(format!("postden-mailroom-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (ended, done) = std::sync::mpsc::channel::<()>();
         // The callback goes with the store thread: once it's dropped, the thread ended.
-        let mailroom = Mailroom::start(&dir.join("db"), WatchConfig::default(), 50, move |_| {
-            let _ = &ended;
-        })
+        let mailroom = Mailroom::start(
+            &dir.join("db"),
+            WatchConfig::default(),
+            50,
+            false,
+            move |_| {
+                let _ = &ended;
+            },
+        )
         .unwrap();
         drop(mailroom);
         let result = done.recv_timeout(Duration::from_secs(5));
@@ -2700,6 +2915,7 @@ mod tests {
             uid: 1,
             body,
             at: 0,
+            cleared: 0,
         };
         let seen = |store: &Store| {
             store.recent_messages(Role::Inbox, 1).unwrap()[0]
@@ -3122,6 +3338,7 @@ mod tests {
                 uid: 1,
                 body: Ok(Body::default()),
                 at: 0,
+                cleared: 0,
             },
         );
         assert!(matches!(opened.as_slice(), [Update::Opened { .. }]));
