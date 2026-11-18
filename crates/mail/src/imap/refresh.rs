@@ -7,20 +7,21 @@ use std::sync::Arc;
 
 use postden_core::account::Account;
 use postden_core::message::{MailboxState, Role};
-use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
 
 use super::connection::connect;
 use super::mailboxes::list_mailboxes;
-use super::watch::{Event, WatchConfig, sync, with_timeout};
+use super::message::logout;
+use super::watch::{Event, Nudge, WatchConfig, sync, with_timeout};
 use crate::{Credentials, Error, Result};
 
 /// Lists `account`'s mailboxes and syncs every one but the inbox, then again every
-/// [`WatchConfig::refresh_interval`] or as soon as `nudge` is notified, until `events` is closed.
+/// [`WatchConfig::refresh_interval`] or as soon as `nudge` is asked, until `events` is closed.
 ///
 /// Starts from `cached`, each mailbox's state as last synced, by name. Sends
-/// [`Event::Mailboxes`] after each listing and [`Event::Messages`] for what each sync finds.
+/// [`Event::Mailboxes`] after each listing, [`Event::Messages`] for what each sync finds, and
+/// [`Event::Synced`] as each mailbox's sync ends and, with no mailbox, as the round does.
 /// Failures aren't reported, as the inbox's watcher already says whether the account works; the
 /// next round tries again.
 pub async fn refresh<T: From<Event>, S: BuildHasher + Send>(
@@ -28,13 +29,19 @@ pub async fn refresh<T: From<Event>, S: BuildHasher + Send>(
     credentials: Credentials,
     mut cached: HashMap<String, MailboxState, S>,
     config: WatchConfig,
-    nudge: Arc<Notify>,
+    nudge: Arc<Nudge>,
     events: UnboundedSender<T>,
 ) {
     loop {
+        let asked = nudge.asked();
         // An error ends this round only; the next one reconnects.
-        let _failed = round(&account, &credentials, &mut cached, &config, &events).await;
-        if events.is_closed() {
+        let _failed = round(&account, &credentials, &mut cached, &config, &events, asked).await;
+        let ended = Event::Synced {
+            account: account.id.clone(),
+            mailbox: None,
+            asked,
+        };
+        if send(&events, ended).is_err() {
             return;
         }
         tokio::select! {
@@ -51,6 +58,7 @@ async fn round<T: From<Event>, S: BuildHasher>(
     cached: &mut HashMap<String, MailboxState, S>,
     config: &WatchConfig,
     events: &UnboundedSender<T>,
+    asked: u64,
 ) -> Result<()> {
     let mut session = connect(&account.imap, credentials).await?;
     let result = async {
@@ -83,11 +91,18 @@ async fn round<T: From<Event>, S: BuildHasher>(
                 Err(e) if is_refusal(&e) => {}
                 Err(e) => return Err(e),
             }
+            let synced = Event::Synced {
+                account: account.id.clone(),
+                mailbox: Some(mailbox.name.clone()),
+                asked,
+            };
+            send(events, synced)?;
         }
         Ok(())
     }
     .await;
-    let _ignored = session.logout().await;
+    // Bounded: an unanswered logout would hold back the round's end, and the next round.
+    logout(session).await;
     result
 }
 

@@ -14,7 +14,7 @@ use postden_core::account::{Account, Server};
 use postden_core::message::{Address, Body, Envelope, Mailbox, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
-    Event, Flags, Found, Older, Prefetched, SNOOZED_NAME, Status, Verdict, WatchConfig,
+    Event, Flags, Found, Nudge, Older, Prefetched, SNOOZED_NAME, Status, Verdict, WatchConfig,
     create_mailbox, download_message, fetch_older, mark_all_seen, move_message, open_message,
     prefetch_messages, refresh, restore_message, save_sent_copy, search, set_flagged, set_seen,
     snooze_message, wake_message, watch,
@@ -22,7 +22,6 @@ use postden_mail::imap::{
 use postden_mail::{Credentials, smtp};
 use postden_store::{Snooze, Store, Written};
 use tokio::runtime::Runtime;
-use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
 
@@ -44,6 +43,15 @@ pub enum Update {
     Status { account: String, status: Status },
     /// The server listed an account's mailboxes. They're in the store.
     Mailboxes { account: String },
+    /// A sync of one of an account's mailboxes ended, with what it found already saved, or
+    /// failed: it answered every refresh numbered up to `asked`, as [`Mailroom::refresh`] and
+    /// [`Mailroom::refresh_inbox`] number them. With no mailbox, it's every mailbox but the
+    /// inbox.
+    Synced {
+        account: String,
+        mailbox: Option<String>,
+        asked: u64,
+    },
     /// Mail was saved. `first_sync` is true when this is the mailbox's first fetch (or a restart after
     /// its UIDVALIDITY changed), so the messages aren't "new", just newly cached.
     Mail {
@@ -430,6 +438,7 @@ fn event_account(event: &Event) -> &str {
         Event::Status { account, .. }
         | Event::Messages { account, .. }
         | Event::Mailboxes { account, .. }
+        | Event::Synced { account, .. }
         | Event::Flags { account, .. } => account,
     }
 }
@@ -573,9 +582,9 @@ struct Watched {
     /// The inbox's watcher, the other mailboxes' refresher, and what numbers what they report.
     tasks: [AbortHandle; 3],
     /// Wakes the refresher.
-    nudge: Arc<Notify>,
+    nudge: Arc<Nudge>,
     /// Wakes the inbox's watcher.
-    inbox_nudge: Arc<Notify>,
+    inbox_nudge: Arc<Nudge>,
     /// Which watch of the account this is: see [`Job::Watching`].
     number: u64,
 }
@@ -626,6 +635,8 @@ pub struct Mailroom {
     watches: Watches,
     /// The number of the last watch started.
     last_watch: u64,
+    /// Numbers every refresh asked for, of any account: see [`Nudge`].
+    refreshes: Arc<AtomicU64>,
     /// The accounts whose due snoozes are being brought back, not to be asked for twice at once.
     waking: Arc<Mutex<HashSet<String>>>,
     /// Snoozed messages being moved back by [`Mailroom::restore`], by account and Message-ID:
@@ -696,6 +707,7 @@ impl Mailroom {
             logins,
             watches,
             last_watch: 0,
+            refreshes: Arc::default(),
             waking: Arc::default(),
             unsnoozing: Arc::default(),
         })
@@ -834,8 +846,8 @@ impl Mailroom {
                 }
             }
         });
-        let nudge = Arc::new(Notify::new());
-        let inbox_nudge = Arc::new(Notify::new());
+        let nudge = Arc::new(Nudge::new(Arc::clone(&self.refreshes)));
+        let inbox_nudge = Arc::new(Nudge::new(Arc::clone(&self.refreshes)));
         let watcher = self.handle.spawn(watch(
             account.clone(),
             imap_credentials.clone(),
@@ -1123,7 +1135,7 @@ impl Mailroom {
             .map_err(|e| e.to_string());
             // The inbox's watcher sees mail moved there on its own; the refresher syncs the rest.
             if result.is_ok() {
-                nudge.notify_one();
+                let _asked = nudge.ask();
             }
             let moving = Moving {
                 account,
@@ -1202,7 +1214,7 @@ impl Mailroom {
             .await
             .map_err(|e| e.to_string());
             if result.is_ok() {
-                nudge.notify_one();
+                let _asked = nudge.ask();
             }
             let moving = Moving {
                 account,
@@ -1296,7 +1308,7 @@ impl Mailroom {
             .await
             .map_err(|e| e.to_string());
             if result.is_ok() {
-                nudge.notify_one();
+                let _asked = nudge.ask();
             }
             // Bringing it back once due finds nothing to bring if it was moved.
             if let Some(unsnoozing) = unsnoozing {
@@ -1362,7 +1374,7 @@ impl Mailroom {
                     .await
                     .map_err(|e| e.to_string());
                     if result.is_ok() {
-                        nudge.notify_one();
+                        let _asked = nudge.ask();
                     }
                     let _ignored = jobs.send(Job::Woke(snooze, result));
                 }
@@ -1444,19 +1456,16 @@ impl Mailroom {
     }
 
     /// Lists and syncs `account`'s mailboxes other than the inbox now, rather than at the next
-    /// interval. Does nothing for an account that isn't watched.
-    pub fn refresh(&self, account: &str) {
-        if let Some(w) = self.watchers.get(account) {
-            w.nudge.notify_one();
-        }
+    /// interval. Returns the refresh's number, which an [`Update::Synced`] numbered as much or
+    /// more answers; `None`, doing nothing, for an account that isn't watched.
+    pub fn refresh(&self, account: &str) -> Option<u64> {
+        self.watchers.get(account).map(|w| w.nudge.ask())
     }
 
     /// Syncs `account`'s inbox now, rather than once the server reports a change or at the next
-    /// poll. Does nothing for an account that isn't watched.
-    pub fn refresh_inbox(&self, account: &str) {
-        if let Some(w) = self.watchers.get(account) {
-            w.inbox_nudge.notify_one();
-        }
+    /// poll. Returns the refresh's number, as [`Mailroom::refresh`] does.
+    pub fn refresh_inbox(&self, account: &str) -> Option<u64> {
+        self.watchers.get(account).map(|w| w.inbox_nudge.ask())
     }
 
     /// Creates a mailbox called `name` on `account`'s server in the background, then lists the
@@ -1476,7 +1485,7 @@ impl Mailroom {
                 .await
                 .map_err(|e| e.to_string());
             if result.is_ok() {
-                nudge.notify_one();
+                let _asked = nudge.ask();
             }
             let _ignored = jobs.send(Job::Done(Update::MailboxCreated {
                 account,
@@ -1524,7 +1533,9 @@ impl Mailroom {
             }));
             match save_sent_copy(&imap, &credentials, &sent.message_id, &sent.copy).await {
                 // Fetch it from Sent now, so it's listed there right away.
-                Ok(()) => nudge.notify_one(),
+                Ok(()) => {
+                    let _asked = nudge.ask();
+                }
                 Err(e) => {
                     let _ignored = jobs.send(Job::Done(Update::CopyFailed {
                         account,
@@ -1885,6 +1896,15 @@ impl Prefetcher {
 fn save(store: &mut Store, job: Job) -> Vec<Update> {
     match job {
         Job::Watched(Event::Status { account, status }) => vec![Update::Status { account, status }],
+        Job::Watched(Event::Synced {
+            account,
+            mailbox,
+            asked,
+        }) => vec![Update::Synced {
+            account,
+            mailbox,
+            asked,
+        }],
         Job::Watched(Event::Mailboxes { account, mailboxes }) => {
             save_mailboxes(store, account, &mailboxes)
                 .into_iter()
