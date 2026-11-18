@@ -97,8 +97,15 @@ fn on_reopen(s: &mut Mail, _visible: bool, _: &mut Tx) -> bool {
 /// on their own only count while no field takes what's typed, and none at all while a mailbox is
 /// being named, whose dialog Escape closes. Escape also closes the settings (or the update announcement over them, or an account's
 /// settings with nothing unsaved), and in the search field ends the search and leaves the field.
-/// While writing, ⌘↩ sends, and ⌘K links the selected text, as it does in a signature.
+/// While writing, ⌘↩ sends, and ⌘K links the selected text, as it does in a signature. A key that
+/// gets here with the From picker open, as after Tab leaves its search, closes it; Escape only that.
 fn on_key(s: &mut Mail, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if s.compose.from.is_open() {
+        s.close_from_picker();
+        if ev.key == Key::Escape {
+            return true;
+        }
+    }
     let go = s.take_go();
     let command_k = ev.is_command('k') && !ev.mods.shift;
     if s.palette.open && (command_k || ev.key == Key::Escape) {

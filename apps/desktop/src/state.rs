@@ -1475,6 +1475,15 @@ impl Mail {
         }
     }
 
+    /// Closes the From picker for a key that went past it, as after Tab left its search. The key
+    /// still does what it does (⌘W closes the window), so an update of its own builds the view.
+    pub(crate) fn close_from_picker(&mut self) {
+        self.compose.from.close();
+        if let Some(handle) = &self.handle {
+            handle.update(|_: &mut Self, _| {});
+        }
+    }
+
     /// Starts a reply to the open message, once it's downloaded.
     pub(crate) fn reply(&mut self, all: bool) {
         self.answer(if all { Answer::ReplyAll } else { Answer::Reply });
