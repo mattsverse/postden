@@ -60,6 +60,12 @@ static FOLDER: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M2.5 4.25C2.5 3.84 2.84 3.5 3.25 3.5H6.25L7.5 5H12.75C13.16 5 13.5 5.34 13.5 5.75V11.75C13.5 12.16 13.16 12.5 12.75 12.5H3.25C2.84 12.5 2.5 12.16 2.5 11.75Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/>"#,
 };
+/// The Junk mailbox's: a stop sign.
+static JUNK: Icon = Icon {
+    name: "postden-junk",
+    view: 16.0,
+    body: r#"<path d="M5.6 2.25H10.4L13.75 5.6V10.4L10.4 13.75H5.6L2.25 10.4V5.6Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/><path d="M8 5V8.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="10.75" r="0.8" fill="currentColor"/>"#,
+};
 static GEAR: Icon = Icon {
     name: "postden-gear",
     view: 16.0,
@@ -434,6 +440,7 @@ fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut 
         .icon(match mailbox.role {
             Role::Inbox => &INBOX,
             Role::Sent => &SENT,
+            Role::Junk => &JUNK,
             _ => &FOLDER,
         })
         .depth(1)
@@ -1040,6 +1047,11 @@ fn message_menu_moves(s: &Mail, m: &StoredMessage, menu: &MessageMenu, mut items
     };
     let archive = elsewhere(Role::Archive);
     let junk = elsewhere(Role::Junk);
+    // Spam goes back to the inbox.
+    let inbox = s
+        .mailbox_with_role(account, Role::Junk)
+        .filter(|b| b.name == mailbox)
+        .and_then(|_| elsewhere(Role::Inbox));
     // A snoozed message waits in the Snoozed mailbox; one already there isn't snoozed again.
     let snoozable = s
         .mailbox_with_role(account, Role::Snoozed)
@@ -1052,7 +1064,12 @@ fn message_menu_moves(s: &Mail, m: &StoredMessage, menu: &MessageMenu, mut items
         .filter(|b| b.name != mailbox)
         .map(|b| MenuEntry::item(MenuItem::new(b.label()).on_select(move_to(&b.name))))
         .collect();
-    if archive.is_some() || junk.is_some() || !destinations.is_empty() || snoozable {
+    if archive.is_some()
+        || junk.is_some()
+        || inbox.is_some()
+        || !destinations.is_empty()
+        || snoozable
+    {
         items = items.separator();
     }
     if snoozable {
@@ -1078,6 +1095,9 @@ fn message_menu_moves(s: &Mail, m: &StoredMessage, menu: &MessageMenu, mut items
     }
     if let Some(junk) = junk {
         items = items.item(MenuItem::new("Mark as spam").on_select(move_to(&junk.name)));
+    }
+    if let Some(inbox) = inbox {
+        items = items.item(MenuItem::new("Not spam").on_select(move_to(&inbox.name)));
     }
     if !destinations.is_empty() {
         items = items.item(

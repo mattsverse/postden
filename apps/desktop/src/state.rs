@@ -2282,7 +2282,8 @@ impl Mail {
         self.left_list(key);
     }
 
-    /// Moves the focused message to its account's mailbox with `role`: its Archive, Trash or Junk.
+    /// Moves the focused message to its account's mailbox with `role`: its Archive, Trash or Junk,
+    /// or its inbox for spam that isn't.
     pub(crate) fn move_focused_to(&mut self, role: Role) {
         let Some(m) = self.focused_message() else {
             return;
@@ -2364,11 +2365,14 @@ impl Mail {
                     return;
                 }
                 let Ok(services) = &self.services else { return };
-                if let Err(e) =
-                    services
-                        .mailroom
-                        .restore(account, &to, &message_id, mailbox, snoozed)
-                {
+                if let Err(e) = services.mailroom.restore(
+                    &services.store,
+                    account,
+                    &to,
+                    &message_id,
+                    mailbox,
+                    snoozed,
+                ) {
                     let label = self.label(account).to_owned();
                     self.notify(format!("{label}: couldn't move the message back: {e}"));
                     return;
