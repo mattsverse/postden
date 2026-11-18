@@ -22,7 +22,7 @@ use rune_kit::{
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
 use crate::commands::{Command, Entry, Shortcut};
 use crate::compose::{ComposeForm, Mode, Preview};
-use crate::form::{AccountForm, SECURITY, Step, security_index};
+use crate::form::{AccountForm, SECURITY, Step, is_set_up, security_index};
 use crate::rich::RichEditor;
 use crate::search::{SERVER_PAGE, ServerSearch};
 use crate::state::{
@@ -31,6 +31,7 @@ use crate::state::{
 };
 use crate::transfer::{self as moving, Transfer};
 use crate::update::{self, Phase};
+use postden_app::import::{Found, Setup};
 
 static INBOX: Icon = Icon {
     name: "postden-inbox",
@@ -100,7 +101,7 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
     } else if s.settings_open {
         settings(s, &k)
     } else if s.form.open {
-        form(&s.form, &k)
+        form(&s.form, &s.accounts, &k)
     } else if s.compose.open {
         compose(s, &s.compose, &k)
     } else if let Some(reader) = &s.reader {
@@ -293,6 +294,7 @@ fn title(s: &Mail) -> String {
             Step::Choose => "Add an account",
             Step::Google => "Sign in with Google",
             Step::Servers => "Other mail (IMAP and SMTP)",
+            Step::Import => "From another mail app",
         }
         .into();
     }
@@ -1442,11 +1444,12 @@ fn long_date(unix: Option<i64>) -> Option<String> {
     )
 }
 
-fn form(f: &AccountForm, k: &Kit) -> El {
+fn form(f: &AccountForm, accounts: &[Account], k: &Kit) -> El {
     let page = match f.step {
-        Step::Choose => choose(k),
+        Step::Choose => choose(f, k),
         Step::Google => google_form(f, k),
         Step::Servers => servers_form(f, k),
+        Step::Import => import_list(f, accounts, k),
     };
     col()
         .key("form-scroll")
@@ -1478,8 +1481,9 @@ fn with_error(page: El, f: &AccountForm, k: &Kit) -> El {
     }
 }
 
-/// The first screen: how to connect the account.
-fn choose(k: &Kit) -> El {
+/// The first screen: how to connect the account. Setting it up from another mail app is a
+/// choice only when one is on this computer.
+fn choose(f: &AccountForm, k: &Kit) -> El {
     let option = |key: &str, title: &str, about: &str, action: &str, step: Step| {
         col()
             .key(key)
@@ -1508,29 +1512,138 @@ fn choose(k: &Kit) -> El {
                 ),
             )
     };
-    form_page("form-choose")
-        .child(option(
-            "choose-google",
-            "Google",
-            "Gmail and Google Workspace. Sign in in your browser; no app password needed.",
-            "Sign in with Google",
-            Step::Google,
-        ))
-        .child(option(
-            "choose-servers",
-            "Other mail (IMAP and SMTP)",
-            "Any provider: fill in its incoming and outgoing servers and your password.",
-            "Set up IMAP and SMTP",
-            Step::Servers,
-        ))
-        .child(
-            row().child(
-                Button::new("Cancel")
-                    .variant(ButtonVariant::Ghost)
-                    .on_press(|s: &mut Mail| s.form = AccountForm::default())
-                    .build(k),
+    let mut page = form_page("form-choose");
+    if !f.imports.apps.is_empty() {
+        let apps = f.imports.apps.join(" and ");
+        page = page.child(option(
+            "choose-import",
+            &format!("From {apps}"),
+            &format!(
+                "Pick an account set up in {apps} on this computer, and its servers are filled \
+                 in. Its password isn't shared: you type it, or sign in with Google again."
             ),
-        )
+            "Choose an account",
+            Step::Import,
+        ));
+    }
+    page.child(option(
+        "choose-google",
+        "Google",
+        "Gmail and Google Workspace. Sign in in your browser; no app password needed.",
+        "Sign in with Google",
+        Step::Google,
+    ))
+    .child(option(
+        "choose-servers",
+        "Other mail (IMAP and SMTP)",
+        "Any provider: fill in its incoming and outgoing servers and your password.",
+        "Set up IMAP and SMTP",
+        Step::Servers,
+    ))
+    .child(
+        row().child(
+            Button::new("Cancel")
+                .variant(ButtonVariant::Ghost)
+                .on_press(|s: &mut Mail| s.form = AccountForm::default())
+                .build(k),
+        ),
+    )
+}
+
+/// The accounts other mail apps on this computer have, each with a button to set it up, or why
+/// it can't be, or that it's set up already.
+fn import_list(f: &AccountForm, accounts: &[Account], k: &Kit) -> El {
+    let muted = |s: String| text(s).font(k.ty.small).color(k.c.text_muted).wrap();
+    let mut page = form_page("form-import");
+    let Some(found) = &f.imports.found else {
+        return page
+            .child(
+                row()
+                    .gap(8.0)
+                    .center_y()
+                    .child(Spinner::new().build(k))
+                    .child(muted("Reading the accounts…".into())),
+            )
+            .child(row().child(back(k, false)));
+    };
+    for (app, read) in found {
+        let mut list = col().w_full().gap(6.0).child(
+            text((*app).to_owned())
+                .font(k.ty.ui_medium)
+                .color(k.c.text_base),
+        );
+        match read {
+            Err(e) => list = list.child(muted(format!("Couldn't read {app}'s accounts: {e}"))),
+            Ok(none) if none.is_empty() => {
+                list = list.child(muted(format!("{app} has no mail accounts set up.")));
+            }
+            Ok(found) => {
+                for account in found {
+                    list = list.child(found_row(account, accounts, k));
+                }
+            }
+        }
+        page = page.child(list);
+    }
+    page.child(row().child(back(k, false)))
+}
+
+/// One account another app has: its names and address, and setting it up.
+fn found_row(found: &Found, accounts: &[Account], k: &Kit) -> El {
+    let name = found
+        .label
+        .as_deref()
+        .or(found.display_name.as_deref())
+        .unwrap_or(&found.address);
+    let mut about = col().grow(1.0).min_w(0.0).child(
+        text(name.to_owned())
+            .font(k.ty.ui_medium)
+            .color(k.c.text_base),
+    );
+    if name != found.address {
+        about = about.child(
+            text(found.address.clone())
+                .font(k.ty.small)
+                .color(k.c.text_muted),
+        );
+    }
+    let set_up = is_set_up(accounts, &found.address);
+    let end = match &found.setup {
+        _ if set_up => text("Set up already".to_owned())
+            .font(k.ty.small)
+            .color(k.c.text_muted),
+        Setup::Unsupported(why) => {
+            about = about.child(
+                text(format!("Can't be set up: {why}"))
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .wrap(),
+            );
+            col()
+        }
+        setup => {
+            let address = found.address.clone();
+            let action = if *setup == Setup::Google {
+                "Sign in with Google"
+            } else {
+                "Set up"
+            };
+            Button::new(action)
+                .variant(ButtonVariant::Neutral)
+                .on_press(move |s: &mut Mail| s.set_up_found(&address))
+                .build(k)
+        }
+    };
+    row()
+        .key(format!("found-{}", found.address))
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .padding(12.0)
+        .radius(8.0)
+        .border(1.0, k.c.border_weak)
+        .child(about)
+        .child(end)
 }
 
 /// Signing in with Google, or the sign-in under way.
@@ -1691,7 +1804,7 @@ fn back(k: &Kit, disabled: bool) -> El {
     Button::new("Back")
         .variant(ButtonVariant::Ghost)
         .disabled(disabled)
-        .on_press(|s: &mut Mail| s.form_step(Step::Choose))
+        .on_press(Mail::form_back)
         .build(k)
 }
 

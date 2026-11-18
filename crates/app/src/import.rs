@@ -6,7 +6,9 @@
 //! what they log in with, so a found account is set up with its password typed in, or by signing
 //! in with Google again; one Postden can't log in to says why, in [`Unsupported`].
 //!
-//! Adding an app is adding a [`Source`] for it, and listing it in [`installed`].
+//! Adding an app is adding a [`Source`] for it, and listing it in [`installed`]. Everything
+//! else, such as the desktop app's list of what each app has, works from [`Source`] and
+//! [`Found`] alone.
 
 mod spark;
 
@@ -43,6 +45,13 @@ pub fn installed(home: &Path) -> Vec<Box<dyn Source>> {
         sources.push(Box::new(spark));
     }
     sources
+}
+
+/// The mail apps Postden can read that are set up for this user: [`installed`] in their home
+/// directory. None when there's no home directory.
+#[must_use]
+pub fn installed_here() -> Vec<Box<dyn Source>> {
+    directories::BaseDirs::new().map_or_else(Vec::new, |dirs| installed(dirs.home_dir()))
 }
 
 /// An account another mail app has.

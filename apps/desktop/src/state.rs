@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use jiff::{Timestamp, Zoned};
 use postden_app::{
     Draft, Imported, Login, Mailroom, Passwords, Profile, Settings, Theme, Update, check_logins,
-    eml_file_name, finish_google_sign_in, is_sealed, password_key, remove_account, save_account,
-    signature, smtp_password_key, start_google_sign_in,
+    eml_file_name, finish_google_sign_in, import, is_sealed, password_key, remove_account,
+    save_account, signature, smtp_password_key, start_google_sign_in,
 };
 use postden_core::account::{Account, Signature};
 use postden_core::message::{Body, Envelope, Mailbox, Role};
@@ -28,7 +28,7 @@ use rune_kit::shell::PaneState;
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
 use crate::commands::{self, Command, Palette, PaletteMode, Shortcut};
 use crate::compose::{ComposeForm, Mode};
-use crate::form::{AccountForm, GoogleSignIn, Step};
+use crate::form::{AccountForm, AppAccounts, GoogleSignIn, Imports, Step, is_set_up};
 use crate::notifications::{self, Alert, Target};
 use crate::search::{self, MailboxKey, MessageKey, SERVER_PAGE, Search};
 use crate::transfer::{self, Transfer};
@@ -251,6 +251,9 @@ pub(crate) const INBOX: &str = "INBOX";
 /// close. Shared, not in [`Mail`], so the tray's thread bumps it the moment its icon is clicked,
 /// before an update already queued could act on the close.
 static CLOSES: AtomicU64 = AtomicU64::new(0);
+
+/// Counts the add-account form's openings, for [`Imports::session`].
+static FORM_OPENINGS: AtomicU64 = AtomicU64::new(0);
 
 /// The window is coming back: what its last close started no longer applies. Any thread.
 pub(crate) fn reopened() {
@@ -546,7 +549,9 @@ impl Mail {
                     Ok(Err(e)) => mail.notify(e.to_string()),
                     Err(_) => {}
                 }
-                mail.form.open = mail.accounts.is_empty();
+                if mail.accounts.is_empty() {
+                    mail.open_form();
+                }
                 // What came due while the app was closed comes back now, then the rest on time.
                 mail.wake_snoozed();
                 mail.updater = Updater::new();
@@ -2984,29 +2989,114 @@ impl Mail {
             .map_or(id, Account::label)
     }
 
+    /// Opens the add-account form, noting which other mail apps it can set accounts up from.
     pub(crate) fn open_form(&mut self) {
         self.reader = None;
         self.settings_open = false;
         self.form = AccountForm {
             open: true,
+            imports: Imports {
+                apps: import::installed_here().iter().map(|s| s.app()).collect(),
+                session: FORM_OPENINGS.fetch_add(1, Ordering::Relaxed),
+                ..Imports::default()
+            },
             ..AccountForm::default()
         };
     }
 
-    /// Moves the add-account form to `step`, starting it afresh.
+    /// Moves the add-account form to `step`, starting its fields afresh. The accounts other
+    /// apps have stay as read; they're read the first time [`Step::Import`] shows.
     pub(crate) fn form_step(&mut self, step: Step) {
+        let imports = std::mem::take(&mut self.form.imports);
         self.form = AccountForm {
             open: true,
             step,
+            imports,
             ..AccountForm::default()
         };
-        self.form.email.focused = step != Step::Choose;
+        self.form.imports.picked = None;
+        self.form.email.focused = step == Step::Google || step == Step::Servers;
+        if step == Step::Import && self.form.imports.found.is_none() {
+            self.read_imports();
+        }
+    }
+
+    /// Back from setting up an account: to the accounts other apps have, when it was picked
+    /// there, else to choosing how to connect.
+    pub(crate) fn form_back(&mut self) {
+        let step = if self.form.imports.picked.is_some() {
+            Step::Import
+        } else {
+            Step::Choose
+        };
+        self.form_step(step);
+    }
+
+    /// Reads, in the background, the accounts each mail app found on this computer has, once
+    /// for each opening of the form.
+    fn read_imports(&mut self) {
+        let (Ok(services), Some(handle)) = (&self.services, &self.handle) else {
+            return;
+        };
+        let imports = &mut self.form.imports;
+        if imports.reading {
+            return;
+        }
+        imports.reading = true;
+        let (session, handle) = (imports.session, handle.clone());
+        services.mailroom.handle().spawn_blocking(move || {
+            let found: Vec<_> = import::installed_here()
+                .iter()
+                .map(|source| {
+                    let accounts = source.accounts().map_err(|e| e.to_string());
+                    (source.app(), accounts)
+                })
+                .collect();
+            handle.update(move |s: &mut Self, _| s.imports_read(session, found));
+        });
+    }
+
+    /// What the other apps have, as read for the form's opening `session`. Not taken when the
+    /// form was opened again meanwhile: that opening reads them anew.
+    fn imports_read(&mut self, session: u64, found: Vec<AppAccounts>) {
+        let imports = &mut self.form.imports;
+        if imports.session == session {
+            imports.found = Some(found);
+            imports.reading = false;
+        }
+    }
+
+    /// Sets up `address`, one of the accounts another app has: the form shows its screen,
+    /// filled in with what that app has, for its password or a Google sign-in. Not when it's
+    /// set up already, as saving it would replace that one.
+    pub(crate) fn set_up_found(&mut self, address: &str) {
+        if is_set_up(&self.accounts, address) {
+            return;
+        }
+        let Some(found) = self.form.imports.find(address).cloned() else {
+            return;
+        };
+        let mut form = AccountForm {
+            open: true,
+            imports: std::mem::take(&mut self.form.imports),
+            ..AccountForm::default()
+        };
+        let Some(step) = form.fill(&found) else {
+            self.form.imports = form.imports;
+            return;
+        };
+        form.step = step;
+        form.imports.picked = Some(found.address);
+        // The servers are filled in: what's left to type is the password.
+        form.password.focused = step == Step::Servers;
+        form.name.focused = step == Step::Google;
+        self.form = form;
     }
 
     /// Submits the form's current screen: signs in with Google, or checks the typed-in login.
     pub(crate) fn submit_form(&mut self, _: &mut Tx) {
         match self.form.step {
-            Step::Choose => {}
+            Step::Choose | Step::Import => {}
             Step::Google => self.sign_in_with_google(),
             Step::Servers => self.check_servers(),
         }
@@ -3025,7 +3115,10 @@ impl Mail {
             .new_account()
             .and_then(|a| a.build().map_err(|e| e.to_string()))
         {
-            Ok(account) => account,
+            Ok(account) => Account {
+                label: self.form.label.clone(),
+                ..account
+            },
             Err(e) => {
                 self.form.error = Some(e);
                 return;
@@ -3140,11 +3233,24 @@ impl Mail {
             return;
         }
         match result {
-            Ok((account, login)) => self.login_checked(&account, &login, Ok(())),
+            Ok((account, login)) => {
+                let label = self.form_label(&account.id);
+                self.login_checked(&Account { label, ..account }, &login, Ok(()));
+            }
             Err(e) => {
                 self.form.checking = false;
                 self.form.error = Some(e);
             }
+        }
+    }
+
+    /// The label to give `address`, signed in to from the form: the one the other app it was
+    /// picked from has. Google may have been signed in to with another address than the one
+    /// picked, which that label doesn't name.
+    fn form_label(&self, address: &str) -> Option<String> {
+        match &self.form.imports.picked {
+            Some(picked) if !picked.eq_ignore_ascii_case(address) => None,
+            _ => self.form.label.clone(),
         }
     }
 
@@ -3176,8 +3282,19 @@ impl Mail {
         }
         self.statuses.insert(id, Ok(Status::Connecting));
         self.notify(format!("Added {label}"));
-        self.form = AccountForm::default();
+        self.form_added();
         self.reload();
+    }
+
+    /// The form once the account it set up was added: back to what the other app it was picked
+    /// from has, for the next one, unless the form was left for something else meanwhile; else
+    /// closed.
+    fn form_added(&mut self) {
+        if self.form.open && self.form.imports.picked.is_some() {
+            self.form_step(Step::Import);
+        } else {
+            self.form = AccountForm::default();
+        }
     }
 
     /// Shows the settings page. A message being written stays, and shows again once it closes,
@@ -4135,6 +4252,8 @@ pub(crate) fn row_key(key: &MessageKey) -> String {
 
 #[cfg(test)]
 mod tests {
+    use postden_core::account::Security;
+
     use super::*;
 
     #[test]
@@ -4163,6 +4282,181 @@ mod tests {
             s.notice.as_deref(),
             Some("me@example.com: created the mailbox Later")
         );
+    }
+
+    /// A form open on the accounts Spark has: one with servers, a Gmail one and a Microsoft one.
+    fn importing() -> Mail {
+        use postden_app::import::{Found, Setup, Unsupported};
+        use postden_core::account::Server;
+
+        let found = |address: &str, setup| Found {
+            address: address.into(),
+            display_name: Some("Ada".into()),
+            label: Some("Work".into()),
+            setup,
+        };
+        let server = |host: &str, port| Server {
+            host: host.into(),
+            port,
+            security: Security::StartTls,
+            username: "ada@example.com".into(),
+        };
+        let mut s = Mail::not_started();
+        s.open_form();
+        s.form.imports.apps = vec!["Spark"];
+        s.form_step(Step::Import);
+        s.form.imports.found = Some(vec![(
+            "Spark",
+            Ok(vec![
+                found(
+                    "ada@example.com",
+                    Setup::Password {
+                        imap: server("imap.example.com", 143),
+                        smtp: server("smtp.example.com", 587),
+                    },
+                ),
+                found("ada@gmail.com", Setup::Google),
+                found(
+                    "ada@outlook.com",
+                    Setup::Unsupported(Unsupported::Microsoft),
+                ),
+            ]),
+        )]);
+        s
+    }
+
+    #[test]
+    fn an_account_from_another_app_fills_in_its_servers_and_back_returns_to_the_list() {
+        let mut s = importing();
+        s.set_up_found("ada@example.com");
+        let f = &s.form;
+        assert_eq!(f.step, Step::Servers);
+        assert_eq!(f.email.text, "ada@example.com");
+        assert_eq!(f.name.text, "Ada");
+        assert_eq!(f.label.as_deref(), Some("Work"));
+        assert_eq!(
+            (f.imap_host.text.as_str(), f.imap_port.text.as_str()),
+            ("imap.example.com", "143")
+        );
+        assert_eq!(
+            (f.smtp_host.text.as_str(), f.smtp_port.text.as_str()),
+            ("smtp.example.com", "587")
+        );
+        assert_eq!(f.smtp_security, Security::StartTls);
+        assert_eq!(f.username.text, "", "the user name is the address");
+        assert!(f.password.focused, "the password is what's left to type");
+
+        s.form_back();
+        assert_eq!(s.form.step, Step::Import);
+        assert_eq!(s.form.imports.picked, None);
+        assert!(
+            s.form.imports.find("ada@gmail.com").is_some(),
+            "the list stays as read"
+        );
+        assert_eq!(s.form.email.text, "", "the fields start afresh");
+    }
+
+    #[test]
+    fn a_gmail_account_from_another_app_signs_in_with_google_and_others_cant_be_set_up() {
+        let mut s = importing();
+        s.set_up_found("ada@outlook.com");
+        assert_eq!(
+            s.form.step,
+            Step::Import,
+            "a Microsoft account isn't set up"
+        );
+        assert!(
+            s.form.imports.find("ada@example.com").is_some(),
+            "the list stays"
+        );
+
+        s.set_up_found("ada@gmail.com");
+        assert_eq!(s.form.step, Step::Google);
+        assert_eq!(s.form.email.text, "ada@gmail.com", "suggested to Google");
+        assert_eq!(s.form.imports.picked.as_deref(), Some("ada@gmail.com"));
+    }
+
+    #[test]
+    fn an_account_added_from_another_app_returns_to_the_list_only_if_the_form_is_still_open() {
+        let mut s = importing();
+        s.set_up_found("ada@example.com");
+        s.form_added();
+        assert!(s.form.open);
+        assert_eq!(s.form.step, Step::Import, "on to the next one");
+        assert!(
+            s.form.imports.find("ada@gmail.com").is_some(),
+            "the list stays as read"
+        );
+
+        s.set_up_found("ada@example.com");
+        s.show(Showing::inbox("ada@example.com"));
+        s.form_added();
+        assert!(!s.form.open, "the inbox shown meanwhile stays");
+    }
+
+    #[test]
+    fn a_google_sign_in_to_another_address_doesnt_take_the_picked_accounts_label() {
+        let mut s = importing();
+        s.set_up_found("ada@gmail.com");
+        assert_eq!(s.form_label("Ada@Gmail.com").as_deref(), Some("Work"));
+        assert_eq!(s.form_label("bob@gmail.com"), None);
+
+        s.form_step(Step::Google);
+        s.form.label = None;
+        assert_eq!(
+            s.form_label("bob@gmail.com"),
+            None,
+            "nothing picked, nothing to give"
+        );
+    }
+
+    #[test]
+    fn what_was_read_for_an_earlier_opening_of_the_form_isnt_taken() {
+        let mut s = Mail::not_started();
+        s.open_form();
+        let earlier = s.form.imports.session;
+        s.open_form();
+        s.form.imports.reading = true;
+        s.imports_read(earlier, vec![("Spark", Err("stale".into()))]);
+        assert!(
+            s.form.imports.found.is_none(),
+            "the earlier read is dropped"
+        );
+        assert!(s.form.imports.reading, "this opening's read still counts");
+
+        let now = s.form.imports.session;
+        s.imports_read(now, vec![("Spark", Ok(vec![]))]);
+        assert!(s.form.imports.found.is_some());
+        assert!(!s.form.imports.reading);
+    }
+
+    #[test]
+    fn an_account_set_up_already_isnt_set_up_again_from_another_app() {
+        let mut s = importing();
+        let mut set_up = postden_app::NewAccount {
+            email: "Ada@Example.com".into(),
+            imap_host: "imap.example.com".into(),
+            smtp_host: "smtp.example.com".into(),
+            ..postden_app::NewAccount::default()
+        }
+        .build()
+        .unwrap();
+        set_up.label = Some("Mine".into());
+        s.accounts = vec![set_up];
+        s.set_up_found("ada@example.com");
+        assert_eq!(s.form.step, Step::Import, "whatever the address's case");
+        assert_eq!(s.form.imports.picked, None);
+
+        s.set_up_found("ada@gmail.com");
+        assert_eq!(s.form.step, Step::Google, "the others still are");
+    }
+
+    #[test]
+    fn back_from_an_account_typed_in_returns_to_choosing() {
+        let mut s = importing();
+        s.form_step(Step::Servers);
+        s.form_back();
+        assert_eq!(s.form.step, Step::Choose);
     }
 
     #[test]

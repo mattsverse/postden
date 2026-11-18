@@ -1,7 +1,8 @@
 //! The add-account form's fields, and turning them into a [`NewAccount`].
 
 use postden_app::NewAccount;
-use postden_core::account::Security;
+use postden_app::import::{Found, Setup};
+use postden_core::account::{Account, Security, Server};
 use rune::TextEdit;
 use tokio::task::AbortHandle;
 
@@ -22,6 +23,41 @@ pub(crate) enum Step {
     Google,
     /// Typing in IMAP and SMTP servers and a password.
     Servers,
+    /// Picking one of the accounts another mail app on this computer has.
+    Import,
+}
+
+/// The accounts one app has, by its name, or why they couldn't be read.
+pub(crate) type AppAccounts = (&'static str, Result<Vec<Found>, String>);
+
+/// The accounts other mail apps on this computer have, to set one up with what it has filled in.
+/// It's kept while the form moves between screens, so it's read once each time the form opens.
+#[derive(Debug, Default)]
+pub(crate) struct Imports {
+    /// The apps found when the form opened, by name.
+    pub(crate) apps: Vec<&'static str>,
+    /// What each app has, by app, or why it couldn't be read. `None` until read.
+    pub(crate) found: Option<Vec<AppAccounts>>,
+    /// The address of the account being set up from them: once it's added, or on Back, the form
+    /// shows them again.
+    pub(crate) picked: Option<String>,
+    /// Which opening of the form this is, so a read started for an earlier one, since closed,
+    /// isn't taken for this one's.
+    pub(crate) session: u64,
+    /// Reading them is under way, so it isn't started twice.
+    pub(crate) reading: bool,
+}
+
+impl Imports {
+    /// The account found at `address`, if any app has it.
+    pub(crate) fn find(&self, address: &str) -> Option<&Found> {
+        self.found
+            .iter()
+            .flatten()
+            .filter_map(|(_, found)| found.as_ref().ok())
+            .flatten()
+            .find(|f| f.address == address)
+    }
 }
 
 pub(crate) struct AccountForm {
@@ -40,6 +76,10 @@ pub(crate) struct AccountForm {
     /// Left empty when it's the IMAP one, as are the SMTP password's.
     pub(crate) smtp_username: TextEdit,
     pub(crate) smtp_password: TextEdit,
+    /// What the account is called, when it's set up from another app that named it. The form
+    /// doesn't show it.
+    pub(crate) label: Option<String>,
+    pub(crate) imports: Imports,
     /// A login check is running.
     pub(crate) checking: bool,
     /// A Google sign-in is waiting for the browser. Dropping it, as resetting the form does, stops it.
@@ -77,6 +117,8 @@ impl Default for AccountForm {
             smtp_security: Security::Tls,
             smtp_username: TextEdit::new(""),
             smtp_password: TextEdit::new(""),
+            label: None,
+            imports: Imports::default(),
             checking: false,
             google: None,
             error: None,
@@ -113,12 +155,52 @@ impl AccountForm {
         })
     }
 
+    /// Fills the fields with what another app has for `found`, for the screen that sets it up:
+    /// its servers and names for [`Step::Servers`], its address and name for [`Step::Google`].
+    /// `None` when it can't be set up.
+    pub(crate) fn fill(&mut self, found: &Found) -> Option<Step> {
+        let step = match &found.setup {
+            Setup::Password { imap, smtp } => {
+                let username = |server: &Server, or: &str| {
+                    if server.username == or {
+                        String::new()
+                    } else {
+                        server.username.clone()
+                    }
+                };
+                self.username.replace_text(username(imap, &found.address));
+                self.imap_host.replace_text(&imap.host);
+                self.imap_port.replace_text(imap.port.to_string());
+                self.imap_security = imap.security;
+                self.smtp_host.replace_text(&smtp.host);
+                self.smtp_port.replace_text(smtp.port.to_string());
+                self.smtp_security = smtp.security;
+                self.smtp_username
+                    .replace_text(username(smtp, &imap.username));
+                Step::Servers
+            }
+            Setup::Google => Step::Google,
+            Setup::Unsupported(_) => return None,
+        };
+        self.email.replace_text(&found.address);
+        self.name
+            .replace_text(found.display_name.as_deref().unwrap_or_default());
+        self.label.clone_from(&found.label);
+        Some(step)
+    }
+
     /// The SMTP host guessed from the IMAP one (`imap.example.com` → `smtp.example.com`), used when the
     /// SMTP field is left empty.
     pub(crate) fn smtp_guess(&self) -> Option<String> {
         let domain = self.imap_host.text.trim().strip_prefix("imap.")?;
         domain.contains('.').then(|| format!("smtp.{domain}"))
     }
+}
+
+/// Whether `address` is one of `accounts` already, whatever its case: then it isn't set up
+/// again from another app, which would replace it.
+pub(crate) fn is_set_up(accounts: &[Account], address: &str) -> bool {
+    accounts.iter().any(|a| a.id.eq_ignore_ascii_case(address))
 }
 
 /// The index of `security` in [`SECURITY`].
