@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.9.0](https://github.com/mattsverse/postden/compare/v0.8.0...v0.9.0) (2026-11-18)
+
+
+### Features
+
+* add your Thunderbird accounts without typing their servers again ([af552aa](https://github.com/mattsverse/postden/commit/af552aaa3a4a665a46dd382553d661e445cdcb33))
+* **app:** find unread mail older than the cache on the server ([d917016](https://github.com/mattsverse/postden/commit/d9170160adba18c16d9920306453e492e15b80f1))
+* **app:** list unread mail older than the first 200, so inbox zero means zero on the server ([c7b00dc](https://github.com/mattsverse/postden/commit/c7b00dc13208f3c9ab9bc7dcd4dd1c58c74e9acd))
+* **app:** read accounts set up in Apple Mail ([b33fdbf](https://github.com/mattsverse/postden/commit/b33fdbf0dca5e31971e2cbd13d9577a37e86410a))
+* **app:** read accounts set up in Thunderbird ([6cba6f0](https://github.com/mattsverse/postden/commit/6cba6f022d6ab5f125ae62ee0e2b072edbb8c460))
+* **app:** refresh every mailbox, each showing it's busy until synced ([f83e980](https://github.com/mattsverse/postden/commit/f83e980aa25d521b2623adad8ae9ebb586d07ca0))
+* **desktop:** pick the app to set accounts up from ([4e384f7](https://github.com/mattsverse/postden/commit/4e384f7b769d3765d1d346a4c67273f9e1e18431))
+* **desktop:** pick the From account from a searchable list ([bd7fd9e](https://github.com/mattsverse/postden/commit/bd7fd9ed640dea863f87882ae1b8095a5198ce46))
+* **desktop:** pick who you send from, however many accounts you have ([8e955a8](https://github.com/mattsverse/postden/commit/8e955a8878aeff9fd2d7eb2762bb9696ed6cebd6))
+* **desktop:** show only unread mail, down to inbox zero ([3fe42a5](https://github.com/mattsverse/postden/commit/3fe42a535d4ce421d9881b6b19ebfe17b431b93b))
+* refresh every mailbox at once, each with a spinner until it's synced ([fdc3371](https://github.com/mattsverse/postden/commit/fdc3371824c88e18a8f43306f124d057f55f02ba))
+* suggest people you've written to as you type a recipient ([60379ce](https://github.com/mattsverse/postden/commit/60379cea7fe1562899894f5df7312468f0ce2731))
+* suggest remembered contacts while typing recipients ([ebb6881](https://github.com/mattsverse/postden/commit/ebb688140fcc2b85690d20b8f4b4d78fac65ff02))
+
+
+### Bug Fixes
+
+* **app:** list an iCloud mailbox under its iCloud address ([2308389](https://github.com/mattsverse/postden/commit/2308389e638298f50a4edce16a3905e56962ad76))
+* **app:** open the Full Disk Access settings with `open` ([26ca6c4](https://github.com/mattsverse/postden/commit/26ca6c4c417ca07b981b69a598929758801f4470))
+
 ## [0.8.0](https://github.com/mattsverse/postden/compare/v0.7.0...v0.8.0) (2026-11-18)
 
 
