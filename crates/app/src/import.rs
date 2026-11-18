@@ -12,6 +12,7 @@
 
 mod apple_mail;
 mod spark;
+mod thunderbird;
 
 use std::collections::HashSet;
 use std::fmt;
@@ -21,6 +22,7 @@ use postden_core::account::Server;
 
 pub use apple_mail::AppleMail;
 pub use spark::Spark;
+pub use thunderbird::Thunderbird;
 
 use crate::Result;
 
@@ -71,6 +73,9 @@ pub fn installed(home: &Path) -> Vec<Box<dyn Source>> {
     }
     if let Some(apple_mail) = AppleMail::find(home) {
         sources.push(Box::new(apple_mail));
+    }
+    if let Some(thunderbird) = Thunderbird::find(home) {
+        sources.push(Box::new(thunderbird));
     }
     sources
 }
@@ -126,6 +131,15 @@ fn once_each(found: Vec<Found>) -> Vec<Found> {
         .into_iter()
         .filter(|f| seen.insert(f.address.to_lowercase()))
         .collect()
+}
+
+/// Whether `host` is this computer, as a local bridge such as Proton Mail Bridge is.
+fn is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// `s` trimmed, or `None` when that leaves nothing.
