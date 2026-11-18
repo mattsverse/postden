@@ -60,16 +60,34 @@ mod key {
     /// The name it sends under.
     pub(super) const NAME: &str = "IdentityDisplayName";
     pub(super) const FULL_NAME: &str = "FullUserName";
+    /// An iCloud account's owner's name.
+    pub(super) const ACCOUNT_NAME: &str = "ACPropertyFullName";
+    /// An iCloud account's other addresses, its iCloud Mail one among them. Its login is the
+    /// Apple ID, which may be an address elsewhere.
+    pub(super) const ALIASES: &str = "appleIDAliases";
     /// Set on iCloud mailboxes, which store no servers, but not only on them.
     pub(super) const MAIL_DROP: &str = "UseMailDrop";
 
-    pub(super) const ALL: [&str; 10] = [
-        HOST, PORT, TLS, TLS_DIRECT, SMTP, ADDRESS, ADDRESSES, NAME, FULL_NAME, MAIL_DROP,
+    pub(super) const ALL: [&str; 12] = [
+        HOST,
+        PORT,
+        TLS,
+        TLS_DIRECT,
+        SMTP,
+        ADDRESS,
+        ADDRESSES,
+        NAME,
+        FULL_NAME,
+        ACCOUNT_NAME,
+        ALIASES,
+        MAIL_DROP,
     ];
 }
 
 /// iCloud Mail's servers, which Mail doesn't store. They log in with the address.
 mod icloud {
+    /// The domains of iCloud Mail addresses.
+    pub(super) const DOMAINS: [&str; 3] = ["icloud.com", "me.com", "mac.com"];
     pub(super) const IMAP: (&str, u16) = ("imap.mail.me.com", 993);
     pub(super) const SMTP: (&str, u16) = ("smtp.mail.me.com", 587);
 }
@@ -216,17 +234,20 @@ impl Store {
         let parent = account
             .parent
             .and_then(|pk| self.accounts.iter().find(|a| a.pk == pk));
-        let setup = match account.kind.as_deref()? {
-            kind::IMAP | kind::IMAP_MAIL => None,
-            kind::POP => Some(Setup::Unsupported(Unsupported::Pop)),
-            kind::EXCHANGE => Some(Setup::Unsupported(Unsupported::Microsoft)),
+        let (provider, setup) = match account.kind.as_deref()? {
+            kind::IMAP | kind::IMAP_MAIL => (self.provider(account, parent), None),
+            kind::POP => (Provider::Other, Some(Setup::Unsupported(Unsupported::Pop))),
+            kind::EXCHANGE => (
+                Provider::Other,
+                Some(Setup::Unsupported(Unsupported::Microsoft)),
+            ),
             _ => return None,
         };
-        let address = self.address(account, parent)?;
-        let setup = setup.unwrap_or_else(|| self.imap_setup(account, parent, &address));
+        let address = self.address(account, parent, &provider)?;
+        let setup = setup.unwrap_or_else(|| self.imap_setup(account, &provider, &address));
         let display_name = std::iter::once(account)
             .chain(parent)
-            .flat_map(|a| [key::NAME, key::FULL_NAME].map(|k| (a.pk, k)))
+            .flat_map(|a| [key::NAME, key::FULL_NAME, key::ACCOUNT_NAME].map(|k| (a.pk, k)))
             .find_map(|(pk, k)| self.text(pk, k));
         let label = non_empty(account.description.clone())
             .or_else(|| parent.and_then(|p| non_empty(p.description.clone())))
@@ -240,20 +261,42 @@ impl Store {
     }
 
     /// The address `account` sends from: its identity's, else the first it lists, else what
-    /// it, or the account it's under, logs in as, when that's an address.
-    fn address(&self, account: &Account, parent: Option<&Account>) -> Option<String> {
-        let is_address = |s: &String| s.contains('@');
-        self.text(account.pk, key::ADDRESS)
-            .filter(is_address)
+    /// it, or the account it's under, logs in as, when that's an address. An iCloud mailbox's
+    /// is its iCloud Mail address, wherever that's found first, as the iCloud account it's
+    /// under logs in with the Apple ID, which may be an address elsewhere, such as Gmail.
+    fn address(
+        &self,
+        account: &Account,
+        parent: Option<&Account>,
+        provider: &Provider,
+    ) -> Option<String> {
+        let mut addresses = self
+            .text(account.pk, key::ADDRESS)
             .into_iter()
             .chain(self.texts(account.pk, key::ADDRESSES))
-            .find(is_address)
-            .or_else(|| non_empty(account.username.clone()).filter(is_address))
-            .or_else(|| parent.and_then(|p| non_empty(p.username.clone()).filter(is_address)))
+            .chain(non_empty(account.username.clone()))
+            .chain(parent.into_iter().flat_map(|p| {
+                let aliases = if *provider == Provider::ICloud {
+                    self.texts(p.pk, key::ALIASES)
+                } else {
+                    Vec::new()
+                };
+                aliases.into_iter().chain(non_empty(p.username.clone()))
+            }))
+            .filter(|s| s.contains('@'));
+        if *provider == Provider::ICloud {
+            let addresses: Vec<_> = addresses.collect();
+            let on_icloud = addresses.iter().find(|a| {
+                a.rsplit_once('@')
+                    .is_some_and(|(_, d)| icloud::DOMAINS.iter().any(|i| d.eq_ignore_ascii_case(i)))
+            });
+            return on_icloud.or_else(|| addresses.first()).cloned();
+        }
+        addresses.next()
     }
 
-    /// How the IMAP account `account`, with `address`, is set up.
-    fn imap_setup(&self, account: &Account, parent: Option<&Account>, address: &str) -> Setup {
+    /// Who the IMAP account `account`, under `parent`, is with.
+    fn provider(&self, account: &Account, parent: Option<&Account>) -> Provider {
         let host = self.text(account.pk, key::HOST);
         let host = host.as_deref().map(str::to_ascii_lowercase);
         let ends_with = |suffix: &[&str]| {
@@ -264,21 +307,24 @@ impl Store {
             })
         };
         let parent_kind = parent.and_then(|p| p.kind.as_deref());
-        let provider =
-            if parent_kind == Some(kind::GOOGLE) || ends_with(&["gmail.com", "googlemail.com"]) {
-                Provider::Google
-            } else if parent_kind == Some(kind::ICLOUD)
-                || ends_with(&["mail.me.com"])
-                // Any account can use Mail Drop, but only iCloud's stores no servers.
-                || (host.is_none()
-                    && self
-                        .properties
-                        .contains_key(&(account.pk, key::MAIL_DROP.into())))
-            {
-                Provider::ICloud
-            } else {
-                Provider::Other
-            };
+        if parent_kind == Some(kind::GOOGLE) || ends_with(&["gmail.com", "googlemail.com"]) {
+            Provider::Google
+        } else if parent_kind == Some(kind::ICLOUD)
+            || ends_with(&["mail.me.com"])
+            // Any account can use Mail Drop, but only iCloud's stores no servers.
+            || (host.is_none()
+                && self
+                    .properties
+                    .contains_key(&(account.pk, key::MAIL_DROP.into())))
+        {
+            Provider::ICloud
+        } else {
+            Provider::Other
+        }
+    }
+
+    /// How the IMAP account `account`, with `provider` and `address`, is set up.
+    fn imap_setup(&self, account: &Account, provider: &Provider, address: &str) -> Setup {
         match provider {
             Provider::Google => Setup::Google,
             Provider::ICloud => {
@@ -362,14 +408,20 @@ impl Store {
         non_empty(self.property(owner, key).and_then(text))
     }
 
+    /// The strings in the property, as one or a list of them, which may be in lists of their
+    /// own.
     fn texts(&self, owner: i64, key: &str) -> Vec<String> {
-        match self.property(owner, key) {
-            Some(Value::Array(items)) => items
-                .iter()
-                .filter_map(|item| non_empty(text(item)))
-                .collect(),
-            other => other.and_then(text).into_iter().collect(),
+        fn collect(value: &Value, into: &mut Vec<String>) {
+            match value {
+                Value::Array(items) => items.iter().for_each(|item| collect(item, into)),
+                other => into.extend(non_empty(text(other))),
+            }
         }
+        let mut texts = Vec::new();
+        if let Some(value) = self.property(owner, key) {
+            collect(value, &mut texts);
+        }
+        texts
     }
 
     fn number(&self, owner: i64, key: &str) -> Option<i64> {
@@ -753,7 +805,9 @@ mod tests {
     }
 
     #[test]
-    fn an_icloud_mailbox_gets_icloud_servers() {
+    fn an_icloud_mailbox_gets_its_icloud_address_and_icloud_servers() {
+        // As a Mac had it: the Apple ID is a Gmail address, and the iCloud Mail address is
+        // only among its aliases. The mailbox has no address or login of its own.
         let found = accounts(
             "icloud",
             &[
@@ -763,24 +817,32 @@ mod tests {
                     None,
                     "A",
                     Some("iCloud"),
-                    Some("ada@icloud.com"),
-                    vec![],
+                    Some("ada@gmail.com"),
+                    vec![
+                        (key::ALIASES, Archived::Strs(&["ada@icloud.com"])),
+                        (key::ACCOUNT_NAME, Archived::Str("Ada Lovelace")),
+                    ],
                 ),
                 (
                     2,
-                    kind::IMAP_MAIL,
+                    kind::IMAP,
                     Some(1),
                     "AI",
                     None,
-                    Some("ada"),
-                    vec![(key::MAIL_DROP, Archived::Bool(true))],
+                    None,
+                    vec![
+                        (key::MAIL_DROP, Archived::Bool(true)),
+                        (key::PORT, Archived::Int(993)),
+                        (key::TLS_DIRECT, Archived::Bool(true)),
+                    ],
                 ),
             ],
         );
         let Setup::Password { imap, smtp } = &found[0].setup else {
             panic!("read as {:?}", found[0].setup);
         };
-        assert_eq!(found[0].address, "ada@icloud.com");
+        assert_eq!(found[0].address, "ada@icloud.com", "not the Apple ID");
+        assert_eq!(found[0].display_name.as_deref(), Some("Ada Lovelace"));
         assert_eq!(
             (
                 imap.host.as_str(),
