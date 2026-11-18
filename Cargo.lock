@@ -4990,6 +4990,7 @@ dependencies = [
  "postden-secrets",
  "postden-store",
  "postden-update",
+ "rusqlite",
  "secrecy",
  "serde",
  "serde_json",
