@@ -1073,15 +1073,7 @@ impl Store {
     ///
     /// Returns an error when the read fails.
     pub fn recent_messages(&self, role: Role, limit: usize) -> Result<Vec<StoredMessage>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {MESSAGE_COLUMNS} FROM messages m
-             JOIN mailboxes b ON b.account = m.account AND b.name = m.mailbox
-             WHERE b.role = ?1
-             ORDER BY m.date IS NULL, m.date DESC, m.uid DESC LIMIT ?2"
-        ))?;
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = stmt.query_map(params![role.as_str(), limit], message_from_row)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        self.newest(Scope::Role(role), false, limit)
     }
 
     /// The `limit` most recent messages in one of the account's mailboxes, newest first.
@@ -1095,14 +1087,11 @@ impl Store {
         mailbox: &str,
         limit: usize,
     ) -> Result<Vec<StoredMessage>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {MESSAGE_COLUMNS} FROM messages m
-             WHERE m.account = ?1 AND m.mailbox = ?2
-             ORDER BY m.date IS NULL, m.date DESC, m.uid DESC LIMIT ?3"
-        ))?;
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = stmt.query_map(params![account, mailbox, limit], message_from_row)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let scope = Scope::Mailbox {
+            account,
+            name: mailbox,
+        };
+        self.newest(scope, false, limit)
     }
 
     /// One cached message, or `None` when it isn't cached.
@@ -1148,7 +1137,7 @@ impl Store {
     pub fn matching_messages(
         &self,
         scope: Scope<'_>,
-        mut matches: impl FnMut(&Envelope) -> bool,
+        mut matches: impl FnMut(&StoredMessage) -> bool,
         limit: usize,
     ) -> Result<Vec<StoredMessage>> {
         const ORDER: &str = "ORDER BY m.date IS NULL, m.date DESC, m.uid DESC";
@@ -1176,11 +1165,47 @@ impl Store {
                 break;
             }
             let message = message?;
-            if matches(&message.envelope) {
+            if matches(&message) {
                 found.push(message);
             }
         }
         Ok(found)
+    }
+
+    /// The `limit` most recent unread messages in `scope`, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn unread_messages(&self, scope: Scope<'_>, limit: usize) -> Result<Vec<StoredMessage>> {
+        self.newest(scope, true, limit)
+    }
+
+    /// The `limit` most recent messages in `scope`, or only its unread ones, newest first.
+    fn newest(&self, scope: Scope<'_>, unread: bool, limit: usize) -> Result<Vec<StoredMessage>> {
+        let unread = if unread { "AND NOT m.seen" } else { "" };
+        let order = "ORDER BY m.date IS NULL, m.date DESC, m.uid DESC";
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = match scope {
+            Scope::Role(role) => self
+                .conn
+                .prepare(&format!(
+                    "SELECT {MESSAGE_COLUMNS} FROM messages m
+                     JOIN mailboxes b ON b.account = m.account AND b.name = m.mailbox
+                     WHERE b.role = ?1 {unread} {order} LIMIT ?2"
+                ))?
+                .query_map(params![role.as_str(), limit], message_from_row)?
+                .collect::<rusqlite::Result<_>>()?,
+            Scope::Mailbox { account, name } => self
+                .conn
+                .prepare(&format!(
+                    "SELECT {MESSAGE_COLUMNS} FROM messages m
+                     WHERE m.account = ?1 AND m.mailbox = ?2 {unread} {order} LIMIT ?3"
+                ))?
+                .query_map(params![account, name, limit], message_from_row)?
+                .collect::<rusqlite::Result<_>>()?,
+        };
+        Ok(rows)
     }
 
     /// How many messages each account has unread in its inbox, by account id. Accounts with none
@@ -2501,7 +2526,7 @@ mod tests {
         store
             .save_messages("a@example.com", "Sent", Role::Sent, 1, &[envelope(5, 50)])
             .unwrap();
-        let not_2 = |e: &Envelope| e.uid != 2;
+        let not_2 = |m: &StoredMessage| m.envelope.uid != 2;
         let uids = |found: Vec<StoredMessage>| -> Vec<u32> {
             found.into_iter().map(|m| m.envelope.uid).collect()
         };
@@ -2527,6 +2552,34 @@ mod tests {
             uids(store.matching_messages(one, |_| false, 10).unwrap()),
             Vec::<u32>::new()
         );
+    }
+
+    #[test]
+    fn unread_messages_are_the_newest_unread_within_their_scope() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account("a@example.com")).unwrap();
+        let read = Envelope {
+            seen: true,
+            ..envelope(2, 30)
+        };
+        let inbox = [envelope(1, 10), read, envelope(3, 20)];
+        store
+            .save_messages("a@example.com", "INBOX", Role::Inbox, 1, &inbox)
+            .unwrap();
+        store
+            .save_messages("a@example.com", "Sent", Role::Sent, 1, &[envelope(4, 40)])
+            .unwrap();
+        let uids = |found: Vec<StoredMessage>| -> Vec<u32> {
+            found.into_iter().map(|m| m.envelope.uid).collect()
+        };
+        let inboxes = Scope::Role(Role::Inbox);
+        assert_eq!(uids(store.unread_messages(inboxes, 10).unwrap()), [3, 1]);
+        assert_eq!(uids(store.unread_messages(inboxes, 1).unwrap()), [3]);
+        let sent = Scope::Mailbox {
+            account: "a@example.com",
+            name: "Sent",
+        };
+        assert_eq!(uids(store.unread_messages(sent, 10).unwrap()), [4]);
     }
 
     #[test]
