@@ -40,7 +40,7 @@ fastrand = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "form"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 ring = "0.17"
 # profiles: an exported profile is encrypted with a passphrase
 age = "0.12"
