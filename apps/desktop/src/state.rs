@@ -2164,6 +2164,33 @@ impl Mail {
         }
     }
 
+    /// Syncs what the list shows with the server now: its mailbox, or every account's inbox or
+    /// Sent.
+    pub(crate) fn refresh_shown(&self) {
+        for (account, mailbox) in self.refresh_targets() {
+            self.refresh_mailbox(&account, &mailbox);
+        }
+    }
+
+    /// The accounts and mailboxes the list shows, which [`Self::refresh_shown`] syncs: searching
+    /// every inbox, those, whatever's selected.
+    pub(crate) fn refresh_targets(&self) -> Vec<(String, String)> {
+        match self.listing() {
+            Showing::Mailbox { account, name } => vec![(account.clone(), name.clone())],
+            Showing::All(role) => self
+                .accounts
+                .iter()
+                .filter_map(|account| {
+                    let name = match role {
+                        Role::Inbox => INBOX,
+                        _ => self.mailbox_with_role(&account.id, *role)?.name.as_str(),
+                    };
+                    Some((account.id.clone(), name.to_owned()))
+                })
+                .collect(),
+        }
+    }
+
     /// Marks every message in one of an account's mailboxes read, on the server too. It shows once
     /// the server agrees; until then the mailbox shows it's busy, and isn't marked again.
     pub(crate) fn mark_all_seen(&mut self, account: &str, mailbox: &str) {

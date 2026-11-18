@@ -144,6 +144,8 @@ pub(crate) enum Command {
         mailbox: String,
     },
     Show(Showing),
+    /// Syncs what's shown with the server now: one mailbox, or every account's inbox or Sent.
+    Refresh,
     /// Marks every message in the mailbox shown read.
     MarkAllSeen {
         account: String,
@@ -213,6 +215,7 @@ impl Command {
                     _ => Vec::new(),
                 }
             }
+            Self::Refresh => vec![Shortcut::shift_cmd('n')],
             Self::Settings => vec![Shortcut::cmd(',')],
             Self::ToggleSidebar => vec![Sidebar],
             _ => Vec::new(),
@@ -272,6 +275,7 @@ impl Command {
             Self::Show(Showing::Mailbox { account, name }) => {
                 format!("Go to {}", s.mailbox_label(account, name))
             }
+            Self::Refresh => "Refresh".into(),
             Self::MarkAllSeen { .. } => "Mark all as read".into(),
             Self::AccountSettings(_) => "Account settings".into(),
             Self::AddAccount => "Add account".into(),
@@ -345,6 +349,7 @@ impl Command {
                 s.move_message(&message.0, &message.1, message.2, &mailbox);
             }
             Self::Show(showing) => s.show(showing),
+            Self::Refresh => s.refresh_shown(),
             Self::MarkAllSeen { account, mailbox } => s.mark_all_seen(&account, &mailbox),
             Self::AccountSettings(account) => s.open_account_settings(&account),
             Self::AddAccount => s.open_form(),
@@ -437,6 +442,7 @@ pub(crate) fn available(s: &Mail) -> Vec<Command> {
         Command::OpenMessage,
     );
     add(browsing && has_accounts, Command::Search);
+    add(browsing && has_accounts, Command::Refresh);
     if let Showing::Mailbox { account, name } = &s.showing
         && browsing
         && !s.marking_seen(account, name)
@@ -592,6 +598,24 @@ impl Palette {
 mod tests {
     use super::*;
     use crate::state::Undo;
+    use postden_core::account::{Account, Auth, Security, Server};
+
+    fn account(id: &str) -> Account {
+        let server = Server {
+            host: "localhost".into(),
+            port: 1,
+            security: Security::None,
+            username: "me".into(),
+        };
+        Account {
+            id: id.into(),
+            display_name: None,
+            label: None,
+            imap: server.clone(),
+            smtp: server,
+            auth: Auth::Password,
+        }
+    }
 
     #[test]
     fn words_match_the_start_of_words_in_any_order() {
@@ -697,6 +721,36 @@ mod tests {
         let row = s.palette.active_row(&shown);
         assert_eq!(row, 1);
         assert_eq!(shown[row].command, Command::ToggleSidebar);
+    }
+
+    #[test]
+    fn refreshing_is_offered_on_the_list_with_its_shortcut() {
+        let mut s = Mail::not_started();
+        assert!(!available(&s).contains(&Command::Refresh));
+        s.accounts.push(account("me@example.com"));
+        assert!(available(&s).contains(&Command::Refresh));
+        assert_eq!(Command::Refresh.hint(&s), "⇧⌘N");
+        s.open_settings();
+        assert!(!available(&s).contains(&Command::Refresh));
+    }
+
+    #[test]
+    fn refreshing_a_search_of_every_inbox_syncs_the_inboxes() {
+        let mut s = Mail::not_started();
+        s.accounts.push(account("me@example.com"));
+        s.showing = Showing::Mailbox {
+            account: "me@example.com".into(),
+            name: "Sent".into(),
+        };
+        let sent = [("me@example.com".to_owned(), "Sent".to_owned())];
+        assert_eq!(s.refresh_targets(), sent);
+        s.search.query = TextEdit::new("invoice");
+        assert_eq!(s.refresh_targets(), sent);
+        s.search.everywhere = true;
+        assert_eq!(
+            s.refresh_targets(),
+            [("me@example.com".to_owned(), "INBOX".to_owned())]
+        );
     }
 
     #[test]

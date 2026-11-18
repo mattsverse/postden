@@ -85,7 +85,8 @@ fn on_reopen(s: &mut Mail, _visible: bool, _: &mut Tx) -> bool {
 
 /// ⌘K opens the command palette, and closes it as Escape does. The shortcuts of the commands it
 /// lists (`commands`) run them where they apply: ⇧⌘B (and ⌃⌘S on macOS) shows and hides the
-/// sidebar, ⌘, opens the settings, C or ⌘N starts a new message and / or ⌘F searches the list.
+/// sidebar, ⌘, opens the settings, C or ⌘N starts a new message, / or ⌘F searches the list and
+/// ⇧⌘N refreshes what it shows.
 /// J and K (or ↓ and ↑) move the list's cursor and ↩ opens its message; with a message open, J
 /// and K open the next or previous one and Escape goes back to the list. On the message open or
 /// under the cursor, U or ⇧⌘U marks it read or unread, S or ⇧⌘L stars it, R or ⌘R and ⇧⌘R reply
