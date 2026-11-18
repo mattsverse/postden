@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.7.0](https://github.com/mattsverse/postden/compare/v0.6.0...v0.7.0) (2026-11-18)
+
+
+### Features
+
+* **desktop:** create mailboxes from an account's menu ([3ff3841](https://github.com/mattsverse/postden/commit/3ff38411d7cabde887c607cce08a1ddd3eaa3d71))
+* **desktop:** create your own mailboxes from an account's menu ([b1a0d31](https://github.com/mattsverse/postden/commit/b1a0d313d79508ed45ca866ede417195f8513983))
+* **desktop:** refresh a mailbox from its menu ([d1f98c1](https://github.com/mattsverse/postden/commit/d1f98c11188e53ec570d461b158743ee99efb53d))
+* **desktop:** refresh what's shown from the palette or with ⇧⌘N ([5a791fb](https://github.com/mattsverse/postden/commit/5a791fbe3014f6936ada6c3f1c4641e53f519bbe))
+* keep opened messages downloaded and clear downloaded mail ([b233007](https://github.com/mattsverse/postden/commit/b2330071bc7bbbcd2f41a2587caf29e8b31ce5e3))
+
 ## [0.6.0](https://github.com/mattsverse/postden/compare/v0.5.0...v0.6.0) (2026-11-17)
 
 

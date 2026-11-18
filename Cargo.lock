@@ -4931,7 +4931,7 @@ dependencies = [
 
 [[package]]
 name = "postden"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "futures",
  "jiff",
@@ -4954,14 +4954,14 @@ dependencies = [
 
 [[package]]
 name = "postden-ai"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "postden-core",
 ]
 
 [[package]]
 name = "postden-app"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "age",
  "base64 0.22.1",
@@ -4982,7 +4982,7 @@ dependencies = [
 
 [[package]]
 name = "postden-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "secrecy",
  "thiserror 2.0.21",
@@ -4990,7 +4990,7 @@ dependencies = [
 
 [[package]]
 name = "postden-html"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ego-tree",
  "scraper",
@@ -4998,7 +4998,7 @@ dependencies = [
 
 [[package]]
 name = "postden-mail"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-imap",
  "base64 0.22.1",
@@ -5019,7 +5019,7 @@ dependencies = [
 
 [[package]]
 name = "postden-secrets"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "apple-native-keyring-store",
  "keyring-core",
@@ -5031,7 +5031,7 @@ dependencies = [
 
 [[package]]
 name = "postden-store"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "postden-core",
  "rusqlite",
@@ -5040,7 +5040,7 @@ dependencies = [
 
 [[package]]
 name = "postden-transfer"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "iroh",
  "ring",
@@ -5050,7 +5050,7 @@ dependencies = [
 
 [[package]]
 name = "postden-update"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "flate2",
  "reqwest",
