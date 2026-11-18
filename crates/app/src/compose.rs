@@ -253,7 +253,11 @@ impl Draft {
     ///
     /// Returns [`Error::Invalid`] when an address can't be read or there are no recipients.
     pub fn outgoing(&self, account: &Account) -> Result<Outgoing> {
-        let parse = |list: &str| parse_addresses(list).map_err(|e| Error::Invalid(e.to_string()));
+        // A list ends with a comma once a suggested recipient is picked, to type the next one.
+        let parse = |list: &str| {
+            parse_addresses(list.trim_end_matches(|c: char| c == ',' || c.is_whitespace()))
+                .map_err(|e| Error::Invalid(e.to_string()))
+        };
         let html = self.html();
         let images = match (&self.signature, &html) {
             (Some(signature), Some(_)) => signature::shown_images(signature),
@@ -594,11 +598,15 @@ mod tests {
         assert!(d.outgoing(&account()).is_err(), "no recipients");
         d.to = "nope".into();
         assert!(d.outgoing(&account()).is_err(), "not an address");
-        d.to = "Ada <ada@example.com>".into();
+        d.to = "Ada <ada@example.com>, ".into();
         d.subject = " Hi ".into();
         let m = d.outgoing(&account()).unwrap();
         assert_eq!(m.from, address(Some("Me"), "me@example.com"));
-        assert_eq!(m.to, vec![address(Some("Ada"), "ada@example.com")]);
+        assert_eq!(
+            m.to,
+            vec![address(Some("Ada"), "ada@example.com")],
+            "the comma after the last recipient is left out"
+        );
         assert_eq!(m.subject, "Hi");
     }
 }

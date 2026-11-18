@@ -10,19 +10,20 @@ use postden_mail::imap::Status;
 use postden_store::StoredMessage;
 use postden_update::Track;
 use rune::{
-    Block, Color, Cx, El, GrowthSpec, Icon, Mark, ScrollSpec, TextEdit, TextStyle, Transition, Tx,
-    col, el, icon, row, text,
+    Align, Block, Color, Cx, El, GrowthSpec, Icon, Mark, ScrollSpec, Side, TextEdit, TextStyle,
+    Transition, Tx, col, el, icon, row, text,
 };
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow, SplitView, Toolbar};
 use rune_kit::{
     Button, ButtonVariant, Dialog, Divider, IconButton, IconButtonVariant, Keybind, Kit, Markdown,
-    MarkdownStyle, Menu, MenuEntry, MenuItem, Placement, SegmentedControl, Select, Spinner, State,
-    Switch, TextArea, TextInput, Toast, ToastRegion, context_menu, glyphs, root,
+    MarkdownStyle, Menu, MenuEntry, MenuItem, Placement, PopupItem, PopupList, SegmentedControl,
+    Select, Spinner, State, Switch, TextArea, TextInput, Toast, ToastRegion, context_menu, glyphs,
+    root,
 };
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
 use crate::commands::{Command, Entry, Shortcut};
-use crate::compose::{ComposeForm, Mode, Preview};
+use crate::compose::{ComposeForm, Mode, Preview, Recipients};
 use crate::form::{AccountForm, SECURITY, Step, Unreadable, is_set_up, security_index};
 use crate::rich::RichEditor;
 use crate::search::{SERVER_PAGE, ServerSearch};
@@ -104,7 +105,7 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
     } else if s.form.open {
         form(&s.form, &s.accounts, &k)
     } else if s.compose.open {
-        compose(s, &s.compose, &k)
+        compose(s, &s.compose, &k, &mut layer)
     } else if let Some(reader) = &s.reader {
         message(reader, &k)
     } else {
@@ -1276,7 +1277,7 @@ fn reader_frame(r: &Reader, header: El, content: El, k: &Kit) -> El {
 }
 
 /// The message being written: who it's from and to, its subject and text, and Send.
-fn compose(s: &Mail, c: &ComposeForm, k: &Kit) -> El {
+fn compose(s: &Mail, c: &ComposeForm, k: &Kit, layer: &mut Vec<El>) -> El {
     let mut fields = col()
         .w_full()
         .max_w(760.0)
@@ -1286,13 +1287,12 @@ fn compose(s: &Mail, c: &ComposeForm, k: &Kit) -> El {
         .child(field(
             k,
             "To",
-            compose_input(
+            recipients_input(
                 k,
                 c,
-                "To",
+                Recipients::To,
                 "ada@example.com, Bob <bob@example.com>",
-                &c.to,
-                |s| &mut s.compose.to,
+                layer,
             ),
         ))
         .child(
@@ -1301,12 +1301,12 @@ fn compose(s: &Mail, c: &ComposeForm, k: &Kit) -> El {
                 .child(field(
                     k,
                     "Cc",
-                    compose_input(k, c, "Cc", "", &c.cc, |s| &mut s.compose.cc),
+                    recipients_input(k, c, Recipients::Cc, "", layer),
                 ))
                 .child(field(
                     k,
                     "Bcc",
-                    compose_input(k, c, "Bcc", "", &c.bcc, |s| &mut s.compose.bcc),
+                    recipients_input(k, c, Recipients::Bcc, "", layer),
                 )),
         )
         .child(field(
@@ -1393,6 +1393,52 @@ fn compose_actions(c: &ComposeForm, k: &Kit) -> El {
                 .on_press(Mail::discard)
                 .build(k),
         )
+}
+
+/// A list of recipients, filling its column, with the contacts the one being typed could be
+/// listed under it, when contacts are remembered.
+fn recipients_input(
+    k: &Kit,
+    c: &ComposeForm,
+    recipients: Recipients,
+    placeholder: &str,
+    layer: &mut Vec<El>,
+) -> El {
+    let suggested = c.suggested(recipients);
+    let active = (!suggested.is_empty()).then_some(c.suggestions.active);
+    let items = suggested.iter().enumerate().map(|(i, contact)| {
+        let item = PopupItem::new(i.to_string(), contact.label());
+        match (&contact.name, &contact.email) {
+            (Some(_), Some(email)) => item.description(email.clone()),
+            _ => item,
+        }
+    });
+    PopupList::new(recipients.suggestions_key(), recipients.key())
+        .anchored(recipients.key(), Side::Bottom, Align::Start, 4.0)
+        .open(active.is_some())
+        .width(360.0)
+        .label("Contacts")
+        .items(items)
+        .active(active)
+        .on_active(move |s: &mut Mail, i| s.compose.suggestions.active = i)
+        .on_choose(move |s: &mut Mail, id, _| {
+            if let Ok(i) = id.parse() {
+                s.compose.choose_suggestion(recipients, i);
+            }
+        })
+        .build(k, layer);
+    TextInput::new(c.recipients(recipients))
+        .label(recipients.label())
+        .placeholder(placeholder)
+        .width(None)
+        .disabled(c.sending)
+        // A screen reader reads the highlighted contact, while the field keeps the focus.
+        .active_descendant(active.map(|i| recipients.suggestion_key(i)))
+        .on_edit(move |s: &mut Mail| s.compose.recipients_mut(recipients))
+        .on_change(move |s: &mut Mail, _| s.suggest(recipients))
+        .on_key(move |s: &mut Mail, ev: &rune::KeyEvent, tx| s.suggestion_key(recipients, ev, tx))
+        .build(k)
+        .key(recipients.key())
 }
 
 /// One of the compose form's one-line fields, filling its column.
@@ -2103,6 +2149,7 @@ fn general_settings(s: &Mail, k: &Kit, page: El, layer: &mut Vec<El>) -> El {
                 .build(k)
                 .key("keep-running"),
         ))
+        .child(contacts_setting(s, k))
         .child(setting_section(
             k,
             "Updates",
@@ -2213,6 +2260,30 @@ fn prefetch_setting(s: &Mail, k: &Kit) -> El {
             .child(row().child(prefetch))
             .child(keep_opened)
             .child(row().child(clear)),
+    )
+}
+
+/// Whether the people mail is sent to are remembered, to suggest them as recipients, and a
+/// button to forget them.
+fn contacts_setting(s: &Mail, k: &Kit) -> El {
+    let remember = Switch::new(s.settings.remember_contacts)
+        .label("Remember who I write to")
+        .on_toggle(|s: &mut Mail| s.set_remember_contacts(!s.settings.remember_contacts))
+        .build(k)
+        .key("remember-contacts");
+    let forget = Button::new("Forget contacts")
+        .on_press(Mail::forget_contacts)
+        .build(k)
+        .key("forget-contacts");
+    setting_section(
+        k,
+        "Contacts",
+        Some(
+            "Postden can remember the addresses you send mail to, on this computer only, and \
+             suggest them as you type a recipient. Turned off, it stops remembering and \
+             suggesting, and keeps those it has until you forget them.",
+        ),
+        col().gap(12.0).child(remember).child(row().child(forget)),
     )
 }
 

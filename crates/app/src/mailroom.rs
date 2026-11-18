@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use postden_core::account::{Account, Server};
-use postden_core::message::{Body, Envelope, Mailbox, Outgoing, Role};
+use postden_core::message::{Address, Body, Envelope, Mailbox, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
     Event, Flags, Found, Older, Prefetched, SNOOZED_NAME, Status, Verdict, WatchConfig,
@@ -203,6 +203,8 @@ pub enum Update {
     Sent {
         account: String,
         result: Result<String, String>,
+        /// Who it went to, in To, Cc and Bcc.
+        recipients: Vec<Address>,
     },
     /// A sent message couldn't be filed in the account's Sent mailbox. It was still sent.
     CopyFailed { account: String, error: String },
@@ -1498,6 +1500,11 @@ impl Mailroom {
         let nudge = Arc::clone(&watched.nudge);
         let account = account.to_owned();
         let jobs = self.jobs.clone();
+        let recipients: Vec<Address> = [&message.to, &message.cc, &message.bcc]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
         self.handle.spawn(async move {
             let sent = match smtp::send(&smtp, &smtp_credentials, &message).await {
                 Ok(sent) => sent,
@@ -1505,6 +1512,7 @@ impl Mailroom {
                     let _ignored = jobs.send(Job::Done(Update::Sent {
                         account,
                         result: Err(e.to_string()),
+                        recipients,
                     }));
                     return;
                 }
@@ -1512,6 +1520,7 @@ impl Mailroom {
             let _ignored = jobs.send(Job::Done(Update::Sent {
                 account: account.clone(),
                 result: Ok(sent.message_id.clone()),
+                recipients,
             }));
             match save_sent_copy(&imap, &credentials, &sent.message_id, &sent.copy).await {
                 // Fetch it from Sent now, so it's listed there right away.

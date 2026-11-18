@@ -1,10 +1,12 @@
-//! The message being written: its fields, its text ([`RichEditor`]), the signature below it, the
-//! quote a reply carries, and how well mail apps support its markup.
+//! The message being written: its fields, the contacts suggested while a recipient is typed,
+//! its text ([`RichEditor`]), the signature below it, the quote a reply carries, and how well
+//! mail apps support its markup.
 
 use std::collections::{BTreeSet, HashMap};
 
-use postden_app::{Draft, Quote, signature};
+use postden_app::{Draft, Quote, contacts, signature};
 use postden_core::account::Signature;
+use postden_core::message::Address;
 use postden_html::compat::{self, Report};
 use rune::{Image, ImageCache, TextEdit};
 
@@ -18,6 +20,54 @@ pub(crate) struct Expanded {
     pub(crate) quote: bool,
     /// What each mail app doesn't support.
     pub(crate) compat: bool,
+}
+
+/// One of the compose form's lists of recipients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recipients {
+    To,
+    Cc,
+    Bcc,
+}
+
+impl Recipients {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::To => "To",
+            Self::Cc => "Cc",
+            Self::Bcc => "Bcc",
+        }
+    }
+
+    /// The field's key, which its suggestions are anchored to.
+    pub(crate) const fn key(self) -> &'static str {
+        match self {
+            Self::To => "compose-to",
+            Self::Cc => "compose-cc",
+            Self::Bcc => "compose-bcc",
+        }
+    }
+
+    /// The key of its list of suggestions.
+    pub(crate) fn suggestions_key(self) -> String {
+        format!("{}-suggestions", self.key())
+    }
+
+    /// The key of its `i`th suggestion's row, as the list names it.
+    pub(crate) fn suggestion_key(self, i: usize) -> String {
+        format!("{}-option-{i}", self.suggestions_key())
+    }
+}
+
+/// The contacts suggested for the recipient being typed in one of the lists.
+#[derive(Debug, Default)]
+pub(crate) struct Suggestions {
+    field: Option<Recipients>,
+    /// The field's text and caret they were found for: edited or moved since, they're stale.
+    typed: (String, usize),
+    contacts: Vec<Address>,
+    /// The one Return or Tab picks.
+    pub(crate) active: usize,
 }
 
 /// A signature as it's shown: as Markdown, with its images.
@@ -60,6 +110,8 @@ pub(crate) struct ComposeForm {
     pub(crate) to: TextEdit,
     pub(crate) cc: TextEdit,
     pub(crate) bcc: TextEdit,
+    /// The contacts suggested for the recipient being typed.
+    pub(crate) suggestions: Suggestions,
     pub(crate) subject: TextEdit,
     /// What's written.
     pub(crate) body: RichEditor,
@@ -105,6 +157,7 @@ impl ComposeForm {
             to: TextEdit::new(draft.to),
             cc: TextEdit::new(draft.cc),
             bcc: TextEdit::new(draft.bcc),
+            suggestions: Suggestions::default(),
             subject: TextEdit::new(draft.subject),
             body: RichEditor::visual(draft.html.as_deref(), &draft.text),
             signature: None,
@@ -147,6 +200,82 @@ impl ComposeForm {
     /// Whether it passes on a message.
     pub(crate) const fn is_forward(&self) -> bool {
         self.forward
+    }
+
+    pub(crate) const fn recipients(&self, field: Recipients) -> &TextEdit {
+        match field {
+            Recipients::To => &self.to,
+            Recipients::Cc => &self.cc,
+            Recipients::Bcc => &self.bcc,
+        }
+    }
+
+    pub(crate) const fn recipients_mut(&mut self, field: Recipients) -> &mut TextEdit {
+        match field {
+            Recipients::To => &mut self.to,
+            Recipients::Cc => &mut self.cc,
+            Recipients::Bcc => &mut self.bcc,
+        }
+    }
+
+    /// The contacts to suggest under `field`: some were found for what it holds, and it's still
+    /// being typed in.
+    pub(crate) fn suggested(&self, field: Recipients) -> &[Address] {
+        let s = &self.suggestions;
+        let edit = self.recipients(field);
+        let current = s.field == Some(field)
+            && edit.focused
+            && !edit.is_composing()
+            && !self.sending
+            && s.typed.0 == edit.text
+            && s.typed.1 == edit.focus;
+        if current { &s.contacts } else { &[] }
+    }
+
+    /// Suggests `contacts` for what `field` holds now, the first picked.
+    pub(crate) fn suggest(&mut self, field: Recipients, contacts: Vec<Address>) {
+        let edit = self.recipients(field);
+        self.suggestions = Suggestions {
+            field: Some(field),
+            typed: (edit.text.clone(), edit.focus),
+            contacts,
+            active: 0,
+        };
+    }
+
+    /// Stops suggesting contacts, until something else is typed.
+    pub(crate) fn close_suggestions(&mut self) {
+        self.suggestions = Suggestions::default();
+    }
+
+    /// Picks the suggestion `by` rows down, or up when negative, wrapping around.
+    pub(crate) fn move_suggestion(&mut self, field: Recipients, by: isize) {
+        let count = self.suggested(field).len();
+        if count == 0 {
+            return;
+        }
+        let active = self.suggestions.active.min(count - 1);
+        self.suggestions.active = if by < 0 {
+            (active + count - by.unsigned_abs() % count) % count
+        } else {
+            (active + by.unsigned_abs()) % count
+        };
+    }
+
+    /// Puts the `i`th suggestion in place of the recipient being typed in `field`, followed by a
+    /// comma to type the next one, and stops suggesting. Whether there was one to put.
+    pub(crate) fn choose_suggestion(&mut self, field: Recipients, i: usize) -> bool {
+        let Some(contact) = self.suggested(field).get(i).cloned() else {
+            return false;
+        };
+        let edit = self.recipients_mut(field);
+        let (range, written) = contacts::complete(&edit.text, edit.focus, &contact);
+        // One edit, which undo takes back, as it does what was typed before it.
+        edit.set_selection(range.start, range.end);
+        edit.insert(&written);
+        edit.focused = true;
+        self.close_suggestions();
+        true
     }
 
     /// Scores the markup again, after an edit.
@@ -257,6 +386,75 @@ mod tests {
                 .to
                 .focused,
             "a new message starts at its recipients"
+        );
+    }
+
+    fn contact(name: &str, email: &str) -> Address {
+        Address {
+            name: Some(name.into()),
+            email: Some(email.into()),
+        }
+    }
+
+    /// A form being typed in To, `text` with the caret at its end.
+    fn typing_to(text: &str) -> ComposeForm {
+        let mut form = ComposeForm::new(Draft::new("me@example.com"), None);
+        form.to.replace_text(text);
+        form.to.set_caret(text.len());
+        form
+    }
+
+    #[test]
+    fn a_suggestion_picked_takes_the_place_of_what_was_typed() {
+        let mut form = typing_to("bob@example.com, ad");
+        let found = vec![
+            contact("Ada", "ada@example.com"),
+            contact("Adam", "adam@example.org"),
+        ];
+        form.suggest(Recipients::To, found.clone());
+        assert_eq!(form.suggested(Recipients::To), found.as_slice());
+        assert!(form.suggested(Recipients::Cc).is_empty(), "only under To");
+
+        form.move_suggestion(Recipients::To, -1);
+        assert_eq!(
+            form.suggestions.active, 1,
+            "up from the first wraps to the last"
+        );
+        form.move_suggestion(Recipients::To, 1);
+        assert_eq!(form.suggestions.active, 0);
+        assert!(form.choose_suggestion(Recipients::To, 1));
+        assert_eq!(form.to.text, "bob@example.com, Adam <adam@example.org>, ");
+        assert_eq!(form.to.focus, form.to.text.len(), "the caret is after it");
+        assert!(
+            form.suggested(Recipients::To).is_empty(),
+            "picked, they're gone"
+        );
+        assert!(!form.choose_suggestion(Recipients::To, 0));
+        form.to.undo();
+        assert_eq!(form.to.text, "bob@example.com, ad", "undo takes it back");
+    }
+
+    #[test]
+    fn suggestions_for_what_was_typed_before_are_stale() {
+        let mut form = typing_to("ad");
+        form.suggest(Recipients::To, vec![contact("Ada", "ada@example.com")]);
+        form.to.replace_text("adx");
+        form.to.set_caret(3);
+        assert!(form.suggested(Recipients::To).is_empty(), "edited since");
+
+        let mut form = typing_to("ad");
+        form.suggest(Recipients::To, vec![contact("Ada", "ada@example.com")]);
+        form.to.focused = false;
+        assert!(
+            form.suggested(Recipients::To).is_empty(),
+            "typing moved elsewhere"
+        );
+        form.to.focused = true;
+        assert_eq!(form.suggested(Recipients::To).len(), 1, "and came back");
+        form.sending = true;
+        assert!(
+            form.suggested(Recipients::To).is_empty(),
+            "nor while sending"
         );
     }
 
