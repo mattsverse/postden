@@ -29,7 +29,7 @@
     "@content-collections/core": "0.15.3",
     "@content-collections/markdown": "0.1.4",
     "@content-collections/vite": "0.3.1",
-    "@tailwindcss/typography": "0.5.19",
+    "@tailwindcss/typography": "0.5.20",
     "@tanstack/devtools-vite": "0.8.6",
     "@types/node": "^22.10.2",
     "@types/react": "^19.2.0",
