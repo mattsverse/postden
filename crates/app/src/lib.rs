@@ -11,6 +11,7 @@
 //! - [`signature`]: what each account adds below the mail it sends, images included.
 //! - [`Profile`]: every account and setting in one passphrase-locked file, to move Postden to
 //!   another computer.
+//! - [`import`]: setting up the accounts another mail app on this computer has, such as Spark.
 //! - [`Settings`]: the app's preferences, such as its [`Theme`] and whether to check for updates.
 //! - [`format_date`] and [`recipients`]: dates and recipients as a mail list shows them.
 //! - [`snooze_times`] and [`format_snooze`]: when a message can be snoozed until, and saying so.
@@ -20,6 +21,7 @@
 mod accounts;
 mod compose;
 mod google;
+pub mod import;
 mod mailroom;
 mod profile;
 mod settings;
