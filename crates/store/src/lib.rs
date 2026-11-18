@@ -80,6 +80,10 @@ CREATE TABLE IF NOT EXISTS mailboxes (
     name         TEXT NOT NULL,
     uid_validity INTEGER NOT NULL,
     role         TEXT NOT NULL DEFAULT 'inbox',
+    -- Every message from this UID up is cached, and the unread ones below it were looked for:
+    -- older mail is fetched below it. NULL until unread mail was first looked for, as every
+    -- message from the lowest UID cached up is then.
+    floor        INTEGER,
     PRIMARY KEY (account, name)
 ) STRICT;
 
@@ -177,11 +181,11 @@ CREATE TABLE IF NOT EXISTS contacts (
 ";
 
 /// The schema version [`SCHEMA`] creates, kept in `PRAGMA user_version`.
-const VERSION: i64 = 5;
+const VERSION: i64 = 6;
 
 /// Columns added since version 0, for databases created before them. Tables added since are
 /// created by [`SCHEMA`] itself.
-const MIGRATIONS: [(&str, &str, &str); 6] = [
+const MIGRATIONS: [(&str, &str, &str); 7] = [
     ("mailboxes", "role", "TEXT NOT NULL DEFAULT 'inbox'"),
     ("messages", "to_list", "TEXT"),
     // Version 2.
@@ -192,6 +196,8 @@ const MIGRATIONS: [(&str, &str, &str); 6] = [
     ("messages", "flagged", "INTEGER NOT NULL DEFAULT 0"),
     // Version 5.
     ("bodies", "kept", "INTEGER NOT NULL DEFAULT 0"),
+    // Version 6.
+    ("mailboxes", "floor", "INTEGER"),
 ];
 
 const MESSAGE_COLUMNS: &str = "m.account, m.mailbox, m.uid, m.message_id, m.from_name, m.from_email, m.subject, m.date, m.seen, m.to_list, m.flagged";
@@ -640,8 +646,9 @@ impl Store {
                 .retain(|(a, m, _)| !(a == account && m == mailbox));
         }
         tx.execute(
-            "INSERT INTO mailboxes VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO mailboxes (account, name, uid_validity, role) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(account, name) DO UPDATE SET
+                floor = CASE WHEN uid_validity = excluded.uid_validity THEN floor END,
                 uid_validity = excluded.uid_validity, role = excluded.role",
             params![account, mailbox, uid_validity, role.as_str()],
         )?;
@@ -678,18 +685,130 @@ impl Store {
         }
         let kept = kept(&self.removed, account, mailbox, messages);
         insert_messages(&tx, account, mailbox, &kept)?;
+        // They reach down from the floor without gaps, so it's lower now.
+        if let Some(lowest) = kept.iter().map(|m| m.uid).min() {
+            tx.execute(
+                "UPDATE mailboxes SET floor = MIN(floor, ?3)
+                 WHERE account = ?1 AND name = ?2 AND floor IS NOT NULL",
+                params![account, mailbox, lowest],
+            )?;
+        }
         tx.commit()?;
         Ok(true)
     }
 
-    /// The lowest UID cached in `mailbox`, or `None` when none is.
+    /// The UID older mail is fetched below in `mailbox`: every message from it up is cached. `None`
+    /// when nothing is.
+    ///
+    /// Unread messages below it can be cached too, as [`Store::save_unread`] found them.
     ///
     /// # Errors
     ///
     /// Returns an error when the read fails.
     pub fn oldest_uid(&self, account: &str, mailbox: &str) -> Result<Option<u32>> {
         Ok(self.conn.query_row(
-            "SELECT MIN(uid) FROM messages WHERE account = ?1 AND mailbox = ?2",
+            "SELECT COALESCE(
+                (SELECT floor FROM mailboxes WHERE account = ?1 AND name = ?2),
+                (SELECT MIN(uid) FROM messages WHERE account = ?1 AND mailbox = ?2))",
+            [account, mailbox],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// The UIDs cached in `mailbox` below `below`, ascending.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn uids_below(&self, account: &str, mailbox: &str, below: u32) -> Result<Vec<u32>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uid FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid < ?3
+             ORDER BY uid",
+        )?;
+        let rows = stmt.query_map(params![account, mailbox, below], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Saves what a search for unread mail below `below` in `mailbox` found, under the mailbox's
+    /// `uid_validity`, in a search that started at `asked`: the messages cached below it are read
+    /// unless in `unseen`, sorted ascending, and `messages`, the unread ones not cached, are added.
+    /// From then on, older mail is fetched below where it was fetched below before, and the
+    /// mailbox's unread mail [was looked for](Store::unread_searched). What was
+    /// [written](Store::written) since is newer, and wins.
+    ///
+    /// If the mailbox is no longer cached under `uid_validity`, nothing is saved. Returns how many
+    /// messages changed or were added, or `None` then.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails. Nothing is written in that case.
+    pub fn save_unread(
+        &mut self,
+        account: &str,
+        mailbox: &str,
+        (uid_validity, asked): (u32, u64),
+        below: u32,
+        unseen: &[u32],
+        messages: &[Envelope],
+    ) -> Result<Option<usize>> {
+        let cached = self.uids_below(account, mailbox, below)?;
+        let seen: Vec<(u32, bool)> = cached
+            .iter()
+            .map(|&uid| {
+                let at = (uid_validity, uid);
+                let (since, _) = self.written_since(account, mailbox, at, asked);
+                (
+                    uid,
+                    since.unwrap_or_else(|| unseen.binary_search(&uid).is_err()),
+                )
+            })
+            .collect();
+        let mut messages = kept(&self.removed, account, mailbox, messages);
+        self.with_written(account, mailbox, (uid_validity, asked), &mut messages);
+        let tx = self.conn.transaction()?;
+        let current: Option<u32> = tx
+            .query_row(
+                "SELECT uid_validity FROM mailboxes WHERE account = ?1 AND name = ?2",
+                [account, mailbox],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current != Some(uid_validity) {
+            return Ok(None);
+        }
+        // Before what's below is added: every message from the lowest UID cached up was.
+        tx.execute(
+            "UPDATE mailboxes SET floor = COALESCE(floor,
+                (SELECT MIN(uid) FROM messages WHERE account = ?1 AND mailbox = ?2), ?3)
+             WHERE account = ?1 AND name = ?2",
+            params![account, mailbox, below],
+        )?;
+        let mut changed = 0;
+        {
+            let mut update = tx.prepare(
+                "UPDATE messages SET seen = ?4
+                 WHERE account = ?1 AND mailbox = ?2 AND uid = ?3 AND seen != ?4",
+            )?;
+            for (uid, seen) in seen {
+                changed += update.execute(params![account, mailbox, uid, seen])?;
+            }
+        }
+        insert_messages(&tx, account, mailbox, &messages)?;
+        tx.commit()?;
+        Ok(Some(changed + messages.len()))
+    }
+
+    /// Whether unread mail older than what's cached of `mailbox` was looked for, or there's
+    /// nothing cached to be older than.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn unread_searched(&self, account: &str, mailbox: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM mailboxes WHERE account = ?1 AND name = ?2
+                AND floor IS NOT NULL)
+             OR NOT EXISTS (SELECT 1 FROM messages WHERE account = ?1 AND mailbox = ?2)",
             [account, mailbox],
             |row| row.get(0),
         )?)
@@ -1073,15 +1192,7 @@ impl Store {
     ///
     /// Returns an error when the read fails.
     pub fn recent_messages(&self, role: Role, limit: usize) -> Result<Vec<StoredMessage>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {MESSAGE_COLUMNS} FROM messages m
-             JOIN mailboxes b ON b.account = m.account AND b.name = m.mailbox
-             WHERE b.role = ?1
-             ORDER BY m.date IS NULL, m.date DESC, m.uid DESC LIMIT ?2"
-        ))?;
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = stmt.query_map(params![role.as_str(), limit], message_from_row)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        self.newest(Scope::Role(role), false, limit)
     }
 
     /// The `limit` most recent messages in one of the account's mailboxes, newest first.
@@ -1095,14 +1206,11 @@ impl Store {
         mailbox: &str,
         limit: usize,
     ) -> Result<Vec<StoredMessage>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {MESSAGE_COLUMNS} FROM messages m
-             WHERE m.account = ?1 AND m.mailbox = ?2
-             ORDER BY m.date IS NULL, m.date DESC, m.uid DESC LIMIT ?3"
-        ))?;
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = stmt.query_map(params![account, mailbox, limit], message_from_row)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let scope = Scope::Mailbox {
+            account,
+            name: mailbox,
+        };
+        self.newest(scope, false, limit)
     }
 
     /// One cached message, or `None` when it isn't cached.
@@ -1148,7 +1256,7 @@ impl Store {
     pub fn matching_messages(
         &self,
         scope: Scope<'_>,
-        mut matches: impl FnMut(&Envelope) -> bool,
+        mut matches: impl FnMut(&StoredMessage) -> bool,
         limit: usize,
     ) -> Result<Vec<StoredMessage>> {
         const ORDER: &str = "ORDER BY m.date IS NULL, m.date DESC, m.uid DESC";
@@ -1176,11 +1284,47 @@ impl Store {
                 break;
             }
             let message = message?;
-            if matches(&message.envelope) {
+            if matches(&message) {
                 found.push(message);
             }
         }
         Ok(found)
+    }
+
+    /// The `limit` most recent unread messages in `scope`, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn unread_messages(&self, scope: Scope<'_>, limit: usize) -> Result<Vec<StoredMessage>> {
+        self.newest(scope, true, limit)
+    }
+
+    /// The `limit` most recent messages in `scope`, or only its unread ones, newest first.
+    fn newest(&self, scope: Scope<'_>, unread: bool, limit: usize) -> Result<Vec<StoredMessage>> {
+        let unread = if unread { "AND NOT m.seen" } else { "" };
+        let order = "ORDER BY m.date IS NULL, m.date DESC, m.uid DESC";
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = match scope {
+            Scope::Role(role) => self
+                .conn
+                .prepare(&format!(
+                    "SELECT {MESSAGE_COLUMNS} FROM messages m
+                     JOIN mailboxes b ON b.account = m.account AND b.name = m.mailbox
+                     WHERE b.role = ?1 {unread} {order} LIMIT ?2"
+                ))?
+                .query_map(params![role.as_str(), limit], message_from_row)?
+                .collect::<rusqlite::Result<_>>()?,
+            Scope::Mailbox { account, name } => self
+                .conn
+                .prepare(&format!(
+                    "SELECT {MESSAGE_COLUMNS} FROM messages m
+                     WHERE m.account = ?1 AND m.mailbox = ?2 {unread} {order} LIMIT ?3"
+                ))?
+                .query_map(params![account, name, limit], message_from_row)?
+                .collect::<rusqlite::Result<_>>()?,
+        };
+        Ok(rows)
     }
 
     /// How many messages each account has unread in its inbox, by account id. Accounts with none
@@ -2376,6 +2520,86 @@ mod tests {
     }
 
     #[test]
+    fn unread_mail_below_the_cache_leaves_older_mail_fetched_from_where_it_was() {
+        let (me, inbox) = ("me@example.com", "INBOX");
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account(me)).unwrap();
+        let read = |uid, date| Envelope {
+            seen: true,
+            ..envelope(uid, date)
+        };
+        store
+            .save_messages(me, inbox, Role::Inbox, 1, &[read(10, 100), read(11, 110)])
+            .unwrap();
+        assert!(!store.unread_searched(me, inbox).unwrap());
+        assert_eq!(store.unread_counts().unwrap().get(me), None);
+
+        assert_eq!(
+            store
+                .save_unread(me, inbox, (2, 0), 10, &[3], &[envelope(3, 30)])
+                .unwrap(),
+            None,
+            "stale"
+        );
+        assert_eq!(
+            store
+                .save_unread(
+                    me,
+                    inbox,
+                    (1, 0),
+                    10,
+                    &[3, 7],
+                    &[envelope(3, 30), envelope(7, 70)]
+                )
+                .unwrap(),
+            Some(2)
+        );
+        assert!(store.unread_searched(me, inbox).unwrap());
+        assert_eq!(store.unread_counts().unwrap().get(me), Some(&2));
+        assert_eq!(
+            store.oldest_uid(me, inbox).unwrap(),
+            Some(10),
+            "what's between is still fetched as older mail"
+        );
+        assert_eq!(store.uids_below(me, inbox, 10).unwrap(), vec![3, 7]);
+
+        // 7 was read elsewhere, and 3 here since the search started.
+        store.written(
+            me,
+            inbox,
+            (1, 3),
+            Written {
+                at: 5,
+                seen: Some(true),
+                flagged: None,
+            },
+        );
+        assert_eq!(
+            store.save_unread(me, inbox, (1, 4), 10, &[3], &[]).unwrap(),
+            Some(2)
+        );
+        assert_eq!(store.seen(me, inbox, 7).unwrap(), Some(true));
+        assert_eq!(store.seen(me, inbox, 3).unwrap(), Some(true), "read since");
+
+        assert!(
+            store
+                .save_older_messages(me, inbox, 1, &[read(8, 80), read(9, 90)])
+                .unwrap()
+        );
+        assert_eq!(
+            store.oldest_uid(me, inbox).unwrap(),
+            Some(8),
+            "older mail lowers it"
+        );
+
+        store
+            .save_messages(me, inbox, Role::Inbox, 2, &[read(20, 200)])
+            .unwrap();
+        assert!(!store.unread_searched(me, inbox).unwrap(), "started over");
+        assert_eq!(store.oldest_uid(me, inbox).unwrap(), Some(20));
+    }
+
+    #[test]
     fn recent_messages_are_newest_first_across_accounts() {
         let mut store = Store::open_in_memory().unwrap();
         store.save_account(&account("a@example.com")).unwrap();
@@ -2501,7 +2725,7 @@ mod tests {
         store
             .save_messages("a@example.com", "Sent", Role::Sent, 1, &[envelope(5, 50)])
             .unwrap();
-        let not_2 = |e: &Envelope| e.uid != 2;
+        let not_2 = |m: &StoredMessage| m.envelope.uid != 2;
         let uids = |found: Vec<StoredMessage>| -> Vec<u32> {
             found.into_iter().map(|m| m.envelope.uid).collect()
         };
@@ -2527,6 +2751,34 @@ mod tests {
             uids(store.matching_messages(one, |_| false, 10).unwrap()),
             Vec::<u32>::new()
         );
+    }
+
+    #[test]
+    fn unread_messages_are_the_newest_unread_within_their_scope() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account("a@example.com")).unwrap();
+        let read = Envelope {
+            seen: true,
+            ..envelope(2, 30)
+        };
+        let inbox = [envelope(1, 10), read, envelope(3, 20)];
+        store
+            .save_messages("a@example.com", "INBOX", Role::Inbox, 1, &inbox)
+            .unwrap();
+        store
+            .save_messages("a@example.com", "Sent", Role::Sent, 1, &[envelope(4, 40)])
+            .unwrap();
+        let uids = |found: Vec<StoredMessage>| -> Vec<u32> {
+            found.into_iter().map(|m| m.envelope.uid).collect()
+        };
+        let inboxes = Scope::Role(Role::Inbox);
+        assert_eq!(uids(store.unread_messages(inboxes, 10).unwrap()), [3, 1]);
+        assert_eq!(uids(store.unread_messages(inboxes, 1).unwrap()), [3]);
+        let sent = Scope::Mailbox {
+            account: "a@example.com",
+            name: "Sent",
+        };
+        assert_eq!(uids(store.unread_messages(sent, 10).unwrap()), [4]);
     }
 
     #[test]

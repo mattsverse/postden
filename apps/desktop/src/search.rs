@@ -363,17 +363,21 @@ impl Search {
             .collect();
         let mut all = cached;
         all.extend(extra);
-        // As the store orders them: undated last, then newest first.
-        all.sort_by_key(|m| {
-            (
-                m.envelope.date.is_none(),
-                Reverse(m.envelope.date),
-                Reverse(m.envelope.uid),
-            )
-        });
+        newest_first(&mut all);
         all.truncate(limit);
         all
     }
+}
+
+/// Orders `messages` as the store does: undated last, then newest first.
+pub(crate) fn newest_first(messages: &mut [StoredMessage]) {
+    messages.sort_by_key(|m| {
+        (
+            m.envelope.date.is_none(),
+            Reverse(m.envelope.date),
+            Reverse(m.envelope.uid),
+        )
+    });
 }
 
 /// The message `m` is, by account, mailbox and UID.

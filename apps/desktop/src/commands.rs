@@ -150,6 +150,8 @@ pub(crate) enum Command {
     Refresh,
     /// Syncs every mailbox of every account with the server now.
     RefreshAll,
+    /// Lists only unread mail, or all of it again.
+    ToggleUnreadOnly,
     /// Marks every message in the mailbox shown read.
     MarkAllSeen {
         account: String,
@@ -283,6 +285,8 @@ impl Command {
             }
             Self::Refresh => "Refresh".into(),
             Self::RefreshAll => "Refresh all mailboxes".into(),
+            Self::ToggleUnreadOnly if s.settings.unread_only => "Show all mail".into(),
+            Self::ToggleUnreadOnly => "Show only unread mail".into(),
             Self::MarkAllSeen { .. } => "Mark all as read".into(),
             Self::AccountSettings(_) => "Account settings".into(),
             Self::AddAccount => "Add account".into(),
@@ -361,6 +365,7 @@ impl Command {
             Self::Show(showing) => s.show(showing),
             Self::Refresh => s.refresh_shown(),
             Self::RefreshAll => s.refresh_all(),
+            Self::ToggleUnreadOnly => s.set_unread_only(!s.settings.unread_only),
             Self::MarkAllSeen { account, mailbox } => s.mark_all_seen(&account, &mailbox),
             Self::AccountSettings(account) => s.open_account_settings(&account),
             Self::AddAccount => s.open_form(),
@@ -465,6 +470,7 @@ pub(crate) fn available(s: &Mail) -> Vec<Command> {
     add(browsing && has_accounts, Command::Search);
     add(browsing && has_accounts, Command::Refresh);
     add(browsing && has_accounts, Command::RefreshAll);
+    add(browsing && has_accounts, Command::ToggleUnreadOnly);
     if let Showing::Mailbox { account, name } = &s.showing
         && browsing
         && !s.marking_seen(account, name)

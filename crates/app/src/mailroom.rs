@@ -14,10 +14,10 @@ use postden_core::account::{Account, Server};
 use postden_core::message::{Address, Body, Envelope, Mailbox, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
-    Event, Flags, Found, Nudge, Older, Prefetched, SNOOZED_NAME, Status, Verdict, WatchConfig,
-    create_mailbox, download_message, fetch_older, mark_all_seen, move_message, open_message,
-    prefetch_messages, refresh, restore_message, save_sent_copy, search, set_flagged, set_seen,
-    snooze_message, wake_message, watch,
+    Event, Flags, Found, Nudge, Older, Prefetched, SNOOZED_NAME, Status, Unread, Verdict,
+    WatchConfig, create_mailbox, download_message, fetch_older, fetch_unread, mark_all_seen,
+    move_message, open_message, prefetch_messages, refresh, restore_message, save_sent_copy,
+    search, set_flagged, set_seen, snooze_message, wake_message, watch,
 };
 use postden_mail::{Credentials, smtp};
 use postden_store::{Snooze, Store, Written};
@@ -35,6 +35,9 @@ const PREFETCH_BATCH: usize = 20;
 /// The largest message downloaded ahead, in bytes. Larger ones, mostly their attachments, are
 /// only downloaded once opened.
 const PREFETCH_MAX_SIZE: u32 = 5 * 1024 * 1024;
+/// How many of a mailbox's unread messages older than what's cached are kept cached, the newest:
+/// as many as a first sync fetches. Each search for them fetches only those not cached yet.
+const UNREAD_KEPT: usize = 200;
 
 /// Something the UI should show. By the time it's sent, the mail is already in the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,7 +90,7 @@ pub enum Update {
         error: String,
     },
     /// A search asked for with [`Mailroom::search`] finished in one mailbox. What it found isn't
-    /// saved: the cache holds a mailbox's newest mail without gaps, and matches can be anywhere.
+    /// saved: the cache holds a mailbox's newest mail, and matches can be anywhere.
     /// If the mailbox started over (a new UIDVALIDITY) since the search began, it failed: its
     /// UIDs would name other messages now.
     Searched {
@@ -96,6 +99,17 @@ pub enum Update {
         account: String,
         mailbox: String,
         result: Result<Found, String>,
+    },
+    /// Unread mail older than what was cached, looked for with [`Mailroom::find_unread`], was
+    /// saved, and what was cached below it is read or not as the server says; or it couldn't be
+    /// looked for. `count` is how many messages were added or changed.
+    Unread {
+        account: String,
+        mailbox: String,
+        result: Result<usize, String>,
+        /// It was asked for again while it looked, so what it found may be older than what
+        /// asked: ask again.
+        again: bool,
     },
     /// Fetched mail couldn't be saved.
     SaveFailed { account: String, error: String },
@@ -354,6 +368,18 @@ enum Job {
         uid_validity: u32,
         result: Result<Found, String>,
     },
+    /// What [`Mailroom::find_unread`] found below `below`.
+    Unread {
+        account: String,
+        mailbox: String,
+        uid_validity: u32,
+        below: u32,
+        result: Result<Unread, String>,
+        /// As [`Job::Older`]'s.
+        asked: u64,
+        /// As [`Update::Unread`]'s.
+        again: bool,
+    },
     /// Drop every downloaded message, then download ahead anew.
     Clear,
     /// Stop keeping opened messages, unless they're kept again by then.
@@ -443,6 +469,27 @@ fn event_account(event: &Event) -> &str {
     }
 }
 
+/// `job`, failed, as its account was replaced while it was asked: as [`Job::superseded`], and a
+/// search for unread mail, with nothing to save, goes to the UI as it is, still asking to be
+/// searched again if it was.
+fn superseded(job: Job) -> Job {
+    match job {
+        // Asked for again meanwhile, as by the new watch's sync, it's still looked for again.
+        Job::Unread {
+            account,
+            mailbox,
+            again,
+            ..
+        } => Job::Done(Update::Unread {
+            account,
+            mailbox,
+            result: replaced(),
+            again,
+        }),
+        job => job.superseded(),
+    }
+}
+
 /// What a request asked of an account's server ends as when the account was replaced meanwhile.
 fn replaced<T>() -> Result<T, String> {
     Err("the account was replaced while this was under way".to_owned())
@@ -457,7 +504,8 @@ impl Job {
             | Self::Flagged { account, .. }
             | Self::AllSeen { account, .. }
             | Self::Older { account, .. }
-            | Self::Searched { account, .. } => Some(account),
+            | Self::Searched { account, .. }
+            | Self::Unread { account, .. } => Some(account),
             Self::Moved(moving, _) => Some(&moving.account),
             Self::Woke(snooze, _) => Some(&snooze.account),
             Self::Restored(restoring, _) => Some(&restoring.account),
@@ -642,6 +690,36 @@ pub struct Mailroom {
     /// Snoozed messages being moved back by [`Mailroom::restore`], by account and Message-ID:
     /// their snoozes are kept until they're moved, but not brought back meanwhile.
     unsnoozing: Arc<Mutex<HashSet<(String, String)>>>,
+    /// The mailboxes being searched for unread mail by [`Mailroom::find_unread`], not to be
+    /// searched twice at once: see [`Finding`].
+    finding_unread: Finding,
+}
+
+/// The mailboxes being searched for unread mail, by account and name, each with whether it was
+/// asked for again meanwhile: what that search read may be older than what asked.
+#[derive(Debug, Clone, Default)]
+struct Finding(Arc<Mutex<HashMap<(String, String), bool>>>);
+
+impl Finding {
+    /// Starts a search of `key`. Returns `false` if one is under way: it's searched again after.
+    fn start(&self, key: &(String, String)) -> bool {
+        let mut finding = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(again) = finding.get_mut(key) {
+            *again = true;
+            return false;
+        }
+        finding.insert(key.clone(), false);
+        true
+    }
+
+    /// Ends the search of `key`. Returns whether it was asked for again meanwhile.
+    fn end(&self, key: &(String, String)) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key)
+            .unwrap_or(false)
+    }
 }
 
 type Logins = Arc<Mutex<HashMap<String, (Server, Credentials, u64)>>>;
@@ -710,6 +788,7 @@ impl Mailroom {
             refreshes: Arc::default(),
             waking: Arc::default(),
             unsnoozing: Arc::default(),
+            finding_unread: Finding::default(),
         })
     }
 
@@ -1423,6 +1502,56 @@ impl Mailroom {
         Ok(())
     }
 
+    /// Looks in `mailbox` on the server, in the background, for unread mail older than what's
+    /// cached, which a sync never fetches, and caches the newest [`UNREAD_KEPT`] of it; and has
+    /// what was cached of it before read or not as the server says now. The result arrives as
+    /// [`Update::Unread`]. Asked while it's already looking there, it looks again after, as that
+    /// update says. Does nothing when nothing is cached: the next sync fetches the newest.
+    ///
+    /// # Errors
+    ///
+    /// As [`Mailroom::open`].
+    pub fn find_unread(&self, store: &Store, account: &str, mailbox: &str) -> Result<()> {
+        let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
+        let Some(below) = store.oldest_uid(account, mailbox)? else {
+            return Ok(());
+        };
+        let cached = store.uids_below(account, mailbox, below)?;
+        let key = (account.to_owned(), mailbox.to_owned());
+        if !self.finding_unread.start(&key) {
+            return Ok(());
+        }
+        // Before anything is read: what's changed after is newer than what's read.
+        let asked = self.config.changes.now();
+        let finding = self.finding_unread.clone();
+        self.handle.spawn(async move {
+            let (account, mailbox) = key.clone();
+            let result = fetch_unread(
+                &server,
+                &credentials,
+                &mailbox,
+                uid_validity,
+                below,
+                &cached,
+                UNREAD_KEPT,
+            )
+            .await
+            .map_err(|e| e.to_string());
+            // Ended before it's saved, so asking again once it's saved starts another.
+            let again = finding.end(&key);
+            let _ignored = jobs.send(Job::Unread {
+                account,
+                mailbox,
+                uid_validity,
+                below,
+                result,
+                asked,
+                again,
+            });
+        });
+        Ok(())
+    }
+
     /// Searches `mailbox` on the server in the background for the newest `count` messages holding
     /// every word of `query`. The result arrives as [`Update::Searched`], carrying `id`.
     ///
@@ -1659,7 +1788,7 @@ impl Prefetcher {
         let keep = self.keep_opened.load(Ordering::Relaxed);
         let job = match job {
             Job::Asked { watch, job } if job.account().is_some_and(|a| !is_current(a, watch)) => {
-                job.superseded()
+                superseded(*job)
             }
             Job::Asked { job, .. } => *job,
             Job::Watching { watch, event } if !is_current(event_account(&event), watch) => {
@@ -1961,6 +2090,21 @@ fn save(store: &mut Store, job: Job) -> Vec<Update> {
             uid_validity,
             result,
         } => vec![searched(store, id, account, mailbox, uid_validity, result)],
+        Job::Unread {
+            account,
+            mailbox,
+            uid_validity,
+            below,
+            result,
+            asked,
+            again,
+        } => vec![save_unread(
+            store,
+            (account, mailbox, uid_validity),
+            below,
+            result,
+            (asked, again),
+        )],
         // Numbered and downloading-ahead jobs, which `Prefetcher::save` handles first.
         _ => Vec::new(),
     }
@@ -2371,6 +2515,35 @@ fn save_older(
     }
 }
 
+fn save_unread(
+    store: &mut Store,
+    (account, mailbox, uid_validity): (String, String, u32),
+    below: u32,
+    result: Result<Unread, String>,
+    (asked, again): (u64, bool),
+) -> Update {
+    let result = result.and_then(|unread| {
+        store
+            .save_unread(
+                &account,
+                &mailbox,
+                (uid_validity, asked),
+                below,
+                &unread.unseen,
+                &unread.messages,
+            )
+            .map_err(|e| e.to_string())
+            // The mailbox started over (or went) meanwhile: its next sync is looked after anew.
+            .map(Option::unwrap_or_default)
+    });
+    Update::Unread {
+        account,
+        mailbox,
+        result,
+        again,
+    }
+}
+
 fn save_messages(
     store: &mut Store,
     (account, mailbox, role): (String, String, Role),
@@ -2578,6 +2751,43 @@ mod tests {
             matches!(empty.as_slice(), [Update::Older { done: true, .. }]),
             "nothing came back, so nothing more to ask for: {empty:?}"
         );
+    }
+
+    #[test]
+    fn an_unread_search_asked_for_while_under_way_runs_again_after() {
+        let finding = Finding::default();
+        let inbox = ("me@example.com".to_owned(), "INBOX".to_owned());
+        assert!(finding.start(&inbox));
+        assert!(!finding.start(&inbox), "under way");
+        assert!(!finding.start(&inbox), "asked twice, once more is enough");
+        assert!(finding.end(&inbox), "asked for again");
+        assert!(finding.start(&inbox), "that search");
+        assert!(!finding.end(&inbox), "nothing asked meanwhile");
+    }
+
+    #[test]
+    fn an_unread_search_from_a_replaced_watch_still_runs_again_if_asked() {
+        let job = |again| Job::Unread {
+            account: "me@example.com".into(),
+            mailbox: "INBOX".into(),
+            uid_validity: 1,
+            below: 10,
+            result: Ok(Unread {
+                unseen: vec![3],
+                messages: Vec::new(),
+            }),
+            asked: 0,
+            again,
+        };
+        for again in [false, true] {
+            assert!(
+                matches!(
+                    superseded(job(again)),
+                    Job::Done(Update::Unread { result: Err(_), again: a, .. }) if a == again
+                ),
+                "again: {again}"
+            );
+        }
     }
 
     #[test]

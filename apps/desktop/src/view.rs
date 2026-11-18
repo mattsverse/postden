@@ -58,6 +58,12 @@ static MORE: Icon = Icon {
     view: 16.0,
     body: r#"<circle cx="3.5" cy="8" r="1.1" fill="currentColor"/><circle cx="8" cy="8" r="1.1" fill="currentColor"/><circle cx="12.5" cy="8" r="1.1" fill="currentColor"/>"#,
 };
+/// An envelope with an unread dot: the list shows only unread mail.
+static UNREAD: Icon = Icon {
+    name: "postden-unread",
+    view: 16.0,
+    body: r#"<path d="M11.5 12.5H3A1 1 0 0 1 2 11.5V5.25A1 1 0 0 1 3 4.25H8.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" fill="none"/><path d="M13.25 8.75V11.5A1 1 0 0 1 12.25 12.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" fill="none"/><path d="M2.5 5L7.25 8.5L9.5 6.85" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/><circle cx="12.5" cy="4.25" r="2" fill="currentColor"/>"#,
+};
 static FOLDER: Icon = Icon {
     name: "postden-folder",
     view: 16.0,
@@ -715,8 +721,8 @@ fn inbox(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(list)
 }
 
-/// The search field, and, unless the list already shows every inbox, whether to search just what
-/// it shows or every inbox.
+/// The search field; unless the list already shows every inbox, whether to search just what it
+/// shows or every inbox; and a button to show only unread mail, or all of it again.
 fn search_bar(s: &Mail, k: &Kit) -> El {
     let mut input = TextInput::new(&s.search.query)
         .label("Search mail")
@@ -771,7 +777,25 @@ fn search_bar(s: &Mail, k: &Kit) -> El {
                 .build(k),
         );
     }
-    bar
+    // A button, not another segmented control: next to the one above, the field had no room
+    // left in a narrow window.
+    let unread = Command::ToggleUnreadOnly.title(s);
+    bar.child(
+        IconButton::new(&UNREAD)
+            .variant(if s.settings.unread_only {
+                IconButtonVariant::Neutral
+            } else {
+                IconButtonVariant::GhostMuted
+            })
+            .label(unread.clone())
+            .help(unread)
+            .on_press_tx(|s: &mut Mail, tx| {
+                s.set_unread_only(!s.settings.unread_only);
+                keep_keys_for_list(tx);
+            })
+            .build(k)
+            .key("unread-only"),
+    )
 }
 
 /// The end of a search's results: a button to search the server too, a spinner while it does,
@@ -837,6 +861,8 @@ fn empty_list(s: &Mail, k: &Kit) -> El {
         "No cached mail matches."
     } else if s.accounts.is_empty() {
         "Add an account to get started."
+    } else if s.settings.unread_only && s.listing_synced() {
+        return nothing_unread(s, k);
     } else if s.showing_sent() {
         "No sent mail yet."
     } else if matches!(&s.showing, Showing::Mailbox { name, .. } if name != INBOX_NAME) {
@@ -855,6 +881,44 @@ fn empty_list(s: &Mail, k: &Kit) -> El {
         empty = empty.child(server_search(s, k));
     }
     empty
+}
+
+/// What a list of only unread mail says once there's none: an inbox got to zero.
+fn nothing_unread(s: &Mail, k: &Kit) -> El {
+    let inbox = match &s.showing {
+        Showing::All(role) => *role == Role::Inbox,
+        Showing::Mailbox { name, .. } => name == INBOX_NAME,
+    };
+    let (title, hint) = if inbox {
+        (
+            "Congratulations: you got to inbox 0",
+            "Nothing unread. New messages appear here as they arrive.",
+        )
+    } else {
+        ("Nothing unread", "Every message here is read.")
+    };
+    col()
+        .key(if inbox {
+            "inbox-zero"
+        } else {
+            "nothing-unread"
+        })
+        .w_full()
+        .grow(1.0)
+        .center()
+        .gap(6.0)
+        .child(text(title).font(k.ty.body_medium).color(k.c.text_base))
+        .child(text(hint).font(k.ty.ui).color(k.c.text_muted))
+        .child(
+            Button::new("Show all mail")
+                .variant(ButtonVariant::Ghost)
+                .on_press_tx(|s: &mut Mail, tx| {
+                    s.set_unread_only(false);
+                    keep_keys_for_list(tx);
+                })
+                .build(k)
+                .key("show-all-mail"),
+        )
 }
 
 fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
