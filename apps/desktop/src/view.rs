@@ -458,7 +458,7 @@ fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut 
     if mailbox.role == Role::Inbox && unread > 0 {
         r = r.badge(unread.to_string());
     }
-    if s.marking_seen(account, &mailbox.name) {
+    if s.marking_seen(account, &mailbox.name) || s.refreshing(account, &mailbox.name) {
         r = r.status(RowStatus::Busy);
     }
     let (menu_account, menu_mailbox) = (account.to_owned(), mailbox.name.clone());
@@ -477,7 +477,8 @@ fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut 
     }
 }
 
-/// A mailbox's menu, open at where it was right-clicked: refreshing it, and marking it all read.
+/// A mailbox's menu, open at where it was right-clicked: refreshing it or every mailbox, and
+/// marking it all read.
 /// While it's `marking` read, it can't be marked again.
 fn mailbox_menu(menu: &MailboxMenu, marking: bool, row: El, k: &Kit, layer: &mut Vec<El>) -> El {
     let (account, mailbox) = &menu.mailbox;
@@ -494,6 +495,12 @@ fn mailbox_menu(menu: &MailboxMenu, marking: bool, row: El, k: &Kit, layer: &mut
         s.close_mailbox_menu();
         s.refresh_mailbox(&refresh_account, &refresh_mailbox);
     }))
+    .item(
+        MenuItem::new("Refresh all mailboxes").on_select(|s: &mut Mail| {
+            s.close_mailbox_menu();
+            s.refresh_all();
+        }),
+    )
     .item(
         MenuItem::new(if marking {
             "Marking all as read…"

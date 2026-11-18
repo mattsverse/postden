@@ -408,6 +408,13 @@ pub(crate) struct Mail {
     moving: HashSet<MessageKey>,
     /// Mailboxes being marked read, as asked with [`Mail::mark_all_seen`], until the server answers.
     marking_seen: HashSet<MailboxKey>,
+    /// Mailboxes being refreshed, as asked with [`Mail::refresh_mailbox`], with the number of the
+    /// refresh asked for: each shows it's busy until a sync answering it ends.
+    refreshing: HashMap<MailboxKey, u64>,
+    /// Accounts whose mailboxes other than the inbox are refreshed with [`Mail::refresh_all`],
+    /// with the refresh's number, until the round answering it ends: what its listing finds
+    /// shows it's busy too.
+    refreshing_all: HashMap<String, u64>,
     /// The message being written, shown over the reader and the list.
     pub(crate) compose: ComposeForm,
     /// The app's preferences, as last saved.
@@ -499,6 +506,8 @@ impl Mail {
             pending_reply: None,
             moving: HashSet::new(),
             marking_seen: HashSet::new(),
+            refreshing: HashMap::new(),
+            refreshing_all: HashMap::new(),
             collapsed: HashSet::new(),
             settings: Settings::default(),
             settings_open: false,
@@ -753,9 +762,7 @@ impl Mail {
             self.started_over(account, mailbox);
         }
         match update {
-            Update::Status { account, status } => {
-                self.statuses.insert(account, Ok(status));
-            }
+            update @ (Update::Status { .. } | Update::Synced { .. }) => self.watching(update),
             Update::Mail {
                 account,
                 mailbox,
@@ -860,6 +867,19 @@ impl Mail {
     /// on the server is gone.
     fn mailboxes_listed(&mut self, account: &str) {
         self.reload();
+        // Listed by a refresh of every mailbox, or a round before it: either way its round syncs
+        // them all next, whether they were listed before or not.
+        if let Some(&asked) = self.refreshing_all.get(account) {
+            let listed = self.mailboxes.get(account).map_or(&[][..], Vec::as_slice);
+            for mailbox in listed
+                .iter()
+                .filter(|m| !m.name.eq_ignore_ascii_case(INBOX))
+            {
+                let key = (account.to_owned(), mailbox.name.clone());
+                let n = self.refreshing.entry(key).or_insert(asked);
+                *n = (*n).max(asked);
+            }
+        }
         let listed = self.mailboxes.get(account);
         let gone = |a: &str, m: &str| {
             a == account && !listed.is_some_and(|l| l.iter().any(|b| b.name == m))
@@ -2234,23 +2254,100 @@ impl Mail {
     }
 
     /// Syncs one of an account's mailboxes with the server now, rather than waiting for the server
-    /// to report a change or the next interval. What it finds shows as it arrives.
-    pub(crate) fn refresh_mailbox(&self, account: &str, mailbox: &str) {
+    /// to report a change or the next interval. What it finds shows as it arrives, and the
+    /// mailbox shows it's busy until the sync ends.
+    pub(crate) fn refresh_mailbox(&mut self, account: &str, mailbox: &str) {
         let Ok(services) = &self.services else { return };
         // Servers may spell the inbox in any case.
-        if mailbox.eq_ignore_ascii_case(INBOX) {
-            services.mailroom.refresh_inbox(account);
+        let asked = if mailbox.eq_ignore_ascii_case(INBOX) {
+            services.mailroom.refresh_inbox(account)
         } else {
-            services.mailroom.refresh(account);
+            services.mailroom.refresh(account)
+        };
+        if let Some(asked) = asked {
+            self.refreshing
+                .insert((account.to_owned(), mailbox.to_owned()), asked);
         }
     }
 
     /// Syncs what the list shows with the server now: its mailbox, or every account's inbox or
     /// Sent.
-    pub(crate) fn refresh_shown(&self) {
+    pub(crate) fn refresh_shown(&mut self) {
         for (account, mailbox) in self.refresh_targets() {
             self.refresh_mailbox(&account, &mailbox);
         }
+    }
+
+    /// Syncs every mailbox of every account with the server now, each showing it's busy until
+    /// its sync ends.
+    pub(crate) fn refresh_all(&mut self) {
+        let Ok(services) = &self.services else { return };
+        for account in &self.accounts {
+            // Both, whatever's listed yet: the inbox's watcher syncs it regardless, and the
+            // refresher's listing finds the mailboxes not listed.
+            if let Some(inbox) = services.mailroom.refresh_inbox(&account.id) {
+                // As INBOX, which `refreshing` matches however the server spells it.
+                self.refreshing
+                    .insert((account.id.clone(), INBOX.to_owned()), inbox);
+            }
+            let Some(rest) = services.mailroom.refresh(&account.id) else {
+                continue;
+            };
+            self.refreshing_all.insert(account.id.clone(), rest);
+            let listed = self
+                .mailboxes
+                .get(&account.id)
+                .map_or(&[][..], Vec::as_slice);
+            for mailbox in listed {
+                if !mailbox.name.eq_ignore_ascii_case(INBOX) {
+                    self.refreshing
+                        .insert((account.id.clone(), mailbox.name.clone()), rest);
+                }
+            }
+        }
+    }
+
+    /// Whether one of an account's mailboxes is being refreshed, as asked, waiting on the server.
+    pub(crate) fn refreshing(&self, account: &str, mailbox: &str) -> bool {
+        // Servers may spell the inbox in any case: the list of every inbox asks for "INBOX".
+        let inbox = |name: &str| name.eq_ignore_ascii_case(INBOX);
+        self.refreshing
+            .keys()
+            .any(|(a, m)| a == account && (m == mailbox || (inbox(m) && inbox(mailbox))))
+    }
+
+    /// What an account's watchers report: its connection's status, or that a sync of one of its
+    /// mailboxes ended, or with none, of every one but its inbox ([`Update::Synced`]). Those
+    /// refreshed as asked up to then no longer show they're busy.
+    fn watching(&mut self, update: Update) {
+        let (account, mailbox, asked) = match update {
+            Update::Status { account, status } => {
+                self.statuses.insert(account, Ok(status));
+                return;
+            }
+            Update::Synced {
+                account,
+                mailbox,
+                asked,
+            } => (account, mailbox, asked),
+            _ => return,
+        };
+        let inbox = |name: &str| name.eq_ignore_ascii_case(INBOX);
+        if mailbox.is_none()
+            && self
+                .refreshing_all
+                .get(&account)
+                .is_some_and(|&n| n <= asked)
+        {
+            self.refreshing_all.remove(&account);
+        }
+        self.refreshing.retain(|(a, m), &mut n| {
+            let answered = mailbox.as_deref().map_or_else(
+                || !inbox(m),
+                |synced| m == synced || (inbox(m) && inbox(synced)),
+            );
+            !(*a == account && n <= asked && answered)
+        });
     }
 
     /// The accounts and mailboxes the list shows, which [`Self::refresh_shown`] syncs: searching
@@ -4399,6 +4496,8 @@ impl Mail {
         self.read_later.retain(|key, _| key.0 != id);
         self.starring.retain(|key, _| key.0 != id);
         self.unreading.retain(|key| key.0 != id);
+        self.refreshing.retain(|key, _| key.0 != id);
+        self.refreshing_all.remove(id);
         self.leaving.retain(|r| r.account != id);
         let dropped: Vec<MessageKey> = self
             .deferred
@@ -4493,6 +4592,83 @@ mod tests {
             s.notice.as_deref(),
             Some("me@example.com: created the mailbox Later")
         );
+    }
+
+    #[test]
+    fn a_refreshed_mailbox_stays_busy_until_a_sync_answering_its_refresh_ends() {
+        let synced = |mailbox: Option<&str>, asked| Update::Synced {
+            account: "me@example.com".into(),
+            mailbox: mailbox.map(Into::into),
+            asked,
+        };
+        let mut s = Mail::not_started();
+        for (mailbox, asked) in [("Inbox", 3), ("Archive", 4), ("Sent", 4)] {
+            s.refreshing
+                .insert(("me@example.com".into(), mailbox.into()), asked);
+        }
+        s.refreshing
+            .insert(("you@example.com".into(), "Archive".into()), 4);
+
+        // A sync started before the refresh doesn't answer it.
+        s.apply(synced(Some("INBOX"), 2), &mut Tx::default());
+        assert!(s.refreshing("me@example.com", "Inbox"));
+        // Every inbox is refreshed as INBOX, however the server lists it.
+        assert!(s.refreshing("me@example.com", "INBOX"));
+        s.apply(synced(Some("INBOX"), 3), &mut Tx::default());
+        assert!(!s.refreshing("me@example.com", "Inbox"));
+
+        s.apply(synced(Some("Archive"), 5), &mut Tx::default());
+        assert!(!s.refreshing("me@example.com", "Archive"));
+        assert!(s.refreshing("me@example.com", "Sent"));
+        assert!(
+            s.refreshing("you@example.com", "Archive"),
+            "another account's"
+        );
+
+        // The refresher's round ended, if it failed before reaching Sent too.
+        s.apply(synced(None, 4), &mut Tx::default());
+        assert!(!s.refreshing("me@example.com", "Sent"));
+        assert!(s.refreshing("you@example.com", "Archive"));
+    }
+
+    #[test]
+    fn mailboxes_a_refresh_of_every_mailbox_finds_stay_busy_until_its_round_ends() {
+        let me = "me@example.com";
+        let mut s = Mail::not_started();
+        // Only the inbox was listed before: the refresh's listing finds the rest.
+        s.refreshing_all.insert(me.into(), 7);
+        s.mailboxes.insert(
+            me.into(),
+            ["INBOX", "Archive", "Travel"]
+                .map(|name| Mailbox {
+                    name: name.into(),
+                    delimiter: None,
+                    role: if name == "INBOX" {
+                        Role::Inbox
+                    } else {
+                        Role::Other
+                    },
+                })
+                .into(),
+        );
+        let apply = |s: &mut Mail, update| s.apply(update, &mut Tx::default());
+        apply(&mut s, Update::Mailboxes { account: me.into() });
+        assert!(s.refreshing(me, "Archive"));
+        assert!(s.refreshing(me, "Travel"));
+        assert!(!s.refreshing(me, "INBOX"), "its watcher's to answer");
+
+        let synced = |mailbox: Option<&str>| Update::Synced {
+            account: me.into(),
+            mailbox: mailbox.map(Into::into),
+            asked: 7,
+        };
+        apply(&mut s, synced(Some("Archive")));
+        assert!(!s.refreshing(me, "Archive"));
+        apply(&mut s, synced(None));
+        assert!(!s.refreshing(me, "Travel"));
+        // The next round's listing is no longer the refresh's.
+        apply(&mut s, Update::Mailboxes { account: me.into() });
+        assert!(!s.refreshing(me, "Archive"));
     }
 
     /// A form open on the accounts Spark has: one with servers, a Gmail one and a Microsoft one.

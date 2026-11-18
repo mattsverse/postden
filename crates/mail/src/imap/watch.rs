@@ -82,6 +82,46 @@ impl PartialEq for Changes {
 
 impl Eq for Changes {}
 
+/// Asks a watcher or refresher to sync now, and numbers each asking, so what it reports as
+/// [`Event::Synced`] says which askings it answered.
+///
+/// The numbers come from a count shared by every nudge made [`Nudge::new`] from it: a watcher
+/// started afresh answers what its predecessor was asked.
+#[derive(Debug, Default)]
+pub struct Nudge {
+    notify: Notify,
+    asked: Arc<AtomicU64>,
+}
+
+impl Nudge {
+    /// A nudge numbering its askings from `count`.
+    #[must_use]
+    pub fn new(count: Arc<AtomicU64>) -> Self {
+        Self {
+            notify: Notify::new(),
+            asked: count,
+        }
+    }
+
+    /// Asks for a sync now. Returns its number: an [`Event::Synced`] numbered as much or more
+    /// answers it.
+    pub fn ask(&self) -> u64 {
+        let asked = self.asked.fetch_add(1, Ordering::SeqCst) + 1;
+        self.notify.notify_one();
+        asked
+    }
+
+    /// The number of the last asking, read as a sync starts: it answers that one and all before.
+    pub(super) fn asked(&self) -> u64 {
+        self.asked.load(Ordering::SeqCst)
+    }
+
+    /// Waits for the next asking, or returns at once for one made meanwhile.
+    pub(super) async fn notified(&self) {
+        self.notify.notified().await;
+    }
+}
+
 /// What a watcher is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -119,6 +159,14 @@ pub enum Event {
     Mailboxes {
         account: String,
         mailboxes: Vec<Mailbox>,
+    },
+    /// A sync of `mailbox` of `account` ended, whether it found anything or failed: it answered
+    /// every [`Nudge::ask`] numbered up to `asked`. With no mailbox, it's every mailbox but the
+    /// inbox: the refresher's round ended.
+    Synced {
+        account: String,
+        mailbox: Option<String>,
+        asked: u64,
     },
     /// Whether messages already cached from `mailbox` are read and starred, as the server says
     /// now. Only for the mailbox under `uid_validity`.
@@ -180,7 +228,7 @@ impl Synced {
 
 /// Watches `account`'s inbox until `events` is closed, sending what arrives.
 ///
-/// Starts from `state`, what's already cached, so only newer mail is fetched. Notifying `nudge` syncs
+/// Starts from `state`, what's already cached, so only newer mail is fetched. Asking `nudge` syncs
 /// it now, rather than once the server reports a change or the next poll. Connection failures are
 /// reported as [`Status::Failed`] and retried with backoff, or sooner when nudged, so this only
 /// returns once nobody is listening any more.
@@ -192,7 +240,7 @@ pub async fn watch<T: From<Event>>(
     credentials: Credentials,
     mut state: Option<MailboxState>,
     config: WatchConfig,
-    nudge: Arc<Notify>,
+    nudge: Arc<Nudge>,
     events: UnboundedSender<T>,
 ) {
     let mut watcher = Watcher {
@@ -201,6 +249,7 @@ pub async fn watch<T: From<Event>>(
         nudge: &nudge,
         events: &events,
         backoff: MIN_BACKOFF,
+        asked: 0,
     };
     loop {
         if !watcher.status(Status::Connecting) {
@@ -211,10 +260,15 @@ pub async fn watch<T: From<Event>>(
             Err(e) => e,
         };
         let retry_in = watcher.backoff;
-        if !watcher.status(Status::Failed {
-            error: error.to_string(),
-            retry_in,
-        }) {
+        // Everything asked so far is answered, by the failure: even what woke an IDLE that then
+        // failed, before a sync numbered it.
+        watcher.asked = nudge.asked();
+        if !watcher.synced()
+            || !watcher.status(Status::Failed {
+                error: error.to_string(),
+                retry_in,
+            })
+        {
             return;
         }
         // A nudge, such as the user asking for a refresh, retries now.
@@ -229,9 +283,11 @@ pub async fn watch<T: From<Event>>(
 struct Watcher<'a, T> {
     account: &'a Account,
     config: &'a WatchConfig,
-    nudge: &'a Notify,
+    nudge: &'a Nudge,
     events: &'a UnboundedSender<T>,
     backoff: Duration,
+    /// What the sync under way, or the failure, answers: see [`Nudge::asked`].
+    asked: u64,
 }
 
 impl<T: From<Event>> Watcher<'_, T> {
@@ -245,6 +301,15 @@ impl<T: From<Event>> Watcher<'_, T> {
 
     fn send(&self, event: Event) -> bool {
         self.events.send(event.into()).is_ok()
+    }
+
+    /// Reports that the inbox's sync ended. Returns `false` when nobody is listening.
+    fn synced(&self) -> bool {
+        self.send(Event::Synced {
+            account: self.account.id.clone(),
+            mailbox: Some(INBOX.to_owned()),
+            asked: self.asked,
+        })
     }
 
     /// One connection's lifetime. Returns `Ok` only once nobody is listening.
@@ -265,13 +330,14 @@ impl<T: From<Event>> Watcher<'_, T> {
             return Ok(());
         }
         loop {
+            self.asked = self.nudge.asked();
             let synced = with_timeout(sync(&mut session, INBOX, self.config, state)).await?;
             for event in synced.events(&self.account.id, INBOX, Role::Inbox) {
                 if !self.send(event) {
                     return Ok(());
                 }
             }
-            if self.events.is_closed() {
+            if !self.synced() || self.events.is_closed() {
                 return Ok(());
             }
             session = if push {
@@ -297,7 +363,7 @@ pub(super) async fn with_timeout<T>(
 }
 
 /// Waits until the server reports a change, `nudge` is notified, or [`IDLE_TIMEOUT`] passes.
-async fn idle(session: Session, nudge: &Notify) -> Result<Session> {
+async fn idle(session: Session, nudge: &Nudge) -> Result<Session> {
     let mut handle = session.idle();
     with_timeout(handle.init()).await?;
     {

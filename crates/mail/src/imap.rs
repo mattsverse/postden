@@ -28,4 +28,4 @@ pub use older::{Older, fetch_older};
 pub use refresh::refresh;
 pub use search::{Found, search};
 pub use sent::save_sent_copy;
-pub use watch::{Changes, Event, Flags, Status, WatchConfig, watch};
+pub use watch::{Changes, Event, Flags, Nudge, Status, WatchConfig, watch};
