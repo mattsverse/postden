@@ -14,10 +14,10 @@ use postden_core::account::{Account, Server};
 use postden_core::message::{Body, Envelope, Mailbox, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
-    Event, Flags, Found, Older, Prefetched, SNOOZED_NAME, Status, WatchConfig, create_mailbox,
-    download_message, fetch_older, mark_all_seen, move_message, open_message, prefetch_messages,
-    refresh, restore_message, save_sent_copy, search, set_flagged, set_seen, snooze_message,
-    wake_message, watch,
+    Event, Flags, Found, Older, Prefetched, SNOOZED_NAME, Status, Verdict, WatchConfig,
+    create_mailbox, download_message, fetch_older, mark_all_seen, move_message, open_message,
+    prefetch_messages, refresh, restore_message, save_sent_copy, search, set_flagged, set_seen,
+    snooze_message, wake_message, watch,
 };
 use postden_mail::{Credentials, smtp};
 use postden_store::{Snooze, Store, Written};
@@ -1087,7 +1087,8 @@ impl Mailroom {
     }
 
     /// Moves a message to the account's mailbox `to` in the background, then syncs the mailboxes so
-    /// it's listed there. The result arrives as [`Update::Moved`].
+    /// it's listed there. Moved into or out of Junk, it's marked as spam or not on the way
+    /// ([`Verdict`]). The result arrives as [`Update::Moved`].
     ///
     /// # Errors
     ///
@@ -1104,11 +1105,20 @@ impl Mailroom {
         let (server, credentials, uid_validity, jobs) =
             self.target_under(store, account, mailbox, uid_validity)?;
         let nudge = Arc::clone(&self.watched(account)?.nudge);
+        let verdict = verdict(store, account, mailbox, to)?;
         let (account, mailbox, to) = (account.to_owned(), mailbox.to_owned(), to.to_owned());
         self.handle.spawn(async move {
-            let result = move_message(&server, &credentials, &mailbox, uid_validity, uid, &to)
-                .await
-                .map_err(|e| e.to_string());
+            let result = move_message(
+                &server,
+                &credentials,
+                &mailbox,
+                uid_validity,
+                uid,
+                &to,
+                verdict,
+            )
+            .await
+            .map_err(|e| e.to_string());
             // The inbox's watcher sees mail moved there on its own; the refresher syncs the rest.
             if result.is_ok() {
                 nudge.notify_one();
@@ -1207,7 +1217,8 @@ impl Mailroom {
 
     /// Moves a message back from the account's mailbox `mailbox`, where it was moved or snoozed
     /// to, to `to`, where it was, in the background, as when that's undone. It's found by
-    /// `message_id`, as its UID there isn't known, and stays read or unread as it is. A message
+    /// `message_id`, as its UID there isn't known, and stays read or unread as it is; out of or
+    /// back into Junk, it's marked as spam or not, as [`Mailroom::move_message`]. A message
     /// snoozed until `snoozed` is no longer snoozed once it's moved back; until then, and if it
     /// can't be, its snooze is kept, but it isn't brought back. The result arrives as
     /// [`Update::Restored`].
@@ -1217,6 +1228,7 @@ impl Mailroom {
     /// As [`Mailroom::open`], and when the message has no Message-ID to find it by.
     pub fn restore(
         &self,
+        store: &Store,
         account: &str,
         mailbox: &str,
         message_id: &str,
@@ -1229,6 +1241,7 @@ impl Mailroom {
             ));
         }
         let watched = self.watched(account)?;
+        let verdict = verdict(store, account, mailbox, to)?;
         let (server, credentials) = (watched.server.clone(), watched.credentials.clone());
         let jobs = Asking {
             jobs: self.jobs.clone(),
@@ -1276,6 +1289,7 @@ impl Mailroom {
                 &restoring.mailbox,
                 &restoring.message_id,
                 &restoring.to,
+                verdict,
             )
             .await
             .map_err(|e| e.to_string());
@@ -1561,6 +1575,19 @@ impl Mailroom {
     pub fn handle(&self) -> tokio::runtime::Handle {
         self.handle.clone()
     }
+}
+
+/// What moving a message from the account's mailbox `from` to `to` says about whether it's spam,
+/// by their roles as last listed.
+fn verdict(store: &Store, account: &str, from: &str, to: &str) -> Result<Option<Verdict>> {
+    let mailboxes = store.mailboxes(account)?;
+    let role = |name: &str| {
+        mailboxes
+            .iter()
+            .find(|m| m.name == name)
+            .map_or(Role::Other, |m| m.role)
+    };
+    Ok(Verdict::of_move(role(from), role(to)))
 }
 
 impl Drop for Mailroom {

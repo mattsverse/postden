@@ -1,5 +1,6 @@
 //! Opening one message, downloading it whole, setting whether it's been read, moving it to
-//! another mailbox, and snoozing it and bringing it back.
+//! another mailbox, and snoozing it and bringing it back. Moved into or out of Junk, it's marked
+//! as spam or not, for the server's filter to learn from.
 //!
 //! Each call opens a connection of its own, so it never waits behind a watcher's IDLE.
 
@@ -7,7 +8,7 @@ use async_imap::types::NameAttribute;
 use futures::TryStreamExt as _;
 use mail_parser::MessageParser;
 use postden_core::account::Server;
-use postden_core::message::{Address, Body};
+use postden_core::message::{Address, Body, Role};
 
 use super::connection::{Session, connect};
 use super::search::quote;
@@ -21,6 +22,66 @@ const LOGOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// after, as what's waiting on it (more changes to the same message) waits for that.
 pub(super) async fn logout(mut session: Session) {
     let _ignored = tokio::time::timeout(LOGOUT_TIMEOUT, session.logout()).await;
+}
+
+/// What a move says about whether a message is spam.
+///
+/// The message is marked with it as it goes: the `$Junk` and `$NotJunk` keywords (RFC 5788) that
+/// spam filters and other mail apps read. Servers that don't keep keywords are left to learn from
+/// the move alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Junk,
+    NotJunk,
+}
+
+impl Verdict {
+    /// What moving a message from a mailbox with role `from` to one with role `to` says: into
+    /// Junk, it's spam; out of it, it isn't, unless it's being deleted, which says nothing.
+    #[must_use]
+    pub const fn of_move(from: Role, to: Role) -> Option<Self> {
+        match (from, to) {
+            (Role::Junk, Role::Junk | Role::Trash) => None,
+            (_, Role::Junk) => Some(Self::Junk),
+            (Role::Junk, _) => Some(Self::NotJunk),
+            _ => None,
+        }
+    }
+
+    /// The keyword it adds, and the one it takes away.
+    const fn keywords(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Junk => ("$Junk", "$NotJunk"),
+            Self::NotJunk => ("$NotJunk", "$Junk"),
+        }
+    }
+}
+
+/// Marks the messages `uids` (a UID set) of the selected mailbox with `verdict`. A server
+/// refusing the keywords isn't an error: the move that follows still tells it.
+async fn mark_verdict(session: &mut Session, uids: &str, verdict: Verdict) -> Result<()> {
+    let (on, off) = verdict.keywords();
+    for query in [
+        format!("+FLAGS.SILENT ({on})"),
+        format!("-FLAGS.SILENT ({off})"),
+    ] {
+        let stored = with_timeout(async {
+            session
+                .uid_store(uids, &query)
+                .await?
+                .try_for_each(|_fetch| async { Ok(()) })
+                .await
+        })
+        .await;
+        match stored {
+            Ok(())
+            | Err(Error::Imap(
+                async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_),
+            )) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Downloads message `uid` from `mailbox` and marks it read.
@@ -269,8 +330,9 @@ pub async fn mark_all_seen(
     result
 }
 
-/// Moves message `uid` from `mailbox` to the account's mailbox `to`. See [`open_message`] for
-/// `uid_validity`. A message no longer in `mailbox` is left alone, and that isn't an error.
+/// Moves message `uid` from `mailbox` to the account's mailbox `to`, marked with `verdict` if
+/// any. See [`open_message`] for `uid_validity`. A message no longer in `mailbox` is left alone,
+/// and that isn't an error.
 ///
 /// Uses MOVE (RFC 6851), or else COPY, flags the original `\Deleted` and expunges just it
 /// (UIDPLUS, RFC 4315). A server with neither is refused: a plain EXPUNGE would also remove
@@ -287,12 +349,13 @@ pub async fn move_message(
     uid_validity: u32,
     uid: u32,
     to: &str,
+    verdict: Option<Verdict>,
 ) -> Result<()> {
     let mut session = connect(server, credentials).await?;
     let result = async {
         let capabilities = with_timeout(session.capabilities()).await?;
         select(&mut session, mailbox, uid_validity).await?;
-        move_selected(&mut session, &capabilities, &uid.to_string(), to).await
+        move_selected(&mut session, &capabilities, &uid.to_string(), to, verdict).await
     }
     .await;
     logout(session).await;
@@ -326,7 +389,7 @@ pub async fn snooze_message(
         }
         let capabilities = with_timeout(session.capabilities()).await?;
         select(&mut session, mailbox, uid_validity).await?;
-        move_selected(&mut session, &capabilities, &uid.to_string(), to).await
+        move_selected(&mut session, &capabilities, &uid.to_string(), to, None).await
     }
     .await;
     logout(session).await;
@@ -346,11 +409,12 @@ pub async fn wake_message(
     message_id: &str,
     to: &str,
 ) -> Result<Option<(u32, Vec<u32>)>> {
-    bring_back(server, credentials, mailbox, message_id, to, true).await
+    bring_back(server, credentials, mailbox, message_id, to, true, None).await
 }
 
 /// Moves a message back where it was, as when a move is undone: finds it in `mailbox` by
-/// `message_id`, as its UID there isn't known, and moves it to `to`, read or unread as it is.
+/// `message_id`, as its UID there isn't known, and moves it to `to`, read or unread as it is,
+/// marked with `verdict` if any.
 ///
 /// With several copies there, only the one moved there last, with the highest UID, goes back.
 ///
@@ -367,8 +431,9 @@ pub async fn restore_message(
     mailbox: &str,
     message_id: &str,
     to: &str,
+    verdict: Option<Verdict>,
 ) -> Result<Option<(u32, Vec<u32>)>> {
-    bring_back(server, credentials, mailbox, message_id, to, false).await
+    bring_back(server, credentials, mailbox, message_id, to, false, verdict).await
 }
 
 /// Finds a message in `mailbox` by `message_id` and moves it to `to`, unread with `unread` set:
@@ -380,6 +445,7 @@ async fn bring_back(
     message_id: &str,
     to: &str,
     unread: bool,
+    verdict: Option<Verdict>,
 ) -> Result<Option<(u32, Vec<u32>)>> {
     let mut session = connect(server, credentials).await?;
     let result = async {
@@ -438,7 +504,7 @@ async fn bring_back(
             })
             .await?;
         }
-        move_selected(&mut session, &capabilities, &set, to).await?;
+        move_selected(&mut session, &capabilities, &set, to, verdict).await?;
         Ok(Some((uid_validity, uids)))
     }
     .await;
@@ -452,13 +518,20 @@ async fn bring_back(
 /// Moves the messages `uids` (a UID set) of the selected mailbox to `to`: with MOVE (RFC 6851),
 /// or else COPY, flagging them `\Deleted` and expunging just them (UIDPLUS, RFC 4315). A server
 /// with neither is refused: a plain EXPUNGE would also remove every other message flagged
-/// `\Deleted` in the mailbox.
+/// `\Deleted` in the mailbox. Movable, they're marked with `verdict` first, if any.
 async fn move_selected(
     session: &mut Session,
     capabilities: &async_imap::types::Capabilities,
     uids: &str,
     to: &str,
+    verdict: Option<Verdict>,
 ) -> Result<()> {
+    // Marked only once the move can be done, so a server that can't never learns a verdict.
+    if let Some(verdict) = verdict
+        && (capabilities.has_str("MOVE") || capabilities.has_str("UIDPLUS"))
+    {
+        mark_verdict(session, uids, verdict).await?;
+    }
     if capabilities.has_str("MOVE") {
         with_timeout(session.uid_mv(uids, to)).await
     } else if capabilities.has_str("UIDPLUS") {
@@ -556,6 +629,35 @@ fn html_body(message: &mail_parser::Message<'_>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn moves_into_junk_are_spam_and_out_of_it_are_not() {
+        use super::Verdict;
+        use postden_core::message::Role;
+        assert_eq!(
+            Verdict::of_move(Role::Inbox, Role::Junk),
+            Some(Verdict::Junk)
+        );
+        assert_eq!(
+            Verdict::of_move(Role::Other, Role::Junk),
+            Some(Verdict::Junk)
+        );
+        assert_eq!(
+            Verdict::of_move(Role::Junk, Role::Inbox),
+            Some(Verdict::NotJunk)
+        );
+        assert_eq!(
+            Verdict::of_move(Role::Junk, Role::Archive),
+            Some(Verdict::NotJunk)
+        );
+        assert_eq!(
+            Verdict::of_move(Role::Junk, Role::Trash),
+            None,
+            "deleted spam"
+        );
+        assert_eq!(Verdict::of_move(Role::Inbox, Role::Archive), None);
+        assert_eq!(Verdict::of_move(Role::Inbox, Role::Trash), None);
+    }
+
     use super::*;
 
     #[test]

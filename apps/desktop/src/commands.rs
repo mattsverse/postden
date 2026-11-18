@@ -118,6 +118,8 @@ pub(crate) enum Command {
     Trash,
     /// Moves the focused message to its account's Junk mailbox.
     Spam,
+    /// Moves the focused message out of its account's Junk mailbox, to its inbox.
+    NotSpam,
     /// Undoes the last thing done to a message.
     Undo,
     ExportMessage,
@@ -185,7 +187,8 @@ impl Command {
             Self::ToggleStar => vec![Key('s'), Shortcut::shift_cmd('l')],
             Self::Archive => vec![Key('e')],
             Self::Trash => vec![Key('#')],
-            Self::Spam => vec![Key('!'), Shortcut::shift_cmd('j')],
+            // Only one of them applies at a time: in Junk, the same keys take a message out.
+            Self::Spam | Self::NotSpam => vec![Key('!'), Shortcut::shift_cmd('j')],
             Self::Undo => vec![Key('z')],
             Self::CloseReader => vec![Escape],
             // ↑ and ↓ move the cursor in the list; an open message steps with J and K alone.
@@ -259,6 +262,7 @@ impl Command {
             Self::Archive => "Archive".into(),
             Self::Trash => "Delete".into(),
             Self::Spam => "Mark as spam".into(),
+            Self::NotSpam => "Not spam".into(),
             Self::Undo => s.undo_title(),
             Self::ExportMessage => "Export as .eml…".into(),
             Self::CloseReader => "Back to the list".into(),
@@ -316,6 +320,7 @@ impl Command {
             Self::Archive => s.move_focused_to(Role::Archive),
             Self::Trash => s.move_focused_to(Role::Trash),
             Self::Spam => s.move_focused_to(Role::Junk),
+            Self::NotSpam => s.move_focused_to(Role::Inbox),
             Self::Undo => s.undo(),
             Self::ExportMessage => {
                 if let Some(message) = s.focused_message() {
@@ -379,6 +384,12 @@ fn can_move_to(s: &Mail, m: &StoredMessage, role: Role) -> bool {
         .is_some_and(|b| b.name != m.mailbox)
 }
 
+/// Whether `m` is in its account's mailbox with `role`.
+fn in_role(s: &Mail, m: &StoredMessage, role: Role) -> bool {
+    s.mailbox_with_role(&m.account, role)
+        .is_some_and(|b| b.name == m.mailbox)
+}
+
 /// Where `message` can be moved to: its account's other mailboxes, the inbox first.
 fn destinations(s: &Mail, message: &MessageKey) -> Vec<Command> {
     let listed = s.mailboxes.get(&message.0).map_or(&[][..], Vec::as_slice);
@@ -424,6 +435,10 @@ pub(crate) fn available(s: &Mail) -> Vec<Command> {
         add(!destinations(s, &key).is_empty(), Command::PickMove);
         add(can_move_to(s, m, Role::Trash), Command::Trash);
         add(can_move_to(s, m, Role::Junk), Command::Spam);
+        add(
+            in_role(s, m, Role::Junk) && can_move_to(s, m, Role::Inbox),
+            Command::NotSpam,
+        );
         add(true, Command::ExportMessage);
     }
     add(browsing && s.undo.is_some(), Command::Undo);
@@ -1005,6 +1020,46 @@ mod tests {
         let commands = available(&s);
         assert!(!commands.contains(&Command::Archive));
         assert!(commands.contains(&Command::Trash));
+        assert!(!commands.contains(&Command::NotSpam), "it isn't spam");
+    }
+
+    #[test]
+    fn spam_goes_back_to_the_inbox_with_the_keys_that_sent_it() {
+        let mut s = listing();
+        s.mailboxes
+            .get_mut(ADA)
+            .unwrap()
+            .push(postden_core::message::Mailbox {
+                name: "Spam".into(),
+                delimiter: None,
+                role: Role::Junk,
+            });
+        for m in &mut s.messages {
+            m.mailbox = "Spam".into();
+        }
+        s.showing = Showing::Mailbox {
+            account: ADA.into(),
+            name: "Spam".into(),
+        };
+        s.cursor = Some((ADA.into(), "Spam".into(), 1));
+        let commands = available(&s);
+        assert!(commands.contains(&Command::NotSpam));
+        assert!(!commands.contains(&Command::Spam), "it's spam already");
+        assert_eq!(Command::NotSpam.title(&s), "Not spam");
+        assert_eq!(Command::NotSpam.hint(&s), "⇧⌘J");
+        let mut ev = key("!");
+        ev.mods.shift = true;
+        let pressed: Vec<_> = commands
+            .iter()
+            .filter(|c| c.shortcuts(&s).iter().any(|k| k.matches(&ev, false)))
+            .collect();
+        assert_eq!(pressed, [&Command::NotSpam]);
+        // With no inbox to go back to, there's nowhere to take it.
+        s.mailboxes
+            .get_mut(ADA)
+            .unwrap()
+            .retain(|m| m.role != Role::Inbox);
+        assert!(!available(&s).contains(&Command::NotSpam));
     }
 
     #[test]
