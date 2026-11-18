@@ -23,7 +23,7 @@ use rune_kit::{
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
 use crate::commands::{Command, Entry, Shortcut};
 use crate::compose::{ComposeForm, Mode, Preview};
-use crate::form::{AccountForm, SECURITY, Step, is_set_up, security_index};
+use crate::form::{AccountForm, SECURITY, Step, Unreadable, is_set_up, security_index};
 use crate::rich::RichEditor;
 use crate::search::{SERVER_PAGE, ServerSearch};
 use crate::state::{
@@ -180,7 +180,11 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
         .sidebar_padding(18.0, 10.0)
         .reduced_motion(cx.is_reduced_motion())
         .build(&k);
-    root(window, layer)
+    root(window, layer).on_window_focus(|s: &mut Mail, focused, _| {
+        if focused {
+            s.window_focused();
+        }
+    })
 }
 
 /// The ⋯ menu of everything but Reply, which keeps a button of its own.
@@ -295,7 +299,7 @@ fn title(s: &Mail) -> String {
             Step::Choose => "Add an account",
             Step::Google => "Sign in with Google",
             Step::Servers => "Other mail (IMAP and SMTP)",
-            Step::Import => "From another mail app",
+            Step::Import => s.form.imports.app.unwrap_or("From another mail app"),
         }
         .into();
     }
@@ -1485,7 +1489,7 @@ fn with_error(page: El, f: &AccountForm, k: &Kit) -> El {
 /// The first screen: how to connect the account. Setting it up from another mail app is a
 /// choice only when one is on this computer.
 fn choose(f: &AccountForm, k: &Kit) -> El {
-    let option = |key: &str, title: &str, about: &str, action: &str, step: Step| {
+    let option = |key: &str, title: &str, about: &str, action: &str, go: fn(&mut Mail)| {
         col()
             .key(key)
             .w_full()
@@ -1508,23 +1512,23 @@ fn choose(f: &AccountForm, k: &Kit) -> El {
                 row().child(
                     Button::new(action)
                         .variant(ButtonVariant::Contrast)
-                        .on_press(move |s: &mut Mail| s.form_step(step))
+                        .on_press(go)
                         .build(k),
                 ),
             )
     };
     let mut page = form_page("form-choose");
     if !f.imports.apps.is_empty() {
-        let apps = f.imports.apps.join(" and ");
+        let apps = or_list(&f.imports.apps);
         page = page.child(option(
             "choose-import",
-            &format!("From {apps}"),
+            "From another mail app",
             &format!(
                 "Pick an account set up in {apps} on this computer, and its servers are filled \
                  in. Its password isn't shared: you type it, or sign in with Google again."
             ),
-            "Choose an account",
-            Step::Import,
+            "Choose an app",
+            Mail::open_imports,
         ));
     }
     page.child(option(
@@ -1532,14 +1536,14 @@ fn choose(f: &AccountForm, k: &Kit) -> El {
         "Google",
         "Gmail and Google Workspace. Sign in in your browser; no app password needed.",
         "Sign in with Google",
-        Step::Google,
+        |s| s.form_step(Step::Google),
     ))
     .child(option(
         "choose-servers",
         "Other mail (IMAP and SMTP)",
         "Any provider: fill in its incoming and outgoing servers and your password.",
         "Set up IMAP and SMTP",
-        Step::Servers,
+        |s| s.form_step(Step::Servers),
     ))
     .child(
         row().child(
@@ -1551,41 +1555,127 @@ fn choose(f: &AccountForm, k: &Kit) -> El {
     )
 }
 
-/// The accounts other mail apps on this computer have, each with a button to set it up, or why
-/// it can't be, or that it's set up already.
-fn import_list(f: &AccountForm, accounts: &[Account], k: &Kit) -> El {
-    let muted = |s: String| text(s).font(k.ty.small).color(k.c.text_muted).wrap();
-    let mut page = form_page("form-import");
-    let Some(found) = &f.imports.found else {
-        return page
-            .child(
-                row()
-                    .gap(8.0)
-                    .center_y()
-                    .child(Spinner::new().build(k))
-                    .child(muted("Reading the accounts…".into())),
-            )
-            .child(row().child(back(k, false)));
-    };
-    for (app, read) in found {
-        let mut list = col().w_full().gap(6.0).child(
-            text((*app).to_owned())
-                .font(k.ty.ui_medium)
-                .color(k.c.text_base),
-        );
-        match read {
-            Err(e) => list = list.child(muted(format!("Couldn't read {app}'s accounts: {e}"))),
-            Ok(none) if none.is_empty() => {
-                list = list.child(muted(format!("{app} has no mail accounts set up.")));
-            }
-            Ok(found) => {
-                for account in found {
-                    list = list.child(found_row(account, accounts, k));
-                }
-            }
-        }
-        page = page.child(list);
+/// `items` as a sentence would list them: "A", "A or B", "A, B or C".
+fn or_list(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => (*only).to_owned(),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
     }
+}
+
+/// The other mail apps on this computer, to pick one; or, once picked, the accounts it has.
+fn import_list(f: &AccountForm, accounts: &[Account], k: &Kit) -> El {
+    f.imports.app.map_or_else(
+        || import_apps(f, k),
+        |app| app_accounts(f, app, accounts, k),
+    )
+}
+
+/// The other mail apps on this computer, each with how many accounts it has, as soon as
+/// that's read.
+fn import_apps(f: &AccountForm, k: &Kit) -> El {
+    let mut page = form_page("form-import").child(
+        text("Pick the app the account is set up in.".to_owned())
+            .font(k.ty.small)
+            .color(k.c.text_muted)
+            .wrap(),
+    );
+    for app in &f.imports.apps {
+        let app: &'static str = app;
+        let summary = match f.imports.of(app) {
+            None => "Reading its accounts…".to_owned(),
+            Some(Ok(found)) => match found.len() {
+                0 => "No mail accounts".to_owned(),
+                1 => "1 account".to_owned(),
+                n => format!("{n} accounts"),
+            },
+            Some(Err(Unreadable::NeedsFullDiskAccess)) => "Needs Full Disk Access".to_owned(),
+            Some(Err(Unreadable::Failed(_))) => "Couldn't read its accounts".to_owned(),
+        };
+        page = page.child(
+            row()
+                .key(format!("import-app-{app}"))
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .padding(12.0)
+                .radius(8.0)
+                .border(1.0, k.c.border_weak)
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .child(
+                            text(app.to_owned())
+                                .font(k.ty.ui_medium)
+                                .color(k.c.text_base),
+                        )
+                        .child(text(summary).font(k.ty.small).color(k.c.text_muted)),
+                )
+                .child(
+                    Button::new("Choose")
+                        .variant(ButtonVariant::Neutral)
+                        .on_press(move |s: &mut Mail| s.pick_import_app(app))
+                        .build(k),
+                ),
+        );
+    }
+    page.child(row().child(back(k, false)))
+}
+
+/// The accounts `app` has, each with a button to set it up, or why it can't be, or that it's
+/// set up already; or why they can't be read.
+fn app_accounts(f: &AccountForm, app: &str, accounts: &[Account], k: &Kit) -> El {
+    let muted = |s: String| text(s).font(k.ty.small).color(k.c.text_muted).wrap();
+    let page = form_page("form-import-app");
+    let page = match f.imports.of(app) {
+        None => page.child(
+            row()
+                .gap(8.0)
+                .center_y()
+                .child(Spinner::new().build(k))
+                .child(muted("Reading the accounts…".into())),
+        ),
+        Some(Err(Unreadable::NeedsFullDiskAccess)) => {
+            let page = page
+                .child(muted(format!(
+                    "macOS keeps {app}'s accounts private: Postden can only read them with Full \
+                     Disk Access. Turn it on for Postden in System Settings, adding it with + if \
+                     it isn't listed, then come back here."
+                )))
+                .child(muted(
+                    "Postden only reads where the accounts are set up, never your mail.".to_owned(),
+                ))
+                .child(
+                    row()
+                        .gap(8.0)
+                        .child(
+                            Button::new("Open System Settings")
+                                .variant(ButtonVariant::Contrast)
+                                .on_press_tx(|s: &mut Mail, tx| s.open_full_disk_access(tx))
+                                .build(k),
+                        )
+                        .child(
+                            Button::new("Check again")
+                                .variant(ButtonVariant::Neutral)
+                                .disabled(f.imports.reading)
+                                .on_press(Mail::reread_imports)
+                                .build(k),
+                        ),
+                );
+            with_error(page, f, k)
+        }
+        Some(Err(Unreadable::Failed(e))) => {
+            page.child(muted(format!("Couldn't read {app}'s accounts: {e}")))
+        }
+        Some(Ok(none)) if none.is_empty() => {
+            page.child(muted(format!("{app} has no mail accounts set up.")))
+        }
+        Some(Ok(found)) => found.iter().fold(page, |page, account| {
+            page.child(found_row(account, accounts, k))
+        }),
+    };
     page.child(row().child(back(k, false)))
 }
 

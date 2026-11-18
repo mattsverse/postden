@@ -29,7 +29,7 @@ use rune_kit::shell::PaneState;
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
 use crate::commands::{self, Command, Palette, PaletteMode, Shortcut};
 use crate::compose::{ComposeForm, Mode};
-use crate::form::{AccountForm, AppAccounts, GoogleSignIn, Imports, Step, is_set_up};
+use crate::form::{AccountForm, AppAccounts, GoogleSignIn, Imports, Step, Unreadable, is_set_up};
 use crate::notifications::{self, Alert, Target};
 use crate::search::{self, MailboxKey, MessageKey, SERVER_PAGE, Search};
 use crate::transfer::{self, Transfer};
@@ -3023,15 +3023,65 @@ impl Mail {
         }
     }
 
-    /// Back from setting up an account: to the accounts other apps have, when it was picked
-    /// there, else to choosing how to connect.
+    /// Back one screen: from an app's accounts to picking an app; from setting up an account
+    /// to the accounts of the app it was picked from, when it was; else to choosing how to
+    /// connect.
     pub(crate) fn form_back(&mut self) {
+        if self.form.step == Step::Import && self.form.imports.app.is_some() {
+            self.form.imports.app = None;
+            return;
+        }
         let step = if self.form.imports.picked.is_some() {
             Step::Import
         } else {
             Step::Choose
         };
         self.form_step(step);
+    }
+
+    /// Shows the other mail apps on this computer, to pick one.
+    pub(crate) fn open_imports(&mut self) {
+        self.form.imports.app = None;
+        self.form_step(Step::Import);
+    }
+
+    /// Shows the accounts `app`, one of the other mail apps, has.
+    pub(crate) fn pick_import_app(&mut self, app: &'static str) {
+        if self.form.imports.apps.contains(&app) {
+            self.form.imports.app = Some(app);
+        }
+    }
+
+    /// Opens System Settings where Postden can be given Full Disk Access. macOS can't be asked
+    /// for it any other way.
+    pub(crate) fn open_full_disk_access(&mut self, tx: &mut Tx) {
+        if let Err(e) = tx.open_url(import::FULL_DISK_ACCESS_SETTINGS) {
+            self.form.error = Some(format!("Couldn't open System Settings: {e}"));
+        }
+    }
+
+    /// The window is in front again: maybe from System Settings, with Full Disk Access given
+    /// to read an app's accounts that needed it, so they're read again.
+    pub(crate) fn window_focused(&mut self) {
+        let imports = &self.form.imports;
+        let waiting = imports
+            .found
+            .iter()
+            .flatten()
+            .any(|(_, read)| matches!(read, Err(Unreadable::NeedsFullDiskAccess)));
+        if self.form.open && self.form.step == Step::Import && waiting {
+            self.reread_imports();
+        }
+    }
+
+    /// Reads the other apps' accounts again, as after Full Disk Access was given.
+    pub(crate) fn reread_imports(&mut self) {
+        if self.form.imports.reading {
+            return;
+        }
+        self.form.imports.found = None;
+        self.form.error = None;
+        self.read_imports();
     }
 
     /// Reads, in the background, the accounts each mail app found on this computer has, once
@@ -3050,7 +3100,7 @@ impl Mail {
             let found: Vec<_> = import::installed_here()
                 .iter()
                 .map(|source| {
-                    let accounts = source.accounts().map_err(|e| e.to_string());
+                    let accounts = source.accounts().map_err(Unreadable::from);
                     (source.app(), accounts)
                 })
                 .collect();
@@ -4365,7 +4415,8 @@ mod tests {
         let mut s = Mail::not_started();
         s.open_form();
         s.form.imports.apps = vec!["Spark"];
-        s.form_step(Step::Import);
+        s.open_imports();
+        s.pick_import_app("Spark");
         s.form.imports.found = Some(vec![(
             "Spark",
             Ok(vec![
@@ -4478,7 +4529,10 @@ mod tests {
         let earlier = s.form.imports.session;
         s.open_form();
         s.form.imports.reading = true;
-        s.imports_read(earlier, vec![("Spark", Err("stale".into()))]);
+        s.imports_read(
+            earlier,
+            vec![("Spark", Err(Unreadable::Failed("stale".into())))],
+        );
         assert!(
             s.form.imports.found.is_none(),
             "the earlier read is dropped"
@@ -4510,6 +4564,81 @@ mod tests {
 
         s.set_up_found("ada@gmail.com");
         assert_eq!(s.form.step, Step::Google, "the others still are");
+    }
+
+    #[test]
+    fn back_goes_from_an_apps_accounts_to_the_apps_and_then_to_choosing() {
+        let mut s = importing();
+        s.set_up_found("ada@example.com");
+        s.form_back();
+        assert_eq!(
+            (s.form.step, s.form.imports.app),
+            (Step::Import, Some("Spark")),
+            "back to the accounts of the app it was picked from"
+        );
+
+        s.form_back();
+        assert_eq!((s.form.step, s.form.imports.app), (Step::Import, None));
+        s.pick_import_app("Thunderbird");
+        assert_eq!(
+            s.form.imports.app, None,
+            "an app that isn't installed isn't picked"
+        );
+
+        s.form_back();
+        assert_eq!(s.form.step, Step::Choose);
+        s.form.imports.app = Some("Spark");
+        s.open_imports();
+        assert_eq!(s.form.imports.app, None, "the apps are picked from afresh");
+    }
+
+    #[test]
+    fn an_account_is_set_up_from_the_app_it_was_picked_in() {
+        use postden_app::import::{Found, Setup, Unsupported};
+
+        let mut s = importing();
+        let unsupported = Found {
+            address: "ada@example.com".into(),
+            display_name: None,
+            label: None,
+            setup: Setup::Unsupported(Unsupported::Pop),
+        };
+        s.form.imports.apps.push("Apple Mail");
+        s.form
+            .imports
+            .found
+            .as_mut()
+            .unwrap()
+            .push(("Apple Mail", Ok(vec![unsupported])));
+        s.pick_import_app("Apple Mail");
+        s.set_up_found("ada@example.com");
+        assert_eq!(s.form.step, Step::Import, "Apple Mail's can't be set up");
+
+        s.form_back();
+        s.pick_import_app("Spark");
+        s.set_up_found("ada@example.com");
+        assert_eq!(s.form.step, Step::Servers, "Spark's can");
+    }
+
+    #[test]
+    fn coming_back_to_the_window_rereads_only_what_needed_full_disk_access() {
+        let mut s = importing();
+        s.window_focused();
+        assert!(s.form.imports.found.is_some(), "what was read stays");
+
+        s.form.imports.found = Some(vec![("Apple Mail", Err(Unreadable::NeedsFullDiskAccess))]);
+        s.form.imports.app = Some("Apple Mail");
+        s.form.step = Step::Servers;
+        s.window_focused();
+        assert!(
+            s.form.imports.found.is_some(),
+            "not while elsewhere in the form"
+        );
+
+        s.form.step = Step::Import;
+        s.window_focused();
+        assert!(s.form.imports.found.is_none(), "read again");
+        assert_eq!(s.form.imports.app, Some("Apple Mail"), "on the same app");
     }
 
     #[test]
