@@ -1653,7 +1653,7 @@ fn app_accounts(f: &AccountForm, app: &str, accounts: &[Account], k: &Kit) -> El
                         .child(
                             Button::new("Open System Settings")
                                 .variant(ButtonVariant::Contrast)
-                                .on_press_tx(|s: &mut Mail, tx| s.open_full_disk_access(tx))
+                                .on_press(Mail::open_full_disk_access)
                                 .build(k),
                         )
                         .child(

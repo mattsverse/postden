@@ -25,10 +25,26 @@ pub use spark::Spark;
 use crate::Result;
 
 /// Where System Settings lets Postden have Full Disk Access, which reading some apps' accounts
-/// needs: see [`Error::NeedsFullDiskAccess`](crate::Error::NeedsFullDiskAccess). macOS has no
-/// way to ask for it, only to open that page.
-pub const FULL_DISK_ACCESS_SETTINGS: &str =
+/// needs: see [`Error::NeedsFullDiskAccess`](crate::Error::NeedsFullDiskAccess).
+const FULL_DISK_ACCESS_SETTINGS: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
+
+/// Opens System Settings where Postden can be given Full Disk Access. macOS has no way to ask
+/// for it, only to open that page. It's opened with `open`, as it's a link only macOS knows.
+///
+/// # Errors
+///
+/// Returns an error when `open` can't be run, or can't open the page, as on other systems.
+pub fn open_full_disk_access_settings() -> Result<()> {
+    let status = std::process::Command::new("/usr/bin/open")
+        .arg(FULL_DISK_ACCESS_SETTINGS)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(crate::Error::Invalid(format!("open {status}")))
+    }
+}
 
 /// A mail app whose accounts Postden can read.
 pub trait Source: fmt::Debug + Send + Sync {
