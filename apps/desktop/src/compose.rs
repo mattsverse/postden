@@ -9,6 +9,7 @@ use postden_core::account::Signature;
 use postden_core::message::Address;
 use postden_html::compat::{self, Report};
 use rune::{Image, ImageCache, TextEdit};
+use rune_kit::ComboboxState;
 
 pub(crate) use crate::rich::Mode;
 use crate::rich::RichEditor;
@@ -107,6 +108,8 @@ pub(crate) struct ComposeForm {
     pub(crate) open: bool,
     /// The account it's sent from.
     pub(crate) account: String,
+    /// The account picker's popover and search.
+    pub(crate) from: ComboboxState,
     pub(crate) to: TextEdit,
     pub(crate) cc: TextEdit,
     pub(crate) bcc: TextEdit,
@@ -154,6 +157,7 @@ impl ComposeForm {
         let mut form = Self {
             open: true,
             account: draft.account,
+            from: ComboboxState::default(),
             to: TextEdit::new(draft.to),
             cc: TextEdit::new(draft.cc),
             bcc: TextEdit::new(draft.bcc),

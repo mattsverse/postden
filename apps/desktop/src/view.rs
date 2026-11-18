@@ -15,10 +15,10 @@ use rune::{
 };
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow, SplitView, Toolbar};
 use rune_kit::{
-    Button, ButtonVariant, Dialog, Divider, IconButton, IconButtonVariant, Keybind, Kit, Markdown,
-    MarkdownStyle, Menu, MenuEntry, MenuItem, Placement, PopupItem, PopupList, SegmentedControl,
-    Select, Spinner, State, Switch, TextArea, TextInput, Toast, ToastRegion, context_menu, glyphs,
-    root,
+    Button, ButtonVariant, Combobox, ComboboxOption, Dialog, Divider, IconButton,
+    IconButtonVariant, Keybind, Kit, Markdown, MarkdownStyle, Menu, MenuEntry, MenuItem, Placement,
+    PopupItem, PopupList, SegmentedControl, Select, Spinner, State, Switch, TextArea, TextInput,
+    Toast, ToastRegion, context_menu, glyphs, root,
 };
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
@@ -1290,7 +1290,7 @@ fn compose(s: &Mail, c: &ComposeForm, k: &Kit, layer: &mut Vec<El>) -> El {
         .max_w(760.0)
         .padding(24.0)
         .gap(12.0)
-        .child(field(k, "From", from_picker(s, c, k)))
+        .child(field(k, "From", from_picker(s, c, k, layer)))
         .child(field(
             k,
             "To",
@@ -1356,25 +1356,37 @@ fn compose(s: &Mail, c: &ComposeForm, k: &Kit, layer: &mut Vec<El>) -> El {
         .min_h(0.0)
 }
 
-/// Who a message is sent from: a picker when there's more than one account.
-fn from_picker(s: &Mail, c: &ComposeForm, k: &Kit) -> El {
+/// Who a message is sent from: when there's more than one account, a picker that lists them
+/// all, however many, each by name over its address, and finds one by either as it's typed.
+fn from_picker(s: &Mail, c: &ComposeForm, k: &Kit, layer: &mut Vec<El>) -> El {
     if s.accounts.len() > 1 {
-        let labels: Vec<&str> = s.accounts.iter().map(Account::label).collect();
-        let current = s.accounts.iter().position(|a| a.id == c.account);
-        SegmentedControl::new(&labels, current)
-            .label("From")
-            .fit()
-            .on_pick(|s: &mut Mail, i, _| {
-                if let Some(id) = s.accounts.get(i).map(|a| a.id.clone()) {
-                    s.compose_from(&id);
-                }
-            })
-            .build(k)
+        let options: Vec<ComboboxOption> = s.accounts.iter().map(from_option).collect();
+        Combobox::new("compose-from", &c.from, &options, |s: &mut Mail| {
+            &mut s.compose.from
+        })
+        .label("From")
+        .current(Some(&c.account))
+        .search_placeholder("Search accounts")
+        .empty_message("No account matches")
+        .width(320.0)
+        .max_height(280.0)
+        .disabled(c.sending)
+        .on_choose(|s: &mut Mail, id, _| s.compose_from(id))
+        .build(k, layer)
     } else {
         text(s.label(&c.account).to_owned())
             .font(k.ty.ui)
             .color(k.c.text_base)
     }
+}
+
+/// An account in the From picker: its name, over its address when the name isn't it.
+fn from_option(account: &Account) -> ComboboxOption {
+    let mut option = ComboboxOption::new(&account.id, account.label());
+    if account.label() != account.id {
+        option.detail.clone_from(&account.id);
+    }
+    option
 }
 
 fn compose_actions(c: &ComposeForm, k: &Kit) -> El {
@@ -4030,4 +4042,46 @@ fn clients_label(clients: &[Client]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use postden_core::account::{Auth, Server};
+
+    use super::*;
+
+    fn account(id: &str, label: Option<&str>) -> Account {
+        let server = Server {
+            host: "localhost".into(),
+            port: 1,
+            security: Security::None,
+            username: "me".into(),
+        };
+        Account {
+            id: id.into(),
+            display_name: None,
+            label: label.map(Into::into),
+            imap: server.clone(),
+            smtp: server,
+            auth: Auth::Password,
+        }
+    }
+
+    #[test]
+    fn the_from_picker_shows_an_address_under_a_name_but_not_twice() {
+        let named = from_option(&account("ada@work.com", Some("Work")));
+        assert_eq!(
+            (
+                named.id.as_str(),
+                named.label.as_str(),
+                named.detail.as_str()
+            ),
+            ("ada@work.com", "Work", "ada@work.com")
+        );
+        let bare = from_option(&account("ada@home.com", None));
+        assert_eq!(
+            (bare.label.as_str(), bare.detail.as_str()),
+            ("ada@home.com", "")
+        );
+    }
 }
