@@ -19,6 +19,7 @@ use postden_mail::imap::{Status, WatchConfig};
 use postden_secrets::Backend;
 use postden_store::{Scope, Store, StoredMessage};
 use postden_transfer::{Code, Offer};
+use postden_update::Track;
 use rune::{
     AppHandle, FileDialogOptions, ImageCache, PointerPress, Taskbar, TextEdit, Tray, Tx,
     WindowHandle,
@@ -1088,6 +1089,7 @@ impl Mail {
         self.message_menu = None;
         self.mailbox_menu = None;
         self.account_menu = None;
+        self.updater.channel_open = false;
         self.palette = Palette {
             open: true,
             mode,
@@ -3861,6 +3863,29 @@ impl Mail {
         self.save_settings();
     }
 
+    /// Switches between releases only and nightly builds too, then checks the new track, so
+    /// an update found on the old one isn't offered on it.
+    pub(crate) fn set_update_track(&mut self, track: Track) {
+        if self.settings.update_track == track {
+            return;
+        }
+        self.settings.update_track = track;
+        self.save_settings();
+        match self.updater.phase {
+            // What's downloading or installed already stays.
+            Phase::Downloading(_) | Phase::Ready => {}
+            // Its answer is dropped for the old track's, and the new one is checked then.
+            Phase::Checking { manual } => {
+                self.forget_update();
+                self.updater.phase = Phase::Checking { manual };
+            }
+            _ => {
+                self.forget_update();
+                self.check_for_updates(false);
+            }
+        }
+    }
+
     /// Brings back the snoozed messages that are due, then checks again after [`WAKE_EVERY`].
     fn wake_snoozed(&mut self) {
         let Some(handle) = self.handle.clone() else {
@@ -3911,17 +3936,27 @@ impl Mail {
             return;
         }
         self.updater.phase = Phase::Checking { manual };
-        let handle = handle.clone();
+        let (handle, track) = (handle.clone(), self.settings.update_track);
         services.mailroom.handle().spawn(async move {
-            let result = postden_update::check(update::current())
+            let result = postden_update::check(update::current(), track)
                 .await
                 .map_err(|e| e.to_string());
-            handle.update(move |s: &mut Self, _| s.update_checked(result));
+            handle.update(move |s: &mut Self, _| s.update_checked(track, result));
         });
     }
 
-    fn update_checked(&mut self, result: Result<Option<postden_update::Available>, String>) {
+    fn update_checked(
+        &mut self,
+        track: Track,
+        result: Result<Option<postden_update::Available>, String>,
+    ) {
         let manual = matches!(self.updater.phase, Phase::Checking { manual: true });
+        if track != self.settings.update_track {
+            // The track changed while checking: this answer is for the old one.
+            self.forget_update();
+            self.check_for_updates(manual);
+            return;
+        }
         let announce = self
             .updater
             .checked(result, self.settings.skipped_update, Zoned::now());
@@ -3997,15 +4032,41 @@ impl Mail {
                     }
                 });
             })
-            .await
-            .map_err(|e| e.to_string());
-            handle.update(move |s: &mut Self, _| {
-                s.updater.phase = match result {
-                    Ok(()) => Phase::Ready,
-                    Err(error) => Phase::InstallFailed(error),
-                };
-            });
+            .await;
+            handle.update(move |s: &mut Self, _| s.update_installed(result));
         });
+    }
+
+    fn update_installed(&mut self, result: postden_update::Result<()>) {
+        self.updater.phase = match result {
+            Ok(()) => Phase::Ready,
+            // Replaced by a newer nightly since it was found: look for what's there now.
+            Err(postden_update::Error::Gone) => {
+                self.forget_update();
+                self.check_for_updates(true);
+                return;
+            }
+            Err(error) => {
+                // Nightlies were turned off while one downloaded: it's not retried.
+                if self.settings.update_track == Track::Stable
+                    && self
+                        .updater
+                        .available
+                        .as_ref()
+                        .is_some_and(|a| a.latest.version.is_nightly())
+                {
+                    self.forget_update();
+                }
+                Phase::InstallFailed(error.to_string())
+            }
+        };
+    }
+
+    /// Stops offering the update found, and closes its announcement.
+    fn forget_update(&mut self) {
+        self.updater.available = None;
+        self.updater.dialog_open = false;
+        self.updater.phase = Phase::Idle;
     }
 
     /// Restarts into the installed update.
@@ -4251,7 +4312,7 @@ mod tests {
     fn a_check_for_updates_asked_where_its_result_cant_show_says_it_in_a_notice() {
         let mut s = Mail::not_started();
         s.updater.phase = Phase::Checking { manual: true };
-        s.update_checked(Ok(None));
+        s.update_checked(Track::Stable, Ok(None));
         assert!(
             s.notice
                 .as_deref()
@@ -4263,8 +4324,101 @@ mod tests {
         s.dismiss_notice();
         s.open_settings();
         s.updater.phase = Phase::Checking { manual: true };
-        s.update_checked(Ok(None));
+        s.update_checked(Track::Stable, Ok(None));
         assert_eq!(s.notice, None);
+    }
+
+    #[test]
+    fn a_check_answered_for_the_track_switched_away_from_is_dropped() {
+        let mut s = Mail::not_started();
+        s.settings.update_track = Track::Nightly;
+        s.updater.phase = Phase::Checking { manual: true };
+        s.update_checked(Track::Stable, Ok(None));
+        assert_eq!(
+            s.updater.phase,
+            Phase::Idle,
+            "not up to date on the new track"
+        );
+        assert_eq!(s.notice, None);
+    }
+
+    #[test]
+    fn switching_tracks_mid_check_stops_offering_the_old_tracks_update() {
+        let mut s = Mail::not_started();
+        s.settings.update_track = Track::Nightly;
+        s.updater.phase = Phase::Checking { manual: false };
+        s.updater.available = Some(postden_update::Available {
+            current: "0.7.0".parse().unwrap(),
+            latest: postden_update::Release {
+                version: "0.7.1-nightly.1".parse().unwrap(),
+                notes: String::new(),
+                page: String::new(),
+                assets: Vec::new(),
+            },
+            changes: Vec::new(),
+        });
+        s.set_update_track(Track::Stable);
+        assert_eq!(s.updater.available, None);
+        assert_eq!(s.updater.phase, Phase::Checking { manual: false });
+    }
+
+    #[test]
+    fn an_update_gone_from_github_is_no_longer_offered() {
+        let mut s = Mail::not_started();
+        s.updater.phase = Phase::Downloading(None);
+        s.updater.available = Some(postden_update::Available {
+            current: "0.7.0".parse().unwrap(),
+            latest: postden_update::Release {
+                version: "0.7.1-nightly.1".parse().unwrap(),
+                notes: String::new(),
+                page: String::new(),
+                assets: Vec::new(),
+            },
+            changes: Vec::new(),
+        });
+        s.updater.dialog_open = true;
+        s.update_installed(Err(postden_update::Error::Gone));
+        assert_eq!(s.updater.available, None, "not offered to retry");
+        assert_eq!(s.updater.phase, Phase::Idle);
+        assert!(!s.updater.dialog_open, "nor announced");
+    }
+
+    #[test]
+    fn a_nightly_that_failed_to_install_after_nightlies_were_turned_off_isnt_retried() {
+        let nightly = || postden_update::Available {
+            current: "0.7.0".parse().unwrap(),
+            latest: postden_update::Release {
+                version: "0.7.1-nightly.1".parse().unwrap(),
+                notes: String::new(),
+                page: String::new(),
+                assets: Vec::new(),
+            },
+            changes: Vec::new(),
+        };
+        for (track, kept) in [(Track::Nightly, true), (Track::Stable, false)] {
+            let mut s = Mail::not_started();
+            s.settings.update_track = track;
+            s.updater.phase = Phase::Downloading(None);
+            s.updater.available = Some(nightly());
+            s.update_installed(Err(postden_update::Error::ChecksumMismatch));
+            assert!(
+                matches!(s.updater.phase, Phase::InstallFailed(_)),
+                "{track:?}: says why"
+            );
+            assert_eq!(s.updater.available.is_some(), kept, "{track:?}");
+        }
+    }
+
+    #[test]
+    fn the_update_channel_list_closes_for_the_palette_and_commands() {
+        let mut s = Mail::not_started();
+        s.updater.channel_open = true;
+        s.open_palette(PaletteMode::Commands);
+        assert!(!s.updater.channel_open, "the palette");
+        s.updater.channel_open = true;
+        s.close_palette();
+        Command::Compose.run(&mut s, &mut Tx::default());
+        assert!(!s.updater.channel_open, "a shortcut's command");
     }
 
     fn ada(uid: u32) -> MessageKey {

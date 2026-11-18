@@ -22,6 +22,21 @@ class VersionTests(unittest.TestCase):
             release.validate_tag("1.2.3", "1.2.3")
 
 
+class NightlyTests(unittest.TestCase):
+    def test_a_nightly_leads_up_to_the_next_patch(self):
+        self.assertEqual(release.nightly_tag("0.7.0", "202611180300"), "v0.7.1-nightly.202611180300")
+        for build in ("", "0", "01", "1.2", "abc"):
+            with self.subTest(build=build), self.assertRaises(ValueError):
+                release.nightly_tag("0.7.0", build)
+
+    def test_tags_build_the_workspace_version_or_its_nightly(self):
+        self.assertEqual(release.tag_version("v0.7.0", "0.7.0"), "0.7.0")
+        self.assertEqual(release.tag_version("v0.7.1-nightly.5", "0.7.0"), "0.7.1-nightly.5")
+        for tag in ("v0.7.0-nightly.5", "v0.8.0-nightly.5", "0.7.1-nightly.5", "v0.7.1-nightly.05", "nightly"):
+            with self.subTest(tag=tag), self.assertRaises(ValueError):
+                release.tag_version(tag, "0.7.0")
+
+
 class PlistTests(unittest.TestCase):
     def test_writes_version_and_build_number(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -31,6 +46,13 @@ class PlistTests(unittest.TestCase):
         self.assertEqual(metadata["CFBundleShortVersionString"], "1.2.3")
         self.assertEqual(metadata["CFBundleVersion"], "42")
         self.assertEqual(metadata["CFBundleExecutable"], "postden")
+
+    def test_a_nightly_shows_the_release_it_leads_up_to(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "Info.plist"
+            release.write_plist(output, "1.2.4-nightly.7", "42")
+            metadata = plistlib.loads(output.read_bytes())
+        self.assertEqual(metadata["CFBundleShortVersionString"], "1.2.4")
 
     def test_rejects_invalid_build_numbers(self):
         with self.assertRaises(ValueError):

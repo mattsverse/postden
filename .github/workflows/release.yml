@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       tag:
-        description: Existing version tag to build and distribute
+        description: Existing version tag to build and distribute, a release's or a nightly's
         type: string
         required: true
     secrets:
@@ -29,7 +29,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag to build or retry (for example v0.1.0)
+        description: Existing version tag to build or retry (for example v0.1.0 or v0.1.1-nightly.202611180300)
         type: string
         required: true
 
@@ -58,6 +58,8 @@ jobs:
     outputs:
       version: ${{ steps.metadata.outputs.version }}
       state: ${{ steps.metadata.outputs.state }}
+      nightly: ${{ steps.metadata.outputs.nightly }}
+      stable_tag: ${{ steps.metadata.outputs.stable_tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -75,6 +77,10 @@ jobs:
         run: |
           version="$(python3 scripts/release.py version --tag "$RELEASE_TAG")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A nightly is a pre-release of the next patch; its notes start at the release before it.
+          [[ "$version" == *-nightly.* ]] && nightly=true || nightly=false
+          echo "nightly=$nightly" >> "$GITHUB_OUTPUT"
+          echo "stable_tag=v$(python3 scripts/release.py version)" >> "$GITHUB_OUTPUT"
           # A failing API request fails the job, rather than masquerading as a missing release.
           draft="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             --jq '.[] | select(.tag_name == env.RELEASE_TAG) | .draft')"
@@ -119,6 +125,8 @@ jobs:
       - name: Build and package
         env:
           VERSION: ${{ needs.metadata.outputs.version }}
+          # The version the app reports and updates from, which a nightly's tag sets.
+          POSTDEN_VERSION: ${{ needs.metadata.outputs.version }}
           POSTDEN_GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           POSTDEN_GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
         run: bash scripts/package.sh "${{ matrix.target }}"
@@ -152,6 +160,7 @@ jobs:
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Build universal app
         env:
+          POSTDEN_VERSION: ${{ needs.metadata.outputs.version }}
           POSTDEN_GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           POSTDEN_GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
         run: bash scripts/bundle-macos.sh --universal
@@ -190,6 +199,8 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           VERSION: ${{ needs.metadata.outputs.version }}
           RELEASE_STATE: ${{ needs.metadata.outputs.state }}
+          NIGHTLY: ${{ needs.metadata.outputs.nightly }}
+          STABLE_TAG: ${{ needs.metadata.outputs.stable_tag }}
         run: |
           [[ -n "$GH_TOKEN" ]] || { echo 'Set the RELEASE_PLEASE_TOKEN repository secret.' >&2; exit 1; }
           cd dist
@@ -199,23 +210,32 @@ jobs:
           [[ "${#assets[@]}" == 10 ]] || { echo "Expected 10 assets, got: ${assets[*]}" >&2; exit 1; }
           sha256sum "${assets[@]}" > SHA256SUMS
           cat SHA256SUMS
+          # Nightlies are pre-releases, never the latest, noting everything since the last release.
+          if [[ "$NIGHTLY" == true ]]; then
+            kind=(--prerelease --notes-start-tag "$STABLE_TAG")
+            latest=false
+          else
+            kind=()
+            # Let GitHub choose the highest stable version if an older release is retried.
+            latest=legacy
+          fi
           if [[ "$RELEASE_STATE" == missing ]]; then
             gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-              --verify-tag --draft --title "Postden $VERSION" --generate-notes
+              --verify-tag --draft --title "Postden $VERSION" --generate-notes "${kind[@]}"
           fi
           # Replacing assets is allowed only while the release is still a draft.
           [[ "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" == true ]]
           gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}" SHA256SUMS
           release_id="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)"
-          # Let GitHub choose the highest stable version if an older release is retried.
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
-            --field draft=false --raw-field make_latest=legacy --silent
+            --field draft=false --field "prerelease=$NIGHTLY" --raw-field "make_latest=$latest" --silent
 
   # Also runs when retrying an already-published release, so a failed tap update can be redone.
+  # Homebrew installs releases only.
   homebrew:
     needs: [metadata, publish]
     if: >-
-      !cancelled() && needs.metadata.result == 'success' &&
+      !cancelled() && needs.metadata.result == 'success' && needs.metadata.outputs.nightly != 'true' &&
       (needs.publish.result == 'success' || needs.metadata.outputs.state == 'published')
     permissions:
       contents: read

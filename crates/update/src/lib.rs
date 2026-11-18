@@ -1,7 +1,8 @@
 //! Keeping Postden up to date from its GitHub releases.
 //!
 //! - [`check`]: whether a release newer than the running version is out, with what changed in
-//!   every release since ([`Available::changelog`]).
+//!   every release since ([`Available::changelog`]). On the nightly [`Track`], so are the
+//!   nightly builds leading up to the next release.
 //! - [`Install`]: how the running copy was installed, which decides whether Postden can
 //!   update it or the user does, through Homebrew or their package manager.
 //! - [`install`]: downloads the newest release, checks it against the release's `SHA256SUMS`
@@ -20,7 +21,7 @@ use tokio_rustls::rustls::crypto::ring;
 
 pub use install::Install;
 use install::Platform;
-pub use release::{Asset, Available, Release};
+pub use release::{Asset, Available, Release, Track};
 pub use version::{InvalidVersion, Version};
 
 /// Where releases are published.
@@ -43,6 +44,9 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("this release has no download for this computer")]
     NoAsset,
+    /// The release is gone from GitHub, as an older nightly is once newer ones are out.
+    #[error("this update is no longer available; check for updates again")]
+    Gone,
     #[error("the release has no checksum for {0}")]
     NoChecksum(String),
     #[error("the download was corrupted or tampered with: its checksum doesn't match")]
@@ -59,6 +63,15 @@ pub enum Error {
 }
 
 impl Error {
+    /// A download that failed, [`Error::Gone`] when GitHub no longer has it.
+    fn download(e: reqwest::Error) -> Self {
+        if e.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+            Self::Gone
+        } else {
+            e.into()
+        }
+    }
+
     fn not_writable(path: &std::path::Path, source: std::io::Error) -> Self {
         Self::NotWritable {
             path: path.display().to_string(),
@@ -83,13 +96,13 @@ fn client() -> Result<reqwest::Client> {
         .build()?)
 }
 
-/// The newest release if it's newer than `current`, with every changelog since `current`.
-/// `None` when `current` is the newest.
+/// The newest release on `track` if it's newer than `current`, with every changelog since
+/// `current`. `None` when `current` is the newest.
 ///
 /// # Errors
 ///
 /// Returns an error when GitHub can't be reached or answers with something unexpected.
-pub async fn check(current: Version) -> Result<Option<Available>> {
+pub async fn check(current: Version, track: Track) -> Result<Option<Available>> {
     let url = format!("https://api.github.com/repos/{REPOSITORY}/releases?per_page={LISTED}");
     let body = client()?
         .get(url)
@@ -100,7 +113,11 @@ pub async fn check(current: Version) -> Result<Option<Available>> {
         .error_for_status()?
         .bytes()
         .await?;
-    Ok(release::newer(serde_json::from_slice(&body)?, current))
+    Ok(release::newer(
+        serde_json::from_slice(&body)?,
+        current,
+        track,
+    ))
 }
 
 /// Downloads `release` for this computer, checks it, and puts it in place of the running copy.
@@ -133,14 +150,20 @@ pub async fn install(
         .get(&sums.url)
         .send()
         .await?
-        .error_for_status()?
+        .error_for_status()
+        .map_err(Error::download)?
         .text()
         .await?;
     let expected = install::expected_sum(&sums, &name)
         .ok_or_else(|| Error::NoChecksum(name.clone()))?
         .to_ascii_lowercase();
 
-    let mut response = client.get(&asset.url).send().await?.error_for_status()?;
+    let mut response = client
+        .get(&asset.url)
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(Error::download)?;
     let size = response.content_length().filter(|&n| n > 0);
     let mut archive = Vec::with_capacity(
         size.and_then(|n| usize::try_from(n).ok())

@@ -309,6 +309,8 @@ impl Command {
     }
 
     pub(crate) fn run(self, s: &mut Mail, tx: &mut Tx) {
+        // It would open again over wherever the command goes, once the settings show again.
+        s.updater.channel_open = false;
         match self {
             Self::Compose => s.compose(),
             Self::Search => s.focus_search(),

@@ -46,6 +46,35 @@ impl Release {
     }
 }
 
+/// Which releases to update to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Track {
+    /// Releases only.
+    #[default]
+    Stable,
+    /// Releases, and the nightly builds leading up to the next one.
+    Nightly,
+}
+
+impl Track {
+    /// How the track is saved in the settings.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Nightly => "nightly",
+        }
+    }
+
+    /// The track saved as `key`, if it's one.
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        [Self::Stable, Self::Nightly]
+            .into_iter()
+            .find(|t| t.key() == key)
+    }
+}
+
 /// A release newer than the running version, and what changed since that version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Available {
@@ -79,15 +108,23 @@ impl Available {
     }
 }
 
-/// What, among `listed`, is newer than `current`: the newest stable release, and the changelogs
-/// of every stable release since `current`. `None` when nothing is newer.
-pub(crate) fn newer(listed: Vec<Listed>, current: Version) -> Option<Available> {
+/// What, among `listed`, is newer than `current` on `track`: the newest release (or, on the
+/// nightly track, nightly build), and the changelogs of every one since `current`. `None` when
+/// nothing is newer.
+pub(crate) fn newer(listed: Vec<Listed>, current: Version, track: Track) -> Option<Available> {
     let mut releases: Vec<Release> = listed
         .into_iter()
-        .filter(|r| !r.draft && !r.prerelease)
+        .filter(|r| !r.draft)
         .filter_map(|r| {
-            Some(Release {
-                version: Version::from_tag(&r.tag_name)?,
+            let version = Version::from_tag(&r.tag_name)?;
+            // Nightlies are published as pre-releases; any other pre-release is skipped.
+            let wanted = if r.prerelease {
+                track == Track::Nightly && version.is_nightly()
+            } else {
+                !version.is_nightly()
+            };
+            wanted.then(|| Release {
+                version,
                 notes: r.body.unwrap_or_default(),
                 page: r.html_url,
                 assets: r.assets,
@@ -131,7 +168,7 @@ mod tests {
     #[test]
     fn nothing_newer_is_no_update() {
         let releases = vec![listed("v0.1.0", ""), listed("v0.0.9", "")];
-        assert_eq!(newer(releases, v("0.1.0")), None);
+        assert_eq!(newer(releases, v("0.1.0"), Track::Stable), None);
     }
 
     #[test]
@@ -156,7 +193,7 @@ mod tests {
             },
             listed("nightly", "not a version"),
         ];
-        let available = newer(releases, v("0.1.0")).unwrap();
+        let available = newer(releases, v("0.1.0"), Track::Stable).unwrap();
         assert_eq!(available.latest.version, v("0.3.0"));
         assert_eq!(
             available.changes.iter().map(|c| c.0).collect::<Vec<_>>(),
@@ -171,10 +208,58 @@ mod tests {
     }
 
     #[test]
+    fn nightlies_are_offered_only_on_the_nightly_track() {
+        let nightly = |tag| Listed {
+            prerelease: true,
+            ..listed(tag, "")
+        };
+        let releases = || {
+            vec![
+                listed("v0.2.0", ""),
+                nightly("v0.2.1-nightly.202611180300"),
+                nightly("v0.3.0-rc.1"),
+                // Published as a release by mistake: not one.
+                listed("v0.2.1-nightly.202611190300", ""),
+            ]
+        };
+        let latest =
+            |current, track| newer(releases(), v(current), track).map(|a| a.latest.version);
+        assert_eq!(latest("0.1.0", Track::Stable), Some(v("0.2.0")));
+        assert_eq!(latest("0.2.0", Track::Stable), None);
+        assert_eq!(
+            latest("0.2.0", Track::Nightly),
+            Some(v("0.2.1-nightly.202611180300"))
+        );
+        assert_eq!(
+            latest("0.2.1-nightly.202611170300", Track::Nightly),
+            Some(v("0.2.1-nightly.202611180300"))
+        );
+        assert_eq!(
+            latest("0.2.1-nightly.202611180300", Track::Nightly),
+            None,
+            "the newest nightly is running"
+        );
+        assert_eq!(
+            latest("0.2.1-nightly.202611180300", Track::Stable),
+            None,
+            "back on stable, a nightly waits for the next release rather than going back"
+        );
+    }
+
+    #[test]
+    fn tracks_round_trip_through_their_keys() {
+        for track in [Track::Stable, Track::Nightly] {
+            assert_eq!(Track::from_key(track.key()), Some(track));
+        }
+        assert_eq!(Track::from_key("beta"), None);
+    }
+
+    #[test]
     fn changelogs_without_a_heading_get_one() {
         let available = newer(
             vec![listed("v0.3.0", "  \n"), listed("v0.2.0", "* a fix")],
             v("0.1.0"),
+            Track::Stable,
         )
         .unwrap();
         assert_eq!(
@@ -195,7 +280,7 @@ mod tests {
             "assets": [{"name": "SHA256SUMS", "browser_download_url": "https://example.com/SHA256SUMS", "size": 1}]
         }]"#;
         let listed: Vec<Listed> = serde_json::from_str(json).unwrap();
-        let available = newer(listed, v("0.1.0")).unwrap();
+        let available = newer(listed, v("0.1.0"), Track::Stable).unwrap();
         assert_eq!(
             available.latest.asset("SHA256SUMS").map(|a| a.url.as_str()),
             Some("https://example.com/SHA256SUMS")
