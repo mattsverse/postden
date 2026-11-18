@@ -943,6 +943,7 @@ impl Mail {
             } => self.opened(&(account, mailbox, uid), uid_validity, body, tx),
             // Sent mail is shown as it's listed, without a notice.
             Update::Mail { .. } => self.reload(),
+            update @ Update::Unread { .. } => self.unread_found(&update),
             Update::Mailboxes { account } => self.mailboxes_listed(&account),
             Update::Older {
                 account,
@@ -2577,6 +2578,21 @@ impl Mail {
             _ => return,
         };
         let inbox = |name: &str| name.eq_ignore_ascii_case(INBOX);
+        // Unread mail older than what's cached is looked for as each mailbox syncs: every inbox,
+        // for the unread counts, and what's listed, showing only unread mail.
+        if let (Ok(services), Some(synced)) = (&self.services, mailbox.as_deref())
+            && (inbox(synced)
+                || (self.settings.unread_only
+                    && self
+                        .listed
+                        .iter()
+                        .any(|(a, m)| *a == account && m == synced)))
+        {
+            // One that isn't watched looks once it syncs.
+            let _ignored = services
+                .mailroom
+                .find_unread(&services.store, &account, synced);
+        }
         if mailbox.is_none()
             && self
                 .refreshing_all
@@ -2592,6 +2608,26 @@ impl Mail {
             );
             !(*a == account && n <= asked && answered)
         });
+    }
+
+    /// Older unread mail was looked for in one of an account's mailboxes ([`Update::Unread`]): it
+    /// isn't new, so it's only listed. Failing to look isn't shown, as the account's status says
+    /// whether its server answers, and the next sync looks again. Asked for `again` meanwhile,
+    /// it looks again.
+    fn unread_found(&mut self, update: &Update) {
+        self.reload();
+        if let Update::Unread {
+            account,
+            mailbox,
+            again: true,
+            ..
+        } = update
+            && let Ok(services) = &self.services
+        {
+            let _ignored = services
+                .mailroom
+                .find_unread(&services.store, account, mailbox);
+        }
     }
 
     /// The accounts and mailboxes the list shows, which [`Self::refresh_shown`] syncs: searching
@@ -3325,20 +3361,52 @@ impl Mail {
             self.showing = showing;
             self.list_limit = LIST_LIMIT;
             self.reload();
+            self.find_unread_listed();
         }
     }
 
-    /// Whether every mailbox [`Mail::showing`] lists was synced once: each account's with its
-    /// role, or the one mailbox. Until then, an empty list of unread mail isn't an inbox at zero.
+    /// Showing only unread mail, looks for what's older than the cache in each mailbox listed not
+    /// looked in yet. Each looks again as it syncs.
+    fn find_unread_listed(&self) {
+        let Ok(services) = &self.services else { return };
+        if !self.settings.unread_only {
+            return;
+        }
+        for (account, name) in &self.listed {
+            if !services
+                .store
+                .unread_searched(account, name)
+                .unwrap_or(true)
+            {
+                // An account that isn't connected looks once it syncs.
+                let _ignored = services
+                    .mailroom
+                    .find_unread(&services.store, account, name);
+            }
+        }
+    }
+
+    /// Whether every mailbox [`Mail::showing`] lists was synced once, and searched for unread
+    /// mail older than what's cached: each account's with its role, or the one mailbox. Until
+    /// then, an empty list of unread mail isn't an inbox at zero.
     pub(crate) fn listing_synced(&self) -> bool {
         let Ok(services) = &self.services else {
             return false;
         };
-        match &self.showing {
-            Showing::Mailbox { account, name } => services
+        let searched = |account: &str, name: &str| {
+            services
                 .store
-                .mailbox_state(account, name)
-                .is_ok_and(|state| state.is_some()),
+                .unread_searched(account, name)
+                .unwrap_or(false)
+        };
+        match &self.showing {
+            Showing::Mailbox { account, name } => {
+                services
+                    .store
+                    .mailbox_state(account, name)
+                    .is_ok_and(|state| state.is_some())
+                    && searched(account, name)
+            }
             // An account listed without such a mailbox has none to wait for.
             Showing::All(role) => self.accounts.iter().all(|a| {
                 let none = self
@@ -3348,7 +3416,7 @@ impl Mail {
                 none || services
                     .store
                     .mailbox_for_role(&a.id, *role)
-                    .is_ok_and(|found| found.is_some())
+                    .is_ok_and(|found| found.is_some_and(|(name, _)| searched(&a.id, &name)))
             }),
         }
     }
@@ -4391,6 +4459,7 @@ impl Mail {
         self.list_limit = LIST_LIMIT;
         self.save_settings();
         self.reload();
+        self.find_unread_listed();
     }
 
     /// Drops every message downloaded, ahead or once opened, to download them again as needed.
@@ -5963,6 +6032,35 @@ mod tests {
             .unwrap();
     }
 
+    /// The server was searched for unread mail in Ada's inbox below `below`, and had `unseen`,
+    /// of which `fetched` weren't cached.
+    fn searched_unread(s: &mut Mail, below: u32, unseen: &[u32], fetched: &[Envelope]) {
+        let services = s.services.as_mut().unwrap();
+        services
+            .store
+            .save_unread("ada@example.com", INBOX, (1, 0), below, unseen, fetched)
+            .unwrap();
+        s.reload();
+    }
+
+    #[test]
+    fn unread_mail_older_than_whats_cached_isnt_an_inbox_at_zero() {
+        let (_dir, mut s) = synced("unread-older", &[hello(10, true), hello(11, true)]);
+        s.set_unread_only(true);
+        assert_eq!(uids(&s), Vec::<u32>::new());
+        assert!(
+            !s.listing_synced(),
+            "the server wasn't searched for older unread mail yet"
+        );
+        searched_unread(&mut s, 10, &[3], &[hello(3, false)]);
+        assert_eq!(uids(&s), [3]);
+        assert_eq!(s.unread.get("ada@example.com"), Some(&1), "counted too");
+        // Read elsewhere, it's gone at the next search: now the inbox is at zero.
+        searched_unread(&mut s, 10, &[], &[]);
+        assert_eq!(uids(&s), Vec::<u32>::new());
+        assert!(s.listing_synced());
+    }
+
     #[test]
     fn a_message_read_in_a_list_of_unread_mail_stays_until_back_from_it() {
         let (_dir, mut s) = synced(
@@ -5982,6 +6080,8 @@ mod tests {
         s.close_reader();
         assert_eq!(uids(&s), Vec::<u32>::new());
         assert_eq!(s.cursor, None, "nothing left to be on");
+        assert!(!s.listing_synced(), "unless older mail is unread");
+        searched_unread(&mut s, 1, &[], &[]);
         assert!(s.listing_synced(), "an inbox at zero");
     }
 

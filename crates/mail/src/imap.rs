@@ -7,6 +7,7 @@
 //! Messages can be downloaded ahead of their opening, so they open without waiting.
 //! Mail older than what a sync fetched is fetched on demand, as the list is scrolled to its end.
 //! A search on the server finds what the cache can't: older mail, and words in message bodies.
+//! Unread mail older than what's cached is looked for too, so none is missed.
 
 mod connection;
 mod envelope;
@@ -16,6 +17,7 @@ mod older;
 mod refresh;
 mod search;
 mod sent;
+mod unread;
 mod watch;
 
 pub use connection::{Session, check_login, connect};
@@ -28,4 +30,5 @@ pub use older::{Older, fetch_older};
 pub use refresh::refresh;
 pub use search::{Found, search};
 pub use sent::save_sent_copy;
+pub use unread::{Unread, fetch_unread};
 pub use watch::{Changes, Event, Flags, Nudge, Status, WatchConfig, watch};
