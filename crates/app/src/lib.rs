@@ -8,6 +8,8 @@
 //! - [`Mailroom`]: watching every account's inbox and saving what arrives, downloading its newest
 //!   messages ahead when asked to, and sending mail.
 //! - [`Draft`]: a message being written, blank or as a reply.
+//! - [`contacts`]: the people mail was sent to, suggested as recipients when the settings keep
+//!   them.
 //! - [`signature`]: what each account adds below the mail it sends, images included.
 //! - [`Profile`]: every account and setting in one passphrase-locked file, to move Postden to
 //!   another computer.
@@ -20,6 +22,7 @@
 
 mod accounts;
 mod compose;
+pub mod contacts;
 mod google;
 pub mod import;
 mod mailroom;

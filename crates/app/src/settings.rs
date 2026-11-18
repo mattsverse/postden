@@ -1,7 +1,7 @@
 //! The app's preferences: its theme, how often mail is checked, how many messages are downloaded
 //! ahead of their opening, whether opened messages are kept, whether new mail is announced with a system notification, whether the
 //! app keeps running with its window closed, whether updates are checked for and which ones (the
-//! release track), kept in the
+//! release track), and whether the people mail is sent to are remembered, kept in the
 //! [`Store`].
 
 use std::time::Duration;
@@ -20,6 +20,7 @@ const KEEP_RUNNING: &str = "keep_running";
 const CHECK_UPDATES: &str = "check_updates";
 const SKIPPED_UPDATE: &str = "skipped_update";
 const UPDATE_TRACK: &str = "update_track";
+const REMEMBER_CONTACTS: &str = "remember_contacts";
 
 /// Whether the window is light, dark, or follows the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -105,6 +106,9 @@ pub struct Settings {
     pub skipped_update: Option<Version>,
     /// Whether updates are releases only, or nightly builds too. Releases only by default.
     pub update_track: Track,
+    /// Whether the people mail is sent to are remembered, to suggest as recipients. Off by
+    /// default.
+    pub remember_contacts: bool,
 }
 
 impl Default for Settings {
@@ -119,6 +123,7 @@ impl Default for Settings {
             check_updates: true,
             skipped_update: None,
             update_track: Track::default(),
+            remember_contacts: false,
         }
     }
 }
@@ -166,6 +171,10 @@ impl Settings {
             .setting(UPDATE_TRACK)?
             .and_then(|t| Track::from_key(&t))
             .unwrap_or(default.update_track);
+        let remember_contacts = store
+            .setting(REMEMBER_CONTACTS)?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default.remember_contacts);
         Ok(Self {
             theme,
             poll_interval,
@@ -176,6 +185,7 @@ impl Settings {
             check_updates,
             skipped_update,
             update_track,
+            remember_contacts,
         })
     }
 
@@ -199,6 +209,7 @@ impl Settings {
             (CHECK_UPDATES, &self.check_updates.to_string()),
             (SKIPPED_UPDATE, &skipped),
             (UPDATE_TRACK, self.update_track.key()),
+            (REMEMBER_CONTACTS, &self.remember_contacts.to_string()),
         ])?;
         Ok(())
     }
@@ -222,6 +233,7 @@ mod tests {
             check_updates: false,
             skipped_update: Some("0.2.1-nightly.202611180300".parse().unwrap()),
             update_track: Track::Nightly,
+            remember_contacts: true,
         };
         settings.save(&store).unwrap();
         assert_eq!(Settings::load(&store).unwrap(), settings);
@@ -239,6 +251,7 @@ mod tests {
         store.set_setting(CHECK_UPDATES, "maybe").unwrap();
         store.set_setting(SKIPPED_UPDATE, "").unwrap();
         store.set_setting(UPDATE_TRACK, "beta").unwrap();
+        store.set_setting(REMEMBER_CONTACTS, "everyone").unwrap();
         assert_eq!(Settings::load(&store).unwrap(), Settings::default());
     }
 

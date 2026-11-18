@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 use jiff::{Timestamp, Zoned};
 use postden_app::{
     Draft, Imported, Login, Mailroom, Passwords, Profile, Settings, Theme, Update, check_logins,
-    eml_file_name, finish_google_sign_in, import, is_sealed, password_key, remove_account,
-    save_account, signature, smtp_password_key, start_google_sign_in,
+    contacts, eml_file_name, finish_google_sign_in, import, is_sealed, password_key,
+    remove_account, save_account, signature, smtp_password_key, start_google_sign_in,
 };
 use postden_core::account::{Account, Signature};
-use postden_core::message::{Body, Envelope, Mailbox, Role};
+use postden_core::message::{Address, Body, Envelope, Mailbox, Role};
 use postden_core::secrets::{SecretStore, SecretString};
 use postden_mail::imap::{Status, WatchConfig};
 use postden_secrets::Backend;
@@ -28,7 +28,7 @@ use rune_kit::shell::PaneState;
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
 use crate::commands::{self, Command, Palette, PaletteMode, Shortcut};
-use crate::compose::{ComposeForm, Mode};
+use crate::compose::{ComposeForm, Mode, Recipients};
 use crate::form::{AccountForm, AppAccounts, GoogleSignIn, Imports, Step, Unreadable, is_set_up};
 use crate::notifications::{self, Alert, Target};
 use crate::search::{self, MailboxKey, MessageKey, SERVER_PAGE, Search};
@@ -825,7 +825,7 @@ impl Mail {
                 path,
                 result,
             } => self.exported(&account, &path, result),
-            Update::Sent { account, result } => self.sent(&account, result),
+            update @ Update::Sent { .. } => self.sent(update),
             Update::MailboxCreated {
                 account,
                 name,
@@ -1407,6 +1407,54 @@ impl Mail {
         self.compose.set_signature(signature, self.images.as_ref());
     }
 
+    /// Suggests the contacts the recipient being typed in `field` could be, if contacts are
+    /// remembered. Failing to read them, none are suggested.
+    pub(crate) fn suggest(&mut self, field: Recipients) {
+        let Ok(services) = &self.services else {
+            return;
+        };
+        if !self.settings.remember_contacts {
+            self.compose.close_suggestions();
+            return;
+        }
+        let edit = self.compose.recipients(field);
+        match contacts::suggestions(&services.store, &edit.text, edit.focus) {
+            Ok(found) => self.compose.suggest(field, found),
+            Err(_unreadable) => self.compose.close_suggestions(),
+        }
+    }
+
+    /// The keys of a recipients field while it suggests contacts: ↑ and ↓ pick one, Return or
+    /// Tab puts it in, and Escape stops suggesting. Whether the key was taken.
+    pub(crate) fn suggestion_key(
+        &mut self,
+        field: Recipients,
+        ev: &rune::KeyEvent,
+        tx: &mut Tx,
+    ) -> bool {
+        let m = ev.mods;
+        if self.compose.suggested(field).is_empty() || m.cmd || m.ctrl || m.alt || m.shift {
+            return false;
+        }
+        match ev.key {
+            rune::Key::Up | rune::Key::Down => {
+                let by = if ev.key == rune::Key::Up { -1 } else { 1 };
+                self.compose.move_suggestion(field, by);
+                tx.scroll_into_view(field.suggestion_key(self.compose.suggestions.active));
+                true
+            }
+            rune::Key::Enter | rune::Key::Tab => {
+                let active = self.compose.suggestions.active;
+                self.compose.choose_suggestion(field, active)
+            }
+            rune::Key::Escape => {
+                self.compose.close_suggestions();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Starts a reply to the open message, once it's downloaded.
     pub(crate) fn reply(&mut self, all: bool) {
         self.answer(if all { Answer::ReplyAll } else { Answer::Reply });
@@ -1473,10 +1521,19 @@ impl Mail {
 
     /// The mailroom finished sending. Only one message is written at a time, so it's the one shown,
     /// if it's still shown.
-    fn sent(&mut self, account: &str, result: Result<String, String>) {
-        let label = self.label(account).to_owned();
+    fn sent(&mut self, update: Update) {
+        let Update::Sent {
+            account,
+            result,
+            recipients,
+        } = update
+        else {
+            return;
+        };
+        let label = self.label(&account).to_owned();
         match result {
             Ok(_) => {
+                self.remember(&recipients);
                 if self.compose.is_sending() {
                     self.compose = ComposeForm::default();
                 }
@@ -1487,6 +1544,23 @@ impl Mail {
                 self.compose.error = Some(format!("Couldn't send: {error}"));
             }
             Err(error) => self.notify(format!("{label}: couldn't send: {error}")),
+        }
+    }
+
+    /// Remembers who mail was sent to, if contacts are remembered.
+    fn remember(&mut self, recipients: &[Address]) {
+        let Ok(services) = &mut self.services else {
+            return;
+        };
+        if !self.settings.remember_contacts {
+            return;
+        }
+        if let Err(e) = contacts::remember(
+            &mut services.store,
+            recipients,
+            Timestamp::now().as_second(),
+        ) {
+            self.notify(format!("Couldn't remember who it went to: {e}"));
         }
     }
 
@@ -3768,6 +3842,7 @@ impl Mail {
         self.set_poll_interval(settings.poll_interval);
         self.set_prefetch(settings.prefetch);
         self.set_keep_opened(settings.keep_opened);
+        self.set_remember_contacts(settings.remember_contacts);
         self.set_notify_new_mail(settings.notify_new_mail);
         self.set_keep_running(settings.keep_running);
         self.set_check_updates(settings.check_updates);
@@ -3906,6 +3981,31 @@ impl Mail {
         services.mailroom.set_keep_opened(on);
         self.settings.keep_opened = on;
         self.save_settings();
+    }
+
+    /// Remembers who mail is sent to, to suggest them as recipients, or stops. Those remembered
+    /// are kept until forgotten.
+    pub(crate) fn set_remember_contacts(&mut self, on: bool) {
+        if self.settings.remember_contacts != on {
+            self.settings.remember_contacts = on;
+            self.compose.close_suggestions();
+            self.save_settings();
+        }
+    }
+
+    /// Forgets every contact remembered, and says how many there were.
+    pub(crate) fn forget_contacts(&mut self) {
+        let Ok(services) = &self.services else {
+            return;
+        };
+        let notice = match services.store.forget_contacts() {
+            Ok(0) => "No contacts to forget".to_owned(),
+            Ok(1) => "Forgot 1 contact".to_owned(),
+            Ok(n) => format!("Forgot {n} contacts"),
+            Err(e) => format!("Couldn't forget the contacts: {e}"),
+        };
+        self.compose.close_suggestions();
+        self.notify(notice);
     }
 
     /// Drops every message downloaded, ahead or once opened, to download them again as needed.
@@ -4986,7 +5086,7 @@ mod tests {
             envelope: Envelope {
                 uid: 3,
                 message_id: Some("a@example.com".into()),
-                from: postden_core::message::Address::default(),
+                from: Address::default(),
                 to: Vec::new(),
                 subject: None,
                 date: None,
@@ -5088,7 +5188,7 @@ mod tests {
                 envelope: Envelope {
                     uid,
                     message_id: None,
-                    from: postden_core::message::Address::default(),
+                    from: Address::default(),
                     to: Vec::new(),
                     subject: None,
                     date: None,
@@ -5129,7 +5229,7 @@ mod tests {
             envelope: Envelope {
                 uid: 1,
                 message_id: None,
-                from: postden_core::message::Address::default(),
+                from: Address::default(),
                 to: Vec::new(),
                 subject: None,
                 date: None,
@@ -5209,7 +5309,7 @@ mod tests {
             envelope: Envelope {
                 uid: 1,
                 message_id: None,
-                from: postden_core::message::Address::default(),
+                from: Address::default(),
                 to: Vec::new(),
                 subject: None,
                 date: None,

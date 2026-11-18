@@ -165,6 +165,15 @@ CREATE TABLE IF NOT EXISTS snoozes (
     until      INTEGER NOT NULL,
     PRIMARY KEY (account, message_id)
 ) STRICT;
+
+-- People mail was sent to, suggested as recipients, kept only while the setting says to.
+CREATE TABLE IF NOT EXISTS contacts (
+    email     TEXT PRIMARY KEY COLLATE NOCASE,
+    name      TEXT,
+    -- How many messages went to them, and when the last did, as Unix seconds.
+    sent      INTEGER NOT NULL,
+    last_sent INTEGER NOT NULL
+) STRICT;
 ";
 
 /// The schema version [`SCHEMA`] creates, kept in `PRAGMA user_version`.
@@ -1296,6 +1305,85 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Remembers that mail went to `addresses` at `at` (Unix seconds), as contacts to suggest.
+    /// One already known is counted again, and keeps its name unless this one has one. An
+    /// address without an email is skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails. Nothing is written in that case.
+    pub fn remember_contacts(&mut self, addresses: &[Address], at: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut insert = tx.prepare(
+                "INSERT INTO contacts (email, name, sent, last_sent) VALUES (?1, ?2, 1, ?3)
+                 ON CONFLICT(email) DO UPDATE SET
+                    name = COALESCE(excluded.name, contacts.name),
+                    sent = contacts.sent + 1,
+                    last_sent = MAX(contacts.last_sent, excluded.last_sent)",
+            )?;
+            for address in addresses {
+                let Some(email) = address
+                    .email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                else {
+                    continue;
+                };
+                let name = address
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty());
+                insert.execute(params![email, name, at])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Up to `limit` of the contacts `matches` accepts, those written to most first, then most
+    /// recently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn matching_contacts(
+        &self,
+        mut matches: impl FnMut(&Address) -> bool,
+        limit: usize,
+    ) -> Result<Vec<Address>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, email FROM contacts ORDER BY sent DESC, last_sent DESC, email",
+        )?;
+        let mut found = Vec::new();
+        for contact in stmt.query_map([], |row| {
+            Ok(Address {
+                name: row.get(0)?,
+                email: Some(row.get(1)?),
+            })
+        })? {
+            if found.len() >= limit {
+                break;
+            }
+            let contact = contact?;
+            if matches(&contact) {
+                found.push(contact);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Forgets every contact, returning how many there were.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub fn forget_contacts(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM contacts", [])?)
     }
 }
 
@@ -2658,5 +2746,49 @@ mod tests {
         assert_eq!(seen(1), Some(false), "marked unread last");
         assert_eq!(seen(2), Some(true), "marked all read since the sync");
         assert_eq!(seen(30), Some(false), "above where all was marked read");
+    }
+
+    #[test]
+    fn contacts_are_counted_kept_named_and_forgotten() {
+        let mut store = Store::open_in_memory().unwrap();
+        let to = |name: Option<&str>, email: &str| Address {
+            name: name.map(str::to_owned),
+            email: Some(email.to_owned()),
+        };
+        store
+            .remember_contacts(
+                &[
+                    to(Some("Ada"), "ada@example.com"),
+                    to(None, "bob@example.com"),
+                ],
+                10,
+            )
+            .unwrap();
+        store
+            .remember_contacts(&[to(None, "BOB@example.com"), to(None, " ")], 20)
+            .unwrap();
+        store
+            .remember_contacts(&[to(None, "ADA@example.com")], 5)
+            .unwrap();
+        store
+            .remember_contacts(&[to(Some("Bob B"), "bob@example.com")], 30)
+            .unwrap();
+        let all = store.matching_contacts(|_| true, 10).unwrap();
+        assert_eq!(
+            all,
+            vec![
+                to(Some("Bob B"), "bob@example.com"),
+                to(Some("Ada"), "ada@example.com")
+            ],
+            "one per address whatever its case, written to most first, the name kept unless a \
+             new one is given"
+        );
+        let ada = store
+            .matching_contacts(|c| c.name.as_deref() == Some("Ada"), 10)
+            .unwrap();
+        assert_eq!(ada.len(), 1);
+        assert_eq!(store.matching_contacts(|_| true, 1).unwrap().len(), 1);
+        assert_eq!(store.forget_contacts().unwrap(), 2);
+        assert_eq!(store.matching_contacts(|_| true, 10).unwrap(), vec![]);
     }
 }

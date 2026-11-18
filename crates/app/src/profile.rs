@@ -145,6 +145,10 @@ pub struct ProfileSettings {
     /// it, which keep this computer's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_opened: Option<bool>,
+    /// Whether the people mail is sent to are remembered. Absent from profiles exported before
+    /// Postden had it, which keep this computer's. The contacts themselves stay on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remember_contacts: Option<bool>,
     pub notify_new_mail: bool,
     pub keep_running: bool,
     pub check_updates: bool,
@@ -560,6 +564,7 @@ impl From<&Settings> for ProfileSettings {
             poll_interval_secs: settings.poll_interval.as_secs(),
             prefetch: Some(settings.prefetch),
             keep_opened: Some(settings.keep_opened),
+            remember_contacts: Some(settings.remember_contacts),
             notify_new_mail: settings.notify_new_mail,
             keep_running: settings.keep_running,
             check_updates: settings.check_updates,
@@ -579,6 +584,9 @@ impl ProfileSettings {
         }
         if let Some(keep_opened) = self.keep_opened {
             settings.keep_opened = keep_opened;
+        }
+        if let Some(remember_contacts) = self.remember_contacts {
+            settings.remember_contacts = remember_contacts;
         }
         settings.notify_new_mail = self.notify_new_mail;
         settings.keep_running = self.keep_running;
@@ -701,6 +709,7 @@ mod tests {
             prefetch: 50,
             keep_opened: true,
             notify_new_mail: false,
+            remember_contacts: true,
             ..Settings::default()
         };
         settings.save(&store).unwrap();
@@ -734,12 +743,14 @@ mod tests {
         let mut settings = Settings {
             prefetch: 100,
             keep_opened: true,
+            remember_contacts: true,
             ..Settings::default()
         };
         older.apply(&mut settings);
         assert_eq!(settings.theme, Theme::Dark);
         assert_eq!(settings.prefetch, 100, "kept");
         assert!(settings.keep_opened, "kept");
+        assert!(settings.remember_contacts, "kept");
 
         let odd = ProfileSettings {
             prefetch: Some(7),
@@ -779,6 +790,7 @@ mod tests {
         assert_eq!(settings.poll_interval, Duration::from_mins(5));
         assert_eq!(settings.prefetch, 50);
         assert!(settings.keep_opened);
+        assert!(settings.remember_contacts);
         assert!(!settings.notify_new_mail);
     }
 
