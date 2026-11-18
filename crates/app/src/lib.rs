@@ -66,6 +66,8 @@ pub enum Error {
     NotSignedIn(String),
     #[error("that's not the passphrase this profile was exported with")]
     WrongPassphrase,
+    #[error("Postden needs Full Disk Access to read them")]
+    NeedsFullDiskAccess,
     #[error("{0}")]
     Invalid(String),
 }

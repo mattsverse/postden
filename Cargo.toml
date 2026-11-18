@@ -60,6 +60,8 @@ self-replace = "1.5"
 
 # store
 rusqlite = { version = "0.42", features = ["bundled"] }
+# importing accounts: Apple Mail archives its settings as property lists
+plist = "1.10"
 
 # paths and dates
 directories = "6"

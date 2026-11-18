@@ -23,12 +23,29 @@ pub(crate) enum Step {
     Google,
     /// Typing in IMAP and SMTP servers and a password.
     Servers,
-    /// Picking one of the accounts another mail app on this computer has.
+    /// Picking another mail app on this computer, then one of the accounts it has.
     Import,
 }
 
 /// The accounts one app has, by its name, or why they couldn't be read.
-pub(crate) type AppAccounts = (&'static str, Result<Vec<Found>, String>);
+pub(crate) type AppAccounts = (&'static str, Result<Vec<Found>, Unreadable>);
+
+/// Why the accounts an app has couldn't be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unreadable {
+    /// macOS keeps them private until Postden has Full Disk Access.
+    NeedsFullDiskAccess,
+    Failed(String),
+}
+
+impl From<postden_app::Error> for Unreadable {
+    fn from(e: postden_app::Error) -> Self {
+        match e {
+            postden_app::Error::NeedsFullDiskAccess => Self::NeedsFullDiskAccess,
+            other => Self::Failed(other.to_string()),
+        }
+    }
+}
 
 /// The accounts other mail apps on this computer have, to set one up with what it has filled in.
 /// It's kept while the form moves between screens, so it's read once each time the form opens.
@@ -38,6 +55,8 @@ pub(crate) struct Imports {
     pub(crate) apps: Vec<&'static str>,
     /// What each app has, by app, or why it couldn't be read. `None` until read.
     pub(crate) found: Option<Vec<AppAccounts>>,
+    /// The app whose accounts are showing; `None` while picking one.
+    pub(crate) app: Option<&'static str>,
     /// The address of the account being set up from them: once it's added, or on Back, the form
     /// shows them again.
     pub(crate) picked: Option<String>,
@@ -49,13 +68,21 @@ pub(crate) struct Imports {
 }
 
 impl Imports {
-    /// The account found at `address`, if any app has it.
-    pub(crate) fn find(&self, address: &str) -> Option<&Found> {
+    /// What `app` has, once read.
+    pub(crate) fn of(&self, app: &str) -> Option<&Result<Vec<Found>, Unreadable>> {
         self.found
             .iter()
             .flatten()
-            .filter_map(|(_, found)| found.as_ref().ok())
-            .flatten()
+            .find(|(name, _)| *name == app)
+            .map(|(_, read)| read)
+    }
+
+    /// The account found at `address` in the app whose accounts are showing, if it has it.
+    pub(crate) fn find(&self, address: &str) -> Option<&Found> {
+        self.of(self.app?)?
+            .as_ref()
+            .ok()?
+            .iter()
             .find(|f| f.address == address)
     }
 }

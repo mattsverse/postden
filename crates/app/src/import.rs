@@ -10,6 +10,7 @@
 //! else, such as the desktop app's list of what each app has, works from [`Source`] and
 //! [`Found`] alone.
 
+mod apple_mail;
 mod spark;
 
 use std::collections::HashSet;
@@ -18,9 +19,16 @@ use std::path::Path;
 
 use postden_core::account::Server;
 
+pub use apple_mail::AppleMail;
 pub use spark::Spark;
 
 use crate::Result;
+
+/// Where System Settings lets Postden have Full Disk Access, which reading some apps' accounts
+/// needs: see [`Error::NeedsFullDiskAccess`](crate::Error::NeedsFullDiskAccess). macOS has no
+/// way to ask for it, only to open that page.
+pub const FULL_DISK_ACCESS_SETTINGS: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
 
 /// A mail app whose accounts Postden can read.
 pub trait Source: fmt::Debug + Send + Sync {
@@ -32,8 +40,9 @@ pub trait Source: fmt::Debug + Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an error when the app's accounts can't be read at all. One account that can't
-    /// be read is listed as [`Unsupported::Unreadable`] instead.
+    /// Returns an error when the app's accounts can't be read at all, such as
+    /// [`Error::NeedsFullDiskAccess`](crate::Error::NeedsFullDiskAccess) when macOS keeps them
+    /// private. One account that can't be read is listed as [`Unsupported::Unreadable`] instead.
     fn accounts(&self) -> Result<Vec<Found>>;
 }
 
@@ -43,6 +52,9 @@ pub fn installed(home: &Path) -> Vec<Box<dyn Source>> {
     let mut sources: Vec<Box<dyn Source>> = Vec::new();
     if let Some(spark) = Spark::find(home) {
         sources.push(Box::new(spark));
+    }
+    if let Some(apple_mail) = AppleMail::find(home) {
+        sources.push(Box::new(apple_mail));
     }
     sources
 }
@@ -84,6 +96,8 @@ pub enum Setup {
 pub enum Unsupported {
     #[error("Microsoft accounts need signing in with Microsoft, which Postden can't do yet")]
     Microsoft,
+    #[error("it's a POP account, and Postden only connects over IMAP")]
+    Pop,
     #[error("its servers couldn't be read: {0}")]
     Unreadable(String),
 }

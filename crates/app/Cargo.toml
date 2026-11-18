@@ -25,6 +25,7 @@ base64.workspace = true
 age.workspace = true
 # importing accounts: other mail apps keep them in SQLite databases
 rusqlite.workspace = true
+plist.workspace = true
 
 [lints]
 workspace = true
