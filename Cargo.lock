@@ -4984,6 +4984,7 @@ dependencies = [
  "base64 0.23.1",
  "directories",
  "jiff",
+ "plist",
  "postden-core",
  "postden-html",
  "postden-mail",
