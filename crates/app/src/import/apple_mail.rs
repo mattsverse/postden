@@ -23,7 +23,7 @@ use plist::Value;
 use postden_core::account::{Security, Server};
 use rusqlite::{Connection, OpenFlags};
 
-use super::{Found, Setup, Source, Unsupported, non_empty, once_each};
+use super::{Found, Setup, Source, Unsupported, is_loopback, non_empty, once_each};
 use crate::{Error, Result};
 
 /// Where the accounts database is, in the home directory, on macOS.
@@ -444,15 +444,6 @@ impl Store {
 
 fn text(value: &Value) -> Option<String> {
     value.as_string().map(str::to_owned)
-}
-
-/// Whether `host` is this computer, as a local bridge such as Proton Mail Bridge is.
-fn is_loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_matches(['[', ']'])
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// The value `NSKeyedArchiver` archived in `bytes`, with its strings, numbers and arrays as
