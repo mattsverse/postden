@@ -19,7 +19,8 @@ app="$PWD/dist/Postden.app"
   echo 'Build first with scripts/bundle-macos.sh --universal.' >&2
   exit 1
 }
-[[ "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$app/Contents/Info.plist")" == "$version" ]]
+# A nightly's bundle shows the release it leads up to: its version without -nightly.N.
+[[ "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$app/Contents/Info.plist")" == "${version%%-*}" ]]
 lipo "$app/Contents/MacOS/postden" -verify_arch arm64 x86_64 || {
   echo 'Releases must be universal; build with scripts/bundle-macos.sh --universal.' >&2
   exit 1

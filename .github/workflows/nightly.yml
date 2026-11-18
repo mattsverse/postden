@@ -1,0 +1,132 @@
+name: Nightly
+
+# Builds main as a pre-release of the next patch, v<next>-nightly.<commit time>, when main has
+# changed since the last nightly and the last release. Only the newest two are kept, so the
+# updater's release listing stays mostly releases.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Toolchains come from mise.toml; fail if mise.lock doesn't pin them.
+  MISE_LOCKED: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      # To tag the commit being built.
+      contents: write
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      # Release jobs skip caches so a poisoned cache can't reach shipped binaries.
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        with:
+          version: 2026.11.6
+          cache: false
+          install_args: python
+      - name: Tag main unless it's built already
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          commit_of() {
+            gh api "repos/$GITHUB_REPOSITORY/commits/$1" --jq .sha
+          }
+          # The newest published nightly; failed ones stay drafts and are retried.
+          last="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.prerelease and (.draft | not) and (.tag_name | test("-nightly\\."))) | .tag_name')"
+          last="${last%%$'\n'*}"
+          if [[ -n "$last" && "$(commit_of "$last")" == "$sha" ]]; then
+            echo "::notice::main ($sha) is already built as $last."
+            exit 0
+          fi
+          stable="v$(python3 scripts/release.py version)"
+          if [[ "$(commit_of "$stable")" == "$sha" ]]; then
+            echo "::notice::main ($sha) is the release $stable."
+            exit 0
+          fi
+          # The commit's time numbers the build, so a retry of the same commit gets the same tag.
+          build="$(TZ=UTC0 git show -s --format=%cd --date=format-local:%Y%m%d%H%M HEAD)"
+          tag="$(python3 scripts/release.py nightly-tag --build "$build")"
+          tagged="$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
+            --jq "map(select(.ref == \"refs/tags/$tag\")) | .[0].object.sha // empty")"
+          if [[ -z "$tagged" ]]; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              --raw-field "ref=refs/tags/$tag" --raw-field "sha=$sha" --silent
+          elif [[ "$tagged" != "$sha" ]]; then
+            echo "$tag already tags $tagged, not $sha." >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: plan
+    if: needs.plan.outputs.tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.plan.outputs.tag }}
+    secrets:
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      RELEASE_PLEASE_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+      # Required by release.yml, unused for a nightly: Homebrew installs releases only.
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+
+  # The newest two published nightlies stay, so an update an app found before the latest came out
+  # still downloads; older ones go, tags and all. Also runs when main is already built, so a
+  # failed or skipped cleanup catches up.
+  prune:
+    needs: [plan, release]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' &&
+      (needs.release.result == 'success' || needs.release.result == 'skipped')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Delete older nightlies
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILDING: ${{ needs.plan.outputs.tag }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.prerelease and (.tag_name | test("-nightly\\."))) | [.tag_name, .draft] | @tsv' \
+            > nightlies.tsv
+          # Newest first by build number; drafts (failed builds) never count among the two kept.
+          jq -rRn --arg building "$BUILDING" '
+            [inputs | split("\t") | {tag: .[0], draft: (.[1] == "true")}
+              | .n = (.tag | capture("-nightly\\.(?<n>[0-9]+)$").n | tonumber)]
+            | sort_by(-.n)
+            | ([.[] | select(.draft | not)][:2] | map(.tag)) as $keep
+            | .[] | select(.tag != $building and (.tag | IN($keep[]) | not)) | .tag
+          ' nightlies.tsv | while read -r tag; do
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          done

@@ -8,6 +8,7 @@ use postden_core::message::{Address, Mailbox, Role};
 use postden_html::compat::{self, Client, Provider};
 use postden_mail::imap::Status;
 use postden_store::StoredMessage;
+use postden_update::Track;
 use rune::{
     Block, Color, Cx, El, GrowthSpec, Icon, Mark, ScrollSpec, TextEdit, TextStyle, Transition, Tx,
     col, el, icon, row, text,
@@ -15,8 +16,8 @@ use rune::{
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow, SplitView, Toolbar};
 use rune_kit::{
     Button, ButtonVariant, Dialog, Divider, IconButton, IconButtonVariant, Keybind, Kit, Markdown,
-    MarkdownStyle, Menu, MenuEntry, MenuItem, Placement, SegmentedControl, Spinner, State, Switch,
-    TextArea, TextInput, Toast, ToastRegion, context_menu, glyphs, root,
+    MarkdownStyle, Menu, MenuEntry, MenuItem, Placement, SegmentedControl, Select, Spinner, State,
+    Switch, TextArea, TextInput, Toast, ToastRegion, context_menu, glyphs, root,
 };
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
@@ -96,9 +97,9 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
     }
     let mut layer = Vec::new();
     let main = if s.settings_open && s.account_settings.open {
-        account_page(s, &s.account_settings, &k)
+        account_page(s, &s.account_settings, &k, &mut layer)
     } else if s.settings_open {
-        settings(s, &k)
+        settings(s, &k, &mut layer)
     } else if s.form.open {
         form(&s.form, &k)
     } else if s.compose.open {
@@ -1811,7 +1812,7 @@ fn field(k: &Kit, label: &str, input: El) -> El {
 /// notifications, closing the window and updates), Accounts (each editable and removable, and
 /// moving them to another computer) and Advanced (how often mail is checked and how many
 /// messages are downloaded ahead).
-fn settings(s: &Mail, k: &Kit) -> El {
+fn settings(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     let labels: Vec<&str> = SettingsSection::ALL.iter().map(|t| t.label()).collect();
     let mut tabs = SegmentedControl::new(
         &labels,
@@ -1842,7 +1843,7 @@ fn settings(s: &Mail, k: &Kit) -> El {
         .gap(24.0)
         .child(row().child(tabs));
     page = match s.settings_section {
-        SettingsSection::General => general_settings(s, k, page),
+        SettingsSection::General => general_settings(s, k, page, layer),
         SettingsSection::Accounts => page
             .child(settings_accounts(s, k))
             .child(transfer(&s.transfer, k)),
@@ -1860,7 +1861,7 @@ fn settings(s: &Mail, k: &Kit) -> El {
 }
 
 /// The settings' General section: the theme, notifications, closing the window and updates.
-fn general_settings(s: &Mail, k: &Kit, page: El) -> El {
+fn general_settings(s: &Mail, k: &Kit, page: El, layer: &mut Vec<El>) -> El {
     let themes: Vec<&str> = Theme::ALL.iter().map(|t| t.label()).collect();
     let theme = SegmentedControl::new(
         &themes,
@@ -1906,7 +1907,7 @@ fn general_settings(s: &Mail, k: &Kit, page: El) -> El {
                 "Postden asks GitHub for new releases when it starts and once a day, and \
                  shows what changed before you update.",
             ),
-            updates(s, k),
+            updates(s, k, layer),
         ))
 }
 
@@ -2114,9 +2115,9 @@ fn settings_account(s: &Mail, account: &Account, k: &Kit) -> El {
 }
 
 /// An account's settings: what it's called, the name its mail goes under, and its signature.
-fn account_page(s: &Mail, p: &AccountSettings, k: &Kit) -> El {
+fn account_page(s: &Mail, p: &AccountSettings, k: &Kit, layer: &mut Vec<El>) -> El {
     let Some(account) = s.accounts.iter().find(|a| a.id == p.account) else {
-        return settings(s, k);
+        return settings(s, k, layer);
     };
     let names_about = format!(
         "The label names the account in Postden only, such as Work; without one, it's \
@@ -2776,9 +2777,46 @@ fn review(t: &Transfer, k: &Kit) -> El {
         .child(transfer_actions(t, k, go))
 }
 
-/// The running version, whether updates are checked for, a button to check now, and how the
-/// last check went.
-fn updates(s: &Mail, k: &Kit) -> El {
+/// Which updates to get: releases only (Stable), or every nightly build of main too.
+fn channel(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
+    let names = CHANNELS.map(|(_, name)| name);
+    let current = CHANNELS
+        .iter()
+        .find(|(track, _)| *track == s.settings.update_track)
+        .map(|(_, name)| *name);
+    let select = Select::new("update-channel", &names)
+        .label("Update channel")
+        .current(current)
+        .open(s.updater.channel_open)
+        .on_toggle(|s: &mut Mail| s.updater.channel_open = !s.updater.channel_open)
+        .on_close(|s: &mut Mail| s.updater.channel_open = false)
+        .on_choose(|s: &mut Mail, name, _| {
+            s.updater.channel_open = false;
+            if let Some((track, _)) = CHANNELS.iter().find(|(_, n)| *n == name) {
+                s.set_update_track(*track);
+            }
+        })
+        .build(k, layer);
+    row()
+        .gap(8.0)
+        .center_y()
+        .child(
+            text("Update channel")
+                .font(TextStyle {
+                    line_height: 16.0,
+                    ..k.ty.small
+                })
+                .color(k.c.text_faint),
+        )
+        .child(select)
+}
+
+/// The update channels the settings offer, with their names there.
+const CHANNELS: [(Track, &str); 2] = [(Track::Stable, "Stable"), (Track::Nightly, "Nightly")];
+
+/// The running version, whether updates are checked for and on which channel, a button to check
+/// now, and how the last check went.
+fn updates(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     let u = &s.updater;
     let mut buttons = row().gap(8.0).center_y().child(
         Button::new("Check for updates")
@@ -2820,6 +2858,7 @@ fn updates(s: &Mail, k: &Kit) -> El {
                 .build(k)
                 .key("auto-update"),
         )
+        .child(channel(s, k, layer))
         .child(buttons);
     let status = u.status();
     if !status.is_empty() {

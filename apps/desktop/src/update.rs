@@ -3,13 +3,17 @@
 use jiff::Zoned;
 use postden_update::{Available, Install, Version};
 
-/// The running version.
+/// The running version: the one CI built it as, such as a nightly's, else the crate's.
 pub(crate) fn current() -> Version {
-    env!("CARGO_PKG_VERSION").parse().unwrap_or(Version {
-        major: 0,
-        minor: 0,
-        patch: 0,
-    })
+    option_env!("POSTDEN_VERSION")
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+        .parse()
+        .unwrap_or(Version {
+            major: 0,
+            minor: 0,
+            patch: 0,
+            nightly: None,
+        })
 }
 
 /// What the updater is doing.
@@ -42,6 +46,8 @@ pub(crate) struct Updater {
     pub(crate) available: Option<Available>,
     /// The announcement, with the changelog, is shown over the window.
     pub(crate) dialog_open: bool,
+    /// The settings' update channel list is open.
+    pub(crate) channel_open: bool,
     /// When the last check finished, successfully or not.
     pub(crate) checked_at: Option<Zoned>,
     /// Counts scheduled checks, so only the latest timer starts one.
@@ -55,6 +61,7 @@ impl Default for Updater {
             phase: Phase::Idle,
             available: None,
             dialog_open: false,
+            channel_open: false,
             checked_at: None,
             timer: 0,
         }

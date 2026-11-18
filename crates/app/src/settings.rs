@@ -1,12 +1,13 @@
 //! The app's preferences: its theme, how often mail is checked, how many messages are downloaded
 //! ahead of their opening, whether opened messages are kept, whether new mail is announced with a system notification, whether the
-//! app keeps running with its window closed and whether updates are checked for, kept in the
+//! app keeps running with its window closed, whether updates are checked for and which ones (the
+//! release track), kept in the
 //! [`Store`].
 
 use std::time::Duration;
 
 use postden_store::Store;
-use postden_update::Version;
+use postden_update::{Track, Version};
 
 use crate::Result;
 
@@ -18,6 +19,7 @@ const NOTIFY_NEW_MAIL: &str = "notify_new_mail";
 const KEEP_RUNNING: &str = "keep_running";
 const CHECK_UPDATES: &str = "check_updates";
 const SKIPPED_UPDATE: &str = "skipped_update";
+const UPDATE_TRACK: &str = "update_track";
 
 /// Whether the window is light, dark, or follows the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -101,6 +103,8 @@ pub struct Settings {
     pub check_updates: bool,
     /// A release the user chose to skip: automatic checks don't announce it, only newer ones.
     pub skipped_update: Option<Version>,
+    /// Whether updates are releases only, or nightly builds too. Releases only by default.
+    pub update_track: Track,
 }
 
 impl Default for Settings {
@@ -114,6 +118,7 @@ impl Default for Settings {
             keep_running: true,
             check_updates: true,
             skipped_update: None,
+            update_track: Track::default(),
         }
     }
 }
@@ -157,6 +162,10 @@ impl Settings {
             .and_then(|s| s.parse().ok())
             .unwrap_or(default.check_updates);
         let skipped_update = store.setting(SKIPPED_UPDATE)?.and_then(|s| s.parse().ok());
+        let update_track = store
+            .setting(UPDATE_TRACK)?
+            .and_then(|t| Track::from_key(&t))
+            .unwrap_or(default.update_track);
         Ok(Self {
             theme,
             poll_interval,
@@ -166,6 +175,7 @@ impl Settings {
             keep_running,
             check_updates,
             skipped_update,
+            update_track,
         })
     }
 
@@ -188,6 +198,7 @@ impl Settings {
             (KEEP_RUNNING, &self.keep_running.to_string()),
             (CHECK_UPDATES, &self.check_updates.to_string()),
             (SKIPPED_UPDATE, &skipped),
+            (UPDATE_TRACK, self.update_track.key()),
         ])?;
         Ok(())
     }
@@ -209,7 +220,8 @@ mod tests {
             notify_new_mail: false,
             keep_running: false,
             check_updates: false,
-            skipped_update: Some("0.2.0".parse().unwrap()),
+            skipped_update: Some("0.2.1-nightly.202611180300".parse().unwrap()),
+            update_track: Track::Nightly,
         };
         settings.save(&store).unwrap();
         assert_eq!(Settings::load(&store).unwrap(), settings);
@@ -226,6 +238,7 @@ mod tests {
         store.set_setting(KEEP_RUNNING, "sometimes").unwrap();
         store.set_setting(CHECK_UPDATES, "maybe").unwrap();
         store.set_setting(SKIPPED_UPDATE, "").unwrap();
+        store.set_setting(UPDATE_TRACK, "beta").unwrap();
         assert_eq!(Settings::load(&store).unwrap(), Settings::default());
     }
 

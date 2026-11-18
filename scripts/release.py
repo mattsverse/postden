@@ -13,6 +13,8 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+# A nightly build of the next patch release; the updater (crates/update) reads the same form.
+NIGHTLY = re.compile(rf"({VERSION.pattern})-nightly\.([1-9][0-9]*)")
 # The workspace crate names release-please bumps in Cargo.lock.
 LOCK_NAME = re.compile(r"@\.name\.value == '([^']+)'")
 REPOSITORY = "mattsverse/postden"
@@ -37,12 +39,37 @@ def validate_tag(tag, version):
         raise ValueError(f"Release tag {tag!r} must match Cargo.toml: v{version}")
 
 
+def next_patch(version):
+    major, minor, patch = version_parts(version)
+    return f"{major}.{minor}.{patch + 1}"
+
+
+def nightly_tag(version, build):
+    """The tag of a nightly build `build` made after the release `version`."""
+    if not re.fullmatch(r"[1-9][0-9]*", build):
+        raise ValueError(f"A nightly build number must be a positive integer, got {build!r}")
+    return f"v{next_patch(version)}-nightly.{build}"
+
+
+def tag_version(tag, version):
+    """The version `tag` builds: the workspace `version`, or a nightly build of the next patch."""
+    if tag == f"v{version}":
+        return version
+    nightly = NIGHTLY.fullmatch(tag.removeprefix("v")) if tag.startswith("v") else None
+    if nightly and nightly.group(1) == next_patch(version):
+        return tag.removeprefix("v")
+    raise ValueError(
+        f"Release tag {tag!r} must match Cargo.toml: v{version}, or v{next_patch(version)}-nightly.N"
+    )
+
+
 def write_plist(output, version, build_number="1"):
     if not re.fullmatch(r"[1-9][0-9]{0,3}", build_number):
         raise ValueError("The bundle build number must be an integer from 1 to 9999")
     with (ROOT / "assets/macos/Info.plist").open("rb") as source:
         metadata = plistlib.load(source)
-    metadata["CFBundleShortVersionString"] = version
+    # macOS wants major.minor.patch here, so a nightly shows the release it leads up to.
+    metadata["CFBundleShortVersionString"] = version.split("-", 1)[0]
     metadata["CFBundleVersion"] = build_number
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("wb") as target:
@@ -192,8 +219,11 @@ def main():
     metadata.add_argument("--tag")
     plist = commands.add_parser("plist")
     plist.add_argument("--output", type=Path, required=True)
+    plist.add_argument("--tag", help="The tag being built, when it's a nightly's")
     plist.add_argument("--build-number", default=os.environ.get("GITHUB_RUN_NUMBER", "1"))
     commands.add_parser("check-config")
+    nightly = commands.add_parser("nightly-tag", help="The tag for a nightly build of main")
+    nightly.add_argument("--build", required=True, help="The build's number, such as its time")
     for kind in ("formula", "cask"):
         tap = commands.add_parser(kind, help=f"Write the Homebrew {kind} for a release")
         tap.add_argument("--tag", required=True)
@@ -212,10 +242,12 @@ def main():
         return
     version = project_version()
     if args.command == "version":
-        if args.tag:
-            validate_tag(args.tag, version)
-        print(version)
+        print(tag_version(args.tag, version) if args.tag else version)
+    elif args.command == "nightly-tag":
+        print(nightly_tag(version, args.build))
     elif args.command == "plist":
+        if args.tag:
+            version = tag_version(args.tag, version)
         write_plist(args.output, version, args.build_number)
 
 
