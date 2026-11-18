@@ -3,9 +3,11 @@
 //!
 //! The file is [age](https://age-encryption.org) encrypted with the passphrase (scrypt), so
 //! `age --decrypt` opens it too. Inside is JSON, versioned by [`VERSION`]. Mail isn't in it: the
-//! servers hold that, and the other computer fetches it again.
+//! servers hold that, and the other computer fetches it again. What sorting mail learned can be
+//! in it, if asked for: it tells much of the mail, as anyone can tell which words its features
+//! are of.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::Path;
 use std::time::Duration;
@@ -13,7 +15,7 @@ use std::time::Duration;
 use postden_core::account::{Account, Auth, Security, Server, Signature};
 use postden_core::message::InlineImage;
 use postden_core::secrets::{ExposeSecret, SecretError, SecretKey, SecretStore, SecretString};
-use postden_store::Store;
+use postden_store::{Sorting, SortingClass, SortingTaught, SortingWeight, Store};
 use secrecy::SecretSlice;
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +40,143 @@ pub struct Profile {
     version: u32,
     pub accounts: Vec<ProfileAccount>,
     pub settings: ProfileSettings,
+    /// What sorting mail learned, if it was exported with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sorting: Option<ProfileSorting>,
+}
+
+/// What sorting mail learned, in a [`Profile`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProfileSorting {
+    /// The version of what messages were judged by, as [`postden_ai::FEATURES`] counts: learned
+    /// by others, it's no use.
+    pub features: u32,
+    pub classes: Vec<ProfileClass>,
+    pub taught: Vec<ProfileTaught>,
+}
+
+/// One class of an account's model of sorting mail.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProfileClass {
+    pub account: String,
+    pub model: String,
+    pub name: String,
+    pub messages: u32,
+    pub guessed: u32,
+    pub correct: u32,
+    /// Its weights, as base64: each a feature, then its z and n, little-endian.
+    #[serde(with = "base64_bytes")]
+    pub weights: Vec<u8>,
+}
+
+/// What a message was taught as, by its Message-ID.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProfileTaught {
+    pub account: String,
+    pub model: String,
+    pub message_id: String,
+    pub class: String,
+}
+
+/// How many bytes each weight takes in a [`ProfileClass`].
+const WEIGHT_BYTES: usize = 16;
+
+/// The `N` bytes of `chunk` from `at`.
+fn bytes_at<const N: usize>(chunk: &[u8; WEIGHT_BYTES], at: usize) -> [u8; N] {
+    chunk
+        .get(at..at + N)
+        .and_then(|b| b.try_into().ok())
+        .unwrap_or([0; N])
+}
+
+impl ProfileSorting {
+    fn new(features: u32, sorting: Sorting) -> Self {
+        let classes = sorting
+            .classes
+            .into_iter()
+            .map(|c| ProfileClass {
+                weights: c
+                    .weights
+                    .iter()
+                    .flat_map(|w| {
+                        let mut bytes = [0; WEIGHT_BYTES];
+                        let (feature, rest) = bytes.split_at_mut(8);
+                        let (z, n) = rest.split_at_mut(4);
+                        feature.copy_from_slice(&w.feature.to_le_bytes());
+                        z.copy_from_slice(&w.z.to_le_bytes());
+                        n.copy_from_slice(&w.n.to_le_bytes());
+                        bytes
+                    })
+                    .collect(),
+                account: c.account,
+                model: c.model,
+                name: c.name,
+                messages: c.messages,
+                guessed: c.guessed,
+                correct: c.correct,
+            })
+            .collect();
+        let taught = sorting
+            .taught
+            .into_iter()
+            .map(|t| ProfileTaught {
+                account: t.account,
+                model: t.model,
+                message_id: t.message_id,
+                class: t.class,
+            })
+            .collect();
+        Self {
+            features,
+            classes,
+            taught,
+        }
+    }
+
+    /// What was learned, as kept.
+    fn sorting(&self) -> Result<Sorting> {
+        let classes = self
+            .classes
+            .iter()
+            .map(|c| {
+                let (chunks, rest) = c.weights.as_chunks::<WEIGHT_BYTES>();
+                if !rest.is_empty() {
+                    return Err(Error::Invalid(format!(
+                        "what sorting learned of {} is cut short",
+                        c.name
+                    )));
+                }
+                let weights = chunks
+                    .iter()
+                    .map(|chunk| SortingWeight {
+                        feature: u64::from_le_bytes(bytes_at(chunk, 0)),
+                        z: f32::from_le_bytes(bytes_at(chunk, 8)),
+                        n: f32::from_le_bytes(bytes_at(chunk, 12)),
+                    })
+                    .collect();
+                Ok(SortingClass {
+                    account: c.account.clone(),
+                    model: c.model.clone(),
+                    name: c.name.clone(),
+                    messages: c.messages,
+                    guessed: c.guessed,
+                    correct: c.correct,
+                    weights,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let taught = self
+            .taught
+            .iter()
+            .map(|t| SortingTaught {
+                account: t.account.clone(),
+                model: t.model.clone(),
+                message_id: t.message_id.clone(),
+                class: t.class.clone(),
+            })
+            .collect();
+        Ok(Sorting { classes, taught })
+    }
 }
 
 /// One account in a [`Profile`].
@@ -149,6 +288,10 @@ pub struct ProfileSettings {
     /// Postden had it, which keep this computer's. The contacts themselves stay on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remember_contacts: Option<bool>,
+    /// Whether inbox mail is sorted. Absent from profiles exported before Postden sorted mail,
+    /// which keep this computer's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_mail: Option<bool>,
     pub notify_new_mail: bool,
     pub keep_running: bool,
     pub check_updates: bool,
@@ -161,6 +304,9 @@ pub struct ImportOptions {
     pub replace_accounts: bool,
     /// Use the profile's settings; otherwise they're kept as they are.
     pub settings: bool,
+    /// Use what the profile's sorting learned, if it has it, in place of what was learned here
+    /// of its accounts.
+    pub sorting: bool,
 }
 
 /// What [`Profile::import`] did, by account address.
@@ -174,6 +320,8 @@ pub struct Imported {
     pub without_secrets: Vec<String>,
     /// Not imported, and why. The others were.
     pub failed: Vec<(String, String)>,
+    /// Whether what sorting learned was imported, or why it wasn't, if it was to be.
+    pub sorting: Option<Result<(), String>>,
 }
 
 impl Profile {
@@ -213,7 +361,21 @@ impl Profile {
             version: VERSION,
             accounts,
             settings: ProfileSettings::from(&Settings::load(store)?),
+            sorting: None,
         })
+    }
+
+    /// The profile, with what sorting mail learned in `store` too.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store can't be read.
+    pub fn with_sorting(mut self, store: &Store) -> Result<Self> {
+        let (features, sorting) = store.sorting_learned()?;
+        // Never said, nothing was learned yet.
+        let features = features.unwrap_or(postden_ai::FEATURES);
+        self.sorting = Some(ProfileSorting::new(features, sorting));
+        Ok(self)
     }
 
     /// The profile as a file, encrypted with `passphrase`.
@@ -364,8 +526,56 @@ impl Profile {
                 Err(e) => imported.failed.push((id, e.to_string())),
             }
         }
+        if options.sorting
+            && let Some(sorting) = &self.sorting
+        {
+            imported.sorting = Some(self.import_sorting(store, sorting));
+        }
         Ok(imported)
     }
+
+    /// Replaces what sorting learned here of the profile's accounts set up with what it has.
+    fn import_sorting(
+        &self,
+        store: &mut Store,
+        sorting: &ProfileSorting,
+    ) -> std::result::Result<(), String> {
+        if sorting.features != postden_ai::FEATURES {
+            return Err("it was learned by another version of Postden".into());
+        }
+        // Only of the same mailboxes: an account kept here, or not replaced, may read others.
+        let set_up: HashMap<String, Server> = store
+            .accounts()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|a| (a.id, a.imap))
+            .collect();
+        let accounts: Vec<&str> = self
+            .accounts
+            .iter()
+            .filter(|a| {
+                a.account().is_ok_and(|account| {
+                    set_up
+                        .get(&a.id)
+                        .is_some_and(|here| same_mailboxes(here, &account.imap))
+                })
+            })
+            .map(|a| a.id.as_str())
+            .collect();
+        if accounts.is_empty() {
+            return Err("none of its accounts reads the same mail here".into());
+        }
+        let sorting = sorting.sorting().map_err(|e| e.to_string())?;
+        store
+            .replace_sorting(&accounts, &sorting, postden_ai::FEATURES)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Whether `a` and `b` log in to the same mailboxes: host names are the same in any case.
+fn same_mailboxes(a: &Server, b: &Server) -> bool {
+    a.host.eq_ignore_ascii_case(&b.host)
+        && (a.port, a.security, &a.username) == (b.port, b.security, &b.username)
 }
 
 /// Saves one of a profile's accounts: its secrets, then the account, its names and its
@@ -565,6 +775,7 @@ impl From<&Settings> for ProfileSettings {
             prefetch: Some(settings.prefetch),
             keep_opened: Some(settings.keep_opened),
             remember_contacts: Some(settings.remember_contacts),
+            sort_mail: Some(settings.sort_mail),
             notify_new_mail: settings.notify_new_mail,
             keep_running: settings.keep_running,
             check_updates: settings.check_updates,
@@ -587,6 +798,9 @@ impl ProfileSettings {
         }
         if let Some(remember_contacts) = self.remember_contacts {
             settings.remember_contacts = remember_contacts;
+        }
+        if let Some(sort_mail) = self.sort_mail {
+            settings.sort_mail = sort_mail;
         }
         settings.notify_new_mail = self.notify_new_mail;
         settings.keep_running = self.keep_running;
@@ -708,6 +922,7 @@ mod tests {
             poll_interval: Duration::from_mins(5),
             prefetch: 50,
             keep_opened: true,
+            sort_mail: false,
             notify_new_mail: false,
             remember_contacts: true,
             ..Settings::default()
@@ -730,6 +945,7 @@ mod tests {
     const EVERYTHING: ImportOptions = ImportOptions {
         replace_accounts: true,
         settings: true,
+        sorting: true,
     };
 
     #[test]
@@ -744,6 +960,7 @@ mod tests {
             prefetch: 100,
             keep_opened: true,
             remember_contacts: true,
+            sort_mail: false,
             ..Settings::default()
         };
         older.apply(&mut settings);
@@ -751,6 +968,7 @@ mod tests {
         assert_eq!(settings.prefetch, 100, "kept");
         assert!(settings.keep_opened, "kept");
         assert!(settings.remember_contacts, "kept");
+        assert!(!settings.sort_mail, "kept");
 
         let odd = ProfileSettings {
             prefetch: Some(7),
@@ -791,7 +1009,181 @@ mod tests {
         assert_eq!(settings.prefetch, 50);
         assert!(settings.keep_opened);
         assert!(settings.remember_contacts);
+        assert!(!settings.sort_mail);
         assert!(!settings.notify_new_mail);
+    }
+
+    /// What sorting learned of an account's mail: a class, and what one message was taught as.
+    fn learned(account: &str, class: &str) -> Sorting {
+        Sorting {
+            classes: vec![SortingClass {
+                account: account.into(),
+                model: "folders".into(),
+                name: class.into(),
+                messages: 3,
+                guessed: 2,
+                correct: 1,
+                weights: vec![
+                    SortingWeight {
+                        feature: u64::MAX,
+                        z: -1.5,
+                        n: 0.25,
+                    },
+                    SortingWeight {
+                        feature: 7,
+                        z: 2.0,
+                        n: 4.0,
+                    },
+                ],
+            }],
+            taught: vec![SortingTaught {
+                account: account.into(),
+                model: "folders".into(),
+                message_id: "1@example.com".into(),
+                class: class.into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn what_sorting_learned_moves_only_when_asked_and_replaces_whats_there() {
+        let (mut store, secrets) = set_up();
+        store
+            .replace_sorting(
+                &["ada@example.com"],
+                &learned("ada@example.com", "Receipts"),
+                postden_ai::FEATURES,
+            )
+            .unwrap();
+        let without = open(&sealed(&store, &secrets), "correct horse").unwrap();
+        assert!(without.sorting.is_none(), "not unless asked for");
+
+        let file = Profile::collect(&store, &secrets)
+            .unwrap()
+            .with_sorting(&store)
+            .unwrap()
+            .seal_with(&SecretString::from("correct horse"), Some(2))
+            .unwrap();
+        let (mut there, there_secrets) = (Store::open_in_memory().unwrap(), Memory::default());
+        there
+            .save_account(&account("ada@example.com", Auth::Password))
+            .unwrap();
+        there
+            .replace_sorting(
+                &["ada@example.com"],
+                &learned("ada@example.com", "Old"),
+                postden_ai::FEATURES,
+            )
+            .unwrap();
+        let profile = open(&file, "correct horse").unwrap();
+        let keep = ImportOptions {
+            sorting: false,
+            ..EVERYTHING
+        };
+        let imported = profile.import(&mut there, &there_secrets, keep).unwrap();
+        assert_eq!(imported.sorting, None);
+        assert_eq!(there.sorting().unwrap(), learned("ada@example.com", "Old"));
+
+        let imported = profile
+            .import(&mut there, &there_secrets, EVERYTHING)
+            .unwrap();
+        assert_eq!(imported.sorting, Some(Ok(())));
+        assert_eq!(there.sorting().unwrap(), store.sorting().unwrap());
+        // Where sorting never ran, it's kept as learned by the same features.
+        let _sorted = crate::sorting::Learner::default()
+            .sort(&mut there, 0)
+            .unwrap();
+        assert_eq!(there.sorting().unwrap(), store.sorting().unwrap());
+    }
+
+    #[test]
+    fn what_another_version_learned_isnt_imported() {
+        let (mut store, secrets) = set_up();
+        store
+            .replace_sorting(
+                &["ada@example.com"],
+                &learned("ada@example.com", "Receipts"),
+                postden_ai::FEATURES,
+            )
+            .unwrap();
+        let mut profile = Profile::collect(&store, &secrets)
+            .unwrap()
+            .with_sorting(&store)
+            .unwrap();
+        if let Some(sorting) = &mut profile.sorting {
+            sorting.features += 1;
+        }
+        let mut there = Store::open_in_memory().unwrap();
+        let imported = profile
+            .import(&mut there, &Memory::default(), EVERYTHING)
+            .unwrap();
+        assert!(matches!(imported.sorting, Some(Err(_))), "{imported:?}");
+        assert_eq!(there.sorting().unwrap(), Sorting::default());
+    }
+
+    #[test]
+    fn what_sorting_learned_of_other_mailboxes_isnt_imported() {
+        let (mut store, secrets) = set_up();
+        store
+            .replace_sorting(
+                &["ada@example.com"],
+                &learned("ada@example.com", "Receipts"),
+                postden_ai::FEATURES,
+            )
+            .unwrap();
+        store
+            .replace_sorting(
+                &["ada@gmail.com"],
+                &learned("ada@gmail.com", "Receipts"),
+                postden_ai::FEATURES,
+            )
+            .unwrap();
+        let profile = Profile::collect(&store, &secrets)
+            .unwrap()
+            .with_sorting(&store)
+            .unwrap();
+        let mut there = Store::open_in_memory().unwrap();
+        let mut elsewhere = account("ada@example.com", Auth::Password);
+        elsewhere.imap.host = "imap.elsewhere.example".into();
+        there.save_account(&elsewhere).unwrap();
+        let mut shouting = account("ada@gmail.com", Auth::Google);
+        shouting.imap.host = shouting.imap.host.to_uppercase();
+        there.save_account(&shouting).unwrap();
+        let kept = ImportOptions {
+            replace_accounts: false,
+            ..EVERYTHING
+        };
+        let imported = profile
+            .import(&mut there, &Memory::default(), kept)
+            .unwrap();
+        assert_eq!(
+            imported.sorting,
+            Some(Ok(())),
+            "Gmail's is the same in any case"
+        );
+        let accounts: HashSet<String> = there
+            .sorting()
+            .unwrap()
+            .classes
+            .into_iter()
+            .map(|c| c.account)
+            .collect();
+        assert_eq!(
+            accounts,
+            HashSet::from(["ada@gmail.com".to_owned()]),
+            "not of the account reading other mail"
+        );
+
+        let mut alone = Store::open_in_memory().unwrap();
+        alone.save_account(&elsewhere).unwrap();
+        let mut other_gmail = account("ada@gmail.com", Auth::Google);
+        other_gmail.imap.username = "someone.else@gmail.com".into();
+        alone.save_account(&other_gmail).unwrap();
+        let imported = profile
+            .import(&mut alone, &Memory::default(), kept)
+            .unwrap();
+        assert!(matches!(imported.sorting, Some(Err(_))), "{imported:?}");
+        assert_eq!(alone.sorting().unwrap(), Sorting::default());
     }
 
     #[cfg(unix)]

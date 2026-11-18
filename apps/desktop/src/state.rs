@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use jiff::{Timestamp, Zoned};
 use postden_app::{
-    Draft, Imported, Login, Mailroom, Passwords, Profile, Settings, Theme, Update, check_logins,
-    contacts, eml_file_name, finish_google_sign_in, import, is_sealed, password_key,
-    remove_account, save_account, signature, smtp_password_key, start_google_sign_in,
+    Draft, Imported, Login, Mailroom, Passwords, Profile, Settings, Sorted, Sorter, Tags, Theme,
+    Update, check_logins, contacts, eml_file_name, finish_google_sign_in, import, is_sealed,
+    password_key, remove_account, save_account, signature, smtp_password_key, start_google_sign_in,
 };
 use postden_core::account::{Account, Signature};
 use postden_core::message::{Address, Body, Envelope, Mailbox, Role};
@@ -47,6 +47,10 @@ pub(crate) struct Services {
     /// Passwords come from a command and are never written.
     pub(crate) read_only: bool,
     pub(crate) mailroom: Mailroom,
+    /// Where the store's database is, for the sorter's connection to it.
+    database: PathBuf,
+    /// Sorting the inbox, while the settings say to.
+    sorter: Option<Sorter>,
 }
 
 /// A message open for reading.
@@ -145,6 +149,17 @@ const fn undo_hint(undoable: bool) -> &'static str {
     if undoable { " · Z to undo" } else { "" }
 }
 
+/// Every account and setting, to export or send, and what sorting mail learned if
+/// `with_sorting`.
+fn collect_profile(services: &Services, with_sorting: bool) -> postden_app::Result<Profile> {
+    let profile = Profile::collect(&services.store, services.secrets.as_ref())?;
+    if with_sorting {
+        profile.with_sorting(&services.store)
+    } else {
+        Ok(profile)
+    }
+}
+
 /// What importing a profile did, in a sentence.
 fn imported_notice(imported: &Imported) -> String {
     let count = |n: usize| format!("{n} account{}", if n == 1 { "" } else { "s" });
@@ -167,12 +182,48 @@ fn imported_notice(imported: &Imported) -> String {
     if !imported.without_secrets.is_empty() {
         notice.push_str("; their passwords come from the password command");
     }
+    match &imported.sorting {
+        Some(Ok(())) => notice.push_str("; sorting uses what it learned there"),
+        Some(Err(e)) => notice.extend(["; couldn't import what sorting learned: ", e]),
+        None => {}
+    }
     let failed = imported
         .failed
         .iter()
         .map(|(id, error)| format!("; couldn't import {id}: {error}"));
     notice.extend(failed);
     notice
+}
+
+/// Starts sorting the mail cached in `database`: what it says of the inbox shows as it's done.
+fn start_sorter(handle: &AppHandle<Mail>, database: &std::path::Path) -> Result<Sorter, String> {
+    let handle = handle.clone();
+    Sorter::start(database, move |generation, tags| {
+        handle.update(move |s: &mut Mail, _| s.sorted(generation, tags));
+    })
+    .map_err(|e| format!("couldn't start sorting mail: {e}"))
+}
+
+/// Whether an update changes the mail cached, or what's known of it, so what sorting learns from.
+/// Not a snoozed message woken: what it leaves changes no tag, and the inbox copy it gets back
+/// comes with its own update, before which Gmail's All Mail copy would seem archived.
+const fn changes_mail(update: &Update) -> bool {
+    matches!(
+        update,
+        Update::Mailboxes { .. }
+            | Update::Mail { .. }
+            | Update::FlagsChanged { .. }
+            | Update::Older { .. }
+            | Update::Unread { .. }
+            | Update::Opened { .. }
+            | Update::Seen { .. }
+            | Update::Flagged { .. }
+            | Update::AllSeen { .. }
+            | Update::Moved { .. }
+            | Update::Snoozed { .. }
+            | Update::Restored { .. }
+            | Update::Cleared(_)
+    )
 }
 
 fn is_message(m: &StoredMessage, account: &str, mailbox: &str, uid: u32) -> bool {
@@ -469,6 +520,13 @@ pub(crate) struct Mail {
     go_pressed: Option<Instant>,
     /// What Z undoes, if anything.
     pub(crate) undo: Option<Undo>,
+    /// What sorting last said of each inbox message, by message: where it seems to belong, and
+    /// whether it seems important. Empty while mail isn't sorted.
+    tags: HashMap<MessageKey, Tags>,
+    /// The UIDVALIDITY each mailbox with tags was sorted under, by account and mailbox: a
+    /// suggested move is made only while it holds, as the tags' UIDs name their messages only
+    /// then.
+    tagged_under: HashMap<(String, String), u32>,
     /// A message being moved back by undoing: the list's cursor goes to it once it's listed
     /// there again, unless another mailbox is shown meanwhile.
     restoring: Option<Restoring>,
@@ -553,6 +611,8 @@ impl Mail {
             cursor: None,
             go_pressed: None,
             undo: None,
+            tags: HashMap::new(),
+            tagged_under: HashMap::new(),
             restoring: None,
             returning: Vec::new(),
             undoing: Vec::new(),
@@ -579,6 +639,7 @@ impl Mail {
                 mail.services = Ok(services);
                 mail.settings = settings;
                 mail.reload();
+                mail.sort_mail();
                 let failed = mail
                     .services
                     .as_mut()
@@ -658,6 +719,10 @@ impl Mail {
                     // Mail coming in can add rows above the palette's highlight (Reply, once a
                     // message downloads), which the list's scroll anchor doesn't follow.
                     let before = s.palette_highlight();
+                    // What sorting learns from changed: it learns again.
+                    if changes_mail(&update) {
+                        s.sort_mail();
+                    }
                     s.apply(update, tx);
                     if let (Some((was, _)), Some((row, key))) = (before, s.palette_highlight())
                         && was != row
@@ -668,11 +733,17 @@ impl Mail {
             },
         )
         .map_err(|e| e.to_string())?;
+        let sorter = settings
+            .sort_mail
+            .then(|| start_sorter(handle, &database))
+            .transpose()?;
         let services = Services {
             store,
             secrets,
             read_only: matches!(backend, Backend::Command { .. }),
             mailroom,
+            database,
+            sorter,
         };
         Ok((services, settings))
     }
@@ -867,6 +938,8 @@ impl Mail {
             .remove(&(account.to_owned(), mailbox.to_owned()));
         self.search.forget_mailbox(account, mailbox);
         self.starring
+            .retain(|key, _| key.0 != account || key.1 != mailbox);
+        self.tags
             .retain(|key, _| key.0 != account || key.1 != mailbox);
         self.still_listed
             .retain(|key| key.0 != account || key.1 != mailbox);
@@ -2713,12 +2786,25 @@ impl Mail {
     /// Moves a message to another of its account's mailboxes. It leaves the list at once, and
     /// comes back if the server refuses.
     pub(crate) fn move_message(&mut self, account: &str, mailbox: &str, uid: u32, to: &str) {
+        self.move_message_under(account, mailbox, uid, to, None);
+    }
+
+    /// Moves a message as [`Mail::move_message`] does, only while its mailbox is cached under
+    /// `uid_validity`, if given: its UID names another message under another.
+    fn move_message_under(
+        &mut self,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        to: &str,
+        uid_validity: Option<u32>,
+    ) {
         let key = (account.to_owned(), mailbox.to_owned(), uid);
         if self.moving_back(&key) {
             return;
         }
         if self.pending(&key) {
-            let uid_validity = self.uid_validity(account, mailbox);
+            let uid_validity = uid_validity.or_else(|| self.uid_validity(account, mailbox));
             let deferred = (Deferred::Move(to.to_owned()), uid_validity);
             self.deferred.insert(key.clone(), deferred);
             self.undo_move(&key, to, None);
@@ -2729,7 +2815,7 @@ impl Mail {
         if let Err(e) =
             services
                 .mailroom
-                .move_message(&services.store, account, mailbox, uid, to, None)
+                .move_message(&services.store, account, mailbox, uid, to, uid_validity)
         {
             let label = self.label(account).to_owned();
             self.notify(format!("{label}: couldn't move the message: {e}"));
@@ -2756,6 +2842,89 @@ impl Mail {
         if to != mailbox {
             self.move_message(&account, &mailbox, uid, &to);
         }
+    }
+
+    /// Learns from the mail cached again, in the background, if mail is sorted: the inbox's tags
+    /// change once that's done.
+    fn sort_mail(&self) {
+        if let Ok(Services {
+            sorter: Some(sorter),
+            ..
+        }) = &self.services
+            && self.settings.sort_mail
+        {
+            sorter.sort();
+        }
+    }
+
+    /// Sorting said this of the inbox, by what it learned in `generation`: shown unless sorting
+    /// was turned off meanwhile, or what it learned was forgotten or replaced, as far as can be
+    /// read.
+    ///
+    /// Only the tags of mailboxes still cached under the same UIDVALIDITY are kept: of one
+    /// started over since, their UIDs may name other messages.
+    pub(crate) fn sorted(&mut self, generation: u64, sorted: Sorted) {
+        let current = self
+            .services
+            .as_ref()
+            .ok()
+            .and_then(|s| s.store.sorting_generation().ok());
+        if !self.settings.sort_mail || current.is_some_and(|c| c != generation) {
+            return;
+        }
+        let mut same: HashMap<(String, String), bool> = HashMap::new();
+        let mut tags = sorted.tags;
+        tags.retain(|(account, mailbox, _), _| {
+            let mailbox = (account.clone(), mailbox.clone());
+            *same
+                .entry(mailbox)
+                .or_insert_with_key(|(account, mailbox)| {
+                    let then = sorted.uid_validity.get(&(account.clone(), mailbox.clone()));
+                    self.uid_validity(account, mailbox)
+                        .is_none_or(|now| then == Some(&now))
+                })
+        });
+        // A menu showing a suggestion that changed would act on another item where it was.
+        if let Some(menu) = &self.message_menu
+            && self
+                .tags
+                .get(&menu.message)
+                .and_then(|t| t.suggested.as_ref())
+                != tags.get(&menu.message).and_then(|t| t.suggested.as_ref())
+        {
+            self.close_message_menu();
+        }
+        self.tags = tags;
+        self.tagged_under = sorted.uid_validity;
+    }
+
+    /// What sorting says of a message: where it seems to belong, and whether it seems important.
+    /// A suggestion to move it to where it is already, as once moved meanwhile, isn't one.
+    pub(crate) fn tags(&self, key: &MessageKey) -> Option<&Tags> {
+        self.tags
+            .get(key)
+            .filter(|t| t.important || t.suggested.as_ref().is_some_and(|to| *to != key.1))
+    }
+
+    /// Where sorting suggests a message goes, if anywhere.
+    pub(crate) fn suggested(&self, key: &MessageKey) -> Option<&str> {
+        self.tags(key)?
+            .suggested
+            .as_deref()
+            .filter(|to| *to != key.1)
+    }
+
+    /// Moves a message to `to`, shown as where sorting suggests it goes, while that's still what
+    /// it suggests, and only while the message's mailbox is cached as when it was sorted.
+    pub(crate) fn move_as_suggested(&mut self, key: &MessageKey, to: &str) {
+        if self.suggested(key) != Some(to) {
+            return;
+        }
+        let under = self
+            .tagged_under
+            .get(&(key.0.clone(), key.1.clone()))
+            .copied();
+        self.move_message_under(&key.0, &key.1, key.2, to, under);
     }
 
     /// What Z will undo once the message `from` names has been moved to `to`, or snoozed until
@@ -3938,7 +4107,7 @@ impl Mail {
                 return;
             }
         };
-        let profile = match Profile::collect(&services.store, services.secrets.as_ref()) {
+        let profile = match collect_profile(services, self.transfer.with_sorting) {
             Ok(profile) => profile,
             Err(e) => {
                 self.transfer.error = Some(format!("Couldn't send: {e}"));
@@ -4089,7 +4258,7 @@ impl Mail {
         let (Ok(services), Some(handle)) = (&self.services, &self.handle) else {
             return;
         };
-        let profile = match Profile::collect(&services.store, services.secrets.as_ref()) {
+        let profile = match collect_profile(services, self.transfer.with_sorting) {
             Ok(profile) => profile,
             Err(e) => {
                 self.transfer.error = Some(format!("Couldn't export: {e}"));
@@ -4273,6 +4442,11 @@ impl Mail {
             Ok(None) => {}
             Err(e) => self.notify(format!("Couldn't read the imported settings: {e}")),
         }
+        // What sorting learned may have been replaced, and the accounts it learns of changed.
+        if imported.sorting == Some(Ok(())) {
+            self.tags.clear();
+        }
+        self.sort_mail();
         self.notify(imported_notice(&imported));
     }
 
@@ -4283,6 +4457,7 @@ impl Mail {
         self.set_prefetch(settings.prefetch);
         self.set_keep_opened(settings.keep_opened);
         self.set_remember_contacts(settings.remember_contacts);
+        self.set_sort_mail(settings.sort_mail);
         self.set_notify_new_mail(settings.notify_new_mail);
         self.set_keep_running(settings.keep_running);
         self.set_check_updates(settings.check_updates);
@@ -4559,6 +4734,48 @@ impl Mail {
         }
         self.settings.notify_new_mail = on;
         self.save_settings();
+    }
+
+    /// Sorts inbox mail, as learned on this computer, or stops and takes the tags away.
+    pub(crate) fn set_sort_mail(&mut self, on: bool) {
+        if self.settings.sort_mail == on {
+            return;
+        }
+        self.settings.sort_mail = on;
+        self.save_settings();
+        let (Ok(services), Some(handle)) = (&mut self.services, &self.handle) else {
+            return;
+        };
+        self.tags.clear();
+        // What a pass under way learns once it's off isn't saved.
+        if !on && let Err(e) = services.store.renew_sorting() {
+            self.notify(format!("couldn't stop sorting mail: {e}"));
+            return;
+        }
+        // One sorter at most, kept once started, so two never learn at once.
+        if on && services.sorter.is_none() {
+            match start_sorter(handle, &services.database) {
+                Ok(sorter) => services.sorter = Some(sorter),
+                Err(e) => self.notify(e),
+            }
+        }
+        self.sort_mail();
+    }
+
+    /// Forgets everything sorting learned, and takes the tags away: it learns again from the
+    /// mail cached.
+    pub(crate) fn forget_sorting(&mut self) {
+        let Ok(services) = &mut self.services else {
+            return;
+        };
+        match services.store.forget_sorting() {
+            Ok(()) => {
+                self.tags.clear();
+                self.sort_mail();
+                self.notify("Forgot what sorting learned".to_owned());
+            }
+            Err(e) => self.notify(format!("Couldn't forget what sorting learned: {e}")),
+        }
     }
 
     /// Keeps the app running once its window closes, or has closing it quit.
@@ -6014,6 +6231,8 @@ mod tests {
             secrets: Box::new(NoSecrets),
             read_only: true,
             mailroom,
+            database,
+            sorter: None,
         });
         s.showing = Showing::inbox("ada@example.com");
         s.reload();
@@ -6645,6 +6864,32 @@ mod tests {
         }
         s.reload();
         assert!(s.listing_synced(), "listed, without one");
+    }
+
+    #[test]
+    fn tags_of_a_mailbox_started_over_since_arent_shown() {
+        let (_dir, mut s) = synced("sorted-validity", &[hello(1, false)]);
+        let key: MessageKey = ("ada@example.com".into(), INBOX.into(), 1);
+        let sorted_under = |uid_validity| Sorted {
+            tags: [(
+                key.clone(),
+                Tags {
+                    important: true,
+                    suggested: None,
+                },
+            )]
+            .into(),
+            uid_validity: [(("ada@example.com".into(), INBOX.into()), uid_validity)].into(),
+        };
+        s.sorted(0, sorted_under(7));
+        assert!(s.tags(&key).is_none(), "its UID named another message then");
+        s.sorted(0, sorted_under(1));
+        assert!(s.tags(&key).is_some_and(|t| t.important));
+        s.sorted(1, sorted_under(1));
+        assert!(
+            s.tags(&key).is_some(),
+            "of another generation, not shown instead"
+        );
     }
 
     #[test]

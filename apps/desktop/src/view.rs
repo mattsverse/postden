@@ -15,10 +15,10 @@ use rune::{
 };
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow, SplitView, Toolbar};
 use rune_kit::{
-    Button, ButtonVariant, Combobox, ComboboxOption, Dialog, Divider, IconButton,
-    IconButtonVariant, Keybind, Kit, Markdown, MarkdownStyle, Menu, MenuEntry, MenuItem, Placement,
-    PopupItem, PopupList, SegmentedControl, Select, Spinner, State, Switch, TextArea, TextInput,
-    Toast, ToastRegion, context_menu, glyphs, root,
+    Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Combobox, ComboboxOption, Dialog,
+    Divider, IconButton, IconButtonVariant, Keybind, Kit, Markdown, MarkdownStyle, Menu, MenuEntry,
+    MenuItem, Placement, PopupItem, PopupList, SegmentedControl, Select, Spinner, State, Switch,
+    TextArea, TextInput, Toast, ToastRegion, context_menu, glyphs, root,
 };
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
@@ -973,18 +973,8 @@ fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
                 .truncate()
                 .w(190.0),
             )
-            .child(
-                text(e.subject.clone().unwrap_or_else(|| "(no subject)".into()))
-                    .font(strong)
-                    .color(if e.seen {
-                        k.c.text_muted
-                    } else {
-                        k.c.text_base
-                    })
-                    .truncate()
-                    .grow(1.0)
-                    .min_w(0.0),
-            )
+            .child(subject(e, strong, k))
+            .child(tags(s, &key, k))
             // A slot whether starred or not, so the dates line up.
             .child(if e.flagged {
                 icon(&STAR, 14.0).color(k.c.text_accent).label("Starred")
@@ -1025,6 +1015,85 @@ fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     })
     .grow(1.0)
     .min_h(0.0)
+}
+
+/// A message's subject in the list, taking the room left, muted once it's read.
+fn subject(e: &postden_core::message::Envelope, strong: TextStyle, k: &Kit) -> El {
+    text(e.subject.clone().unwrap_or_else(|| "(no subject)".into()))
+        .font(strong)
+        .color(if e.seen {
+            k.c.text_muted
+        } else {
+            k.c.text_base
+        })
+        .truncate()
+        .grow(1.0)
+        .min_w(0.0)
+}
+
+/// What sorting says of a message in the list: that it seems important, and where it seems to
+/// belong, which moves it there when pressed (or with M).
+fn tags(s: &Mail, key: &crate::search::MessageKey, k: &Kit) -> El {
+    // Narrow, the folder's name is cut short rather than the date pushed off the row.
+    let mut tags = row().gap(6.0).center_y().shrink();
+    let Some(t) = s.tags(key) else {
+        return tags;
+    };
+    if t.important {
+        tags = tags.child(
+            Badge::new("Important")
+                .variant(BadgeVariant::Accent)
+                .build(k),
+        );
+    }
+    if let Some(to) = s.suggested(key) {
+        let label = s.mailbox_label(&key.0, to);
+        let (pressed, shown) = (key.clone(), to.to_owned());
+        tags = tags.child(
+            row()
+                // Of its destination too: a press held while that changes is no press on it.
+                .key(format!("suggested-{}-{to}", crate::state::row_key(key)))
+                .role("button")
+                .label(format!("Move to {label} (M)"))
+                .radius(3.0)
+                .hover(k.c.hover)
+                .on_press(move |s: &mut Mail| s.move_as_suggested(&pressed, &shown))
+                .shrink()
+                .child(shrinking_badge(format!("→ {}", shortened(&label)), k).a11y_hidden()),
+        );
+    }
+    tags
+}
+
+/// A badge like the kit's, whose text is cut short with "…" once its row has no room for it.
+fn shrinking_badge(label: String, k: &Kit) -> El {
+    row()
+        .center()
+        .h(16.0)
+        .px(4.0)
+        .radius(2.0)
+        .fill(k.c.layer_02)
+        .border(0.5, k.c.border_base)
+        .shrink()
+        .child(
+            text(label)
+                .font(TextStyle {
+                    line_height: 11.0,
+                    ..k.ty.small_medium
+                })
+                .color(k.c.text_muted)
+                .truncate(),
+        )
+}
+
+/// `label`, cut short with an ellipsis past what a tag in a message's row has room for.
+fn shortened(label: &str) -> String {
+    const MOST: usize = 24;
+    if label.chars().count() <= MOST {
+        return label.to_owned();
+    }
+    let kept: String = label.chars().take(MOST - 1).collect();
+    format!("{}…", kept.trim_end())
 }
 
 /// The list's column. Back from what covered it (a message, the settings, a message being
@@ -1168,6 +1237,16 @@ fn message_menu_moves(s: &Mail, m: &StoredMessage, menu: &MessageMenu, mut items
                 .submenu(times, menu.snooze_open)
                 .on_select(Mail::toggle_snooze_menu),
         );
+    }
+    let key = crate::state::message_key(m);
+    if let Some(to) = s.suggested(&key) {
+        let label = s.mailbox_label(account, to);
+        let shown = to.to_owned();
+        let suggested = move |s: &mut Mail| {
+            s.close_message_menu();
+            s.move_as_suggested(&key, &shown);
+        };
+        items = items.item(MenuItem::new(format!("Move to {label}")).on_select(suggested));
     }
     if let Some(archive) = archive {
         items = items.item(MenuItem::new("Archive").on_select(move_to(&archive.name)));
@@ -2211,6 +2290,35 @@ fn general_settings(s: &Mail, k: &Kit, page: El, layer: &mut Vec<El>) -> El {
     page.child(setting_section(k, "Appearance", None, row().child(theme)))
         .child(setting_section(
             k,
+            "Sorting mail",
+            Some(
+                "Postden learns, on this computer, from what you do with your mail: where you \
+                 file it, what you keep in your inbox, what you star or delete, and who you \
+                 write to. Once it's often right, inbox mail that looks like it belongs in a \
+                 mailbox is tagged with it (press the tag, or M, to move it there), and mail \
+                 that looks important says so. Nothing leaves your computer, unless you export \
+                 what it learned with your accounts.",
+            ),
+            row()
+                .gap(12.0)
+                .center_y()
+                .child(
+                    Switch::new(s.settings.sort_mail)
+                        .label("Sort my inbox")
+                        .on_toggle(|s: &mut Mail| s.set_sort_mail(!s.settings.sort_mail))
+                        .build(k)
+                        .key("sort-mail"),
+                )
+                .child(
+                    Button::new("Forget what it learned")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(Mail::forget_sorting)
+                        .build(k)
+                        .key("forget-sorting"),
+                ),
+        ))
+        .child(setting_section(
+            k,
             "Notifications",
             Some(
                 "Postden tells you about new mail in your inboxes while its window isn't in \
@@ -2946,6 +3054,26 @@ fn export_form(t: &Transfer, k: &Kit) -> El {
             .color(k.c.text_muted)
             .wrap(),
         )
+        .child(
+            Checkbox::new(t.with_sorting)
+                .label("Include what sorting learned")
+                .disabled(t.busy)
+                .on_toggle(|s: &mut Mail| s.transfer.with_sorting = !s.transfer.with_sorting)
+                .build(k)
+                .key("export-sorting"),
+        )
+        .child(
+            text(
+                "So the other computer sorts mail as this one does from the start. It tells \
+                 much of your mail: the words it learned are those of your mail, and who it's \
+                 from, and it lists each message it learned from, by its Message-ID, with where \
+                 it went and whether it mattered."
+                    .to_owned(),
+            )
+            .font(k.ty.small)
+            .color(k.c.text_muted)
+            .wrap(),
+        )
         .child(transfer_actions(t, k, go))
 }
 
@@ -3121,17 +3249,27 @@ fn review(t: &Transfer, k: &Kit) -> El {
         .on_press(Mail::import_profile)
         .build(k)
         .key("import-confirm");
-    section
-        .child(
-            Switch::new(t.options.settings)
-                .label("Use its settings")
+    section = section.child(
+        Switch::new(t.options.settings)
+            .label("Use its settings")
+            .on_toggle(|s: &mut Mail| {
+                s.transfer.options.settings = !s.transfer.options.settings;
+            })
+            .build(k)
+            .key("import-settings"),
+    );
+    if t.profile.as_ref().is_some_and(|p| p.sorting.is_some()) {
+        section = section.child(
+            Switch::new(t.options.sorting)
+                .label("Use what its sorting learned, in place of this computer's")
                 .on_toggle(|s: &mut Mail| {
-                    s.transfer.options.settings = !s.transfer.options.settings;
+                    s.transfer.options.sorting = !s.transfer.options.sorting;
                 })
                 .build(k)
-                .key("import-settings"),
-        )
-        .child(transfer_actions(t, k, go))
+                .key("import-sorting"),
+        );
+    }
+    section.child(transfer_actions(t, k, go))
 }
 
 /// Which updates to get: releases only (Stable), or every nightly build of main too.

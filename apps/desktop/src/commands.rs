@@ -114,6 +114,10 @@ pub(crate) enum Command {
     ToggleStar,
     /// Moves the focused message to its account's Archive.
     Archive,
+    /// Moves the focused message to where sorting suggests it goes: the message and the mailbox
+    /// it was offered for, while that's still what's suggested. Of both, its row in the palette is
+    /// another once either changes, so a press held meanwhile isn't one on it.
+    MoveAsSuggested(MessageKey, String),
     /// Deletes the focused message: moves it to its account's Trash.
     Trash,
     /// Moves the focused message to its account's Junk mailbox.
@@ -190,6 +194,7 @@ impl Command {
             Self::ToggleSeen => vec![Key('u'), Shortcut::shift_cmd('u')],
             Self::ToggleStar => vec![Key('s'), Shortcut::shift_cmd('l')],
             Self::Archive => vec![Key('e')],
+            Self::MoveAsSuggested(..) => vec![Key('m')],
             Self::Trash => vec![Key('#')],
             // Only one of them applies at a time: in Junk, the same keys take a message out.
             Self::Spam | Self::NotSpam => vec![Key('!'), Shortcut::shift_cmd('j')],
@@ -264,6 +269,9 @@ impl Command {
                 _ => "Star".into(),
             },
             Self::Archive => "Archive".into(),
+            Self::MoveAsSuggested((account, ..), to) => {
+                format!("Move to {}", s.mailbox_label(account, to))
+            }
             Self::Trash => "Delete".into(),
             Self::Spam => "Mark as spam".into(),
             Self::NotSpam => "Not spam".into(),
@@ -327,6 +335,7 @@ impl Command {
             Self::ToggleSeen => s.toggle_seen(),
             Self::ToggleStar => s.toggle_star(),
             Self::Archive => s.move_focused_to(Role::Archive),
+            Self::MoveAsSuggested(key, to) => s.move_as_suggested(&key, &to),
             Self::Trash => s.move_focused_to(Role::Trash),
             Self::Spam => s.move_focused_to(Role::Junk),
             Self::NotSpam => s.move_focused_to(Role::Inbox),
@@ -440,6 +449,9 @@ pub(crate) fn available(s: &Mail) -> Vec<Command> {
         add(replies, Command::ReplyAll);
         add(replies, Command::Forward);
         add(can_move_to(s, m, Role::Archive), Command::Archive);
+        if let Some(to) = s.suggested(&key) {
+            add(true, Command::MoveAsSuggested(key.clone(), to.to_owned()));
+        }
         add(true, Command::ToggleSeen);
         add(true, Command::ToggleStar);
         add(snoozable(s, m), Command::PickSnooze);
@@ -1073,6 +1085,71 @@ mod tests {
             .unwrap()
             .retain(|m| m.role != Role::Inbox);
         assert!(!available(&s).contains(&Command::NotSpam));
+    }
+
+    #[test]
+    fn m_moves_a_message_where_sorting_suggests() {
+        let mut s = listing();
+        s.cursor = Some(at(2));
+        assert!(
+            !available(&s)
+                .iter()
+                .any(|c| matches!(c, Command::MoveAsSuggested(..))),
+            "nothing suggested yet"
+        );
+        let suggested = postden_app::Tags {
+            important: false,
+            suggested: Some("Archive".into()),
+        };
+        let sorted = postden_app::Sorted {
+            tags: [(at(2), suggested)].into(),
+            ..postden_app::Sorted::default()
+        };
+        s.sorted(0, sorted);
+        assert!(available(&s).contains(&Command::MoveAsSuggested(at(2), "Archive".into())));
+        assert_eq!(
+            Command::MoveAsSuggested(at(2), "Archive".into()).title(&s),
+            "Move to Archive"
+        );
+        assert!(
+            s.run_shortcut(&key("m"), &mut Tx::default()),
+            "M is taken for the move"
+        );
+        s.cursor = Some(at(1));
+        assert!(
+            !available(&s)
+                .iter()
+                .any(|c| matches!(c, Command::MoveAsSuggested(..))),
+            "nothing suggested for the others"
+        );
+    }
+
+    #[test]
+    fn a_menu_whose_suggestion_changed_closes() {
+        let mut s = listing();
+        let (account, mailbox, uid) = at(2);
+        let suggesting = |to: &str| postden_app::Sorted {
+            tags: [(
+                at(2),
+                postden_app::Tags {
+                    important: false,
+                    suggested: Some(to.into()),
+                },
+            )]
+            .into(),
+            ..postden_app::Sorted::default()
+        };
+        s.sorted(0, suggesting("Archive"));
+        s.open_message_menu(
+            &account,
+            &mailbox,
+            uid,
+            rune::PointerPress { x: 0.0, y: 0.0 },
+        );
+        s.sorted(0, suggesting("Archive"));
+        assert!(s.message_menu.is_some(), "the same, it stays");
+        s.sorted(0, suggesting("Receipts"));
+        assert!(s.message_menu.is_none(), "its items would have moved");
     }
 
     #[test]

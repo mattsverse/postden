@@ -39,6 +39,8 @@ pub(crate) struct Transfer {
     pub(crate) passphrase: TextEdit,
     /// The passphrase again, when exporting, to catch a typo that would lock the file for good.
     pub(crate) confirm: TextEdit,
+    /// Whether what sorting mail learned is exported too.
+    pub(crate) with_sorting: bool,
     /// Encrypting, decrypting or writing is under way.
     pub(crate) busy: bool,
     pub(crate) error: Option<String>,
@@ -111,8 +113,8 @@ impl Transfer {
         }
     }
 
-    /// Shows what an unlocked profile holds. Its settings are used, and accounts set up already
-    /// kept, unless changed.
+    /// Shows what an unlocked profile holds. Its settings and what its sorting learned are used,
+    /// and accounts set up already kept, unless changed.
     pub(crate) fn review(profile: Profile, existing: HashSet<String>) -> Self {
         Self {
             step: Step::Review,
@@ -121,6 +123,7 @@ impl Transfer {
             options: ImportOptions {
                 replace_accounts: false,
                 settings: true,
+                sorting: true,
             },
             ..Self::default()
         }

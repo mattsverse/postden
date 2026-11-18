@@ -10,7 +10,11 @@ use std::time::{Duration, Instant};
 use postden_core::account::{Account, Auth, Security, Server, Signature};
 pub use postden_core::message::MailboxState;
 use postden_core::message::{Address, Body, Envelope, InlineImage, Mailbox, Role};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+
+mod sorting;
+
+pub use sorting::{Sorting, SortingChanges, SortingClass, SortingTaught, SortingWeight};
 
 /// Why a [`Store`] call failed.
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +35,20 @@ pub struct StoredMessage {
     pub account: String,
     pub mailbox: String,
     pub envelope: Envelope,
+}
+
+/// A cached message as [`Store::learning_messages`] gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Learnable {
+    pub message: StoredMessage,
+    /// The UIDVALIDITY its mailbox is cached under: its UID names it only while it holds.
+    pub uid_validity: u32,
+    /// What its mailbox is for; but where an archive, such as Gmail's All Mail, lists it while
+    /// it's snoozed, or once it was moved elsewhere ([`Store::put_away`]): the Trash or Junk if
+    /// that's where, else [`Role::Snoozed`], as it says nothing of where it went.
+    pub role: Role,
+    /// The beginning of its body's text, if it was downloaded.
+    pub text: Option<String>,
 }
 
 /// A snoozed message, waiting in an account's Snoozed mailbox until it's due back in the inbox.
@@ -161,6 +179,20 @@ CREATE TABLE IF NOT EXISTS signature_images (
     PRIMARY KEY (account, cid)
 ) STRICT;
 
+-- Messages moved elsewhere than an archive, by Message-ID, with where they went and its role:
+-- where an archive still lists one, as Gmail's All Mail does, it wasn't archived but put away
+-- there, as the Trash, Junk or a folder, while that's still listed: for a week after it was
+-- noted, as by then where it went is cached, and it may have moved since, unseen.
+CREATE TABLE IF NOT EXISTS put_away (
+    account    TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL,
+    mailbox    TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    -- When it was noted, as Unix seconds.
+    noted      INTEGER NOT NULL,
+    PRIMARY KEY (account, message_id)
+) STRICT;
+
 -- Snoozed messages, by Message-ID, and when each is due back in the inbox, as Unix seconds.
 CREATE TABLE IF NOT EXISTS snoozes (
     account    TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -178,10 +210,45 @@ CREATE TABLE IF NOT EXISTS contacts (
     sent      INTEGER NOT NULL,
     last_sent INTEGER NOT NULL
 ) STRICT;
+
+-- What sorting mail learned: each class of each of an account's models, as postden_ai keeps it.
+CREATE TABLE IF NOT EXISTS sorting_classes (
+    id       INTEGER PRIMARY KEY,
+    account  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    model    TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    messages INTEGER NOT NULL,
+    guessed  INTEGER NOT NULL,
+    correct  INTEGER NOT NULL,
+    UNIQUE (account, model, name)
+) STRICT;
+
+-- What each class learned of each feature it has a weight for: FTRL-Proximal's z and n.
+CREATE TABLE IF NOT EXISTS sorting_weights (
+    class   INTEGER NOT NULL REFERENCES sorting_classes(id) ON DELETE CASCADE,
+    feature INTEGER NOT NULL,
+    z       REAL NOT NULL,
+    n       REAL NOT NULL,
+    PRIMARY KEY (class, feature)
+) STRICT, WITHOUT ROWID;
+
+-- What each message, by Message-ID, was last taught as, for each of an account's models.
+CREATE TABLE IF NOT EXISTS sorting_taught (
+    account    TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    model      TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    class      TEXT NOT NULL,
+    PRIMARY KEY (account, model, message_id)
+) STRICT;
 ";
 
 /// The schema version [`SCHEMA`] creates, kept in `PRAGMA user_version`.
 const VERSION: i64 = 6;
+
+/// How long, in seconds, what [`Store::put_away_message`] noted of a message holds: a week. Its
+/// copy where it went is cached by then, and says so itself; and moved since by another mail
+/// app, it isn't there anymore.
+const PUT_AWAY_HOLDS: i64 = 7 * 24 * 60 * 60;
 
 /// Columns added since version 0, for databases created before them. Tables added since are
 /// created by [`SCHEMA`] itself.
@@ -201,6 +268,30 @@ const MIGRATIONS: [(&str, &str, &str); 7] = [
 ];
 
 const MESSAGE_COLUMNS: &str = "m.account, m.mailbox, m.uid, m.message_id, m.from_name, m.from_email, m.subject, m.date, m.seen, m.to_list, m.flagged";
+
+/// A transaction that takes the write lock at once, for one that reads what it then writes on:
+/// begun deferred, another connection's write in between (the sorter's, the mail watchers')
+/// would fail it.
+fn immediate(conn: &mut Connection) -> Result<Transaction<'_>> {
+    Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
+}
+
+/// Whether `account` reads the mailboxes the account with its id saved reads, if there's one:
+/// on the same IMAP server, port and username.
+fn same_mailboxes(conn: &Connection, account: &Account) -> Result<bool> {
+    let mailbox_owner: Option<(String, u16, String)> = conn
+        .query_row(
+            "SELECT imap_host, imap_port, imap_username FROM accounts WHERE id = ?1",
+            [&account.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    Ok(mailbox_owner.is_none_or(|(host, port, username)| {
+        host.eq_ignore_ascii_case(&account.imap.host)
+            && port == account.imap.port
+            && username == account.imap.username
+    }))
+}
 
 /// A message, by account, mailbox and UID, or a whole mailbox with `None`.
 type Touched = (String, String, Option<u32>);
@@ -322,7 +413,15 @@ impl Store {
     ///
     /// Returns an error when the write fails.
     pub fn save_account(&self, account: &Account) -> Result<()> {
-        upsert_account(&self.conn, account)
+        // Immediate: what's read is written on, and the sorter may write meanwhile.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        // What sorting learned of where another server's or user's mail goes is of no use.
+        if !same_mailboxes(&tx, account)? {
+            sorting::forget_sorting_of(&tx, &account.id)?;
+        }
+        upsert_account(&tx, account)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Adds `account`, or replaces the account with the same id entirely: its settings, its
@@ -338,20 +437,8 @@ impl Store {
         account: &Account,
         signature: Option<&Signature>,
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        let mailbox_owner: Option<(String, u16, String)> = tx
-            .query_row(
-                "SELECT imap_host, imap_port, imap_username FROM accounts WHERE id = ?1",
-                [&account.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let same_mailboxes = mailbox_owner.is_none_or(|(host, port, username)| {
-            host.eq_ignore_ascii_case(&account.imap.host)
-                && port == account.imap.port
-                && username == account.imap.username
-        });
-        if !same_mailboxes {
+        let tx = immediate(&mut self.conn)?;
+        if !same_mailboxes(&tx, account)? {
             // Another server's or user's mailboxes: what's cached of the old ones, down to its
             // UIDs and UIDVALIDITY, says nothing about the new ones. Messages and bodies go with
             // their mailbox. Snoozes too: they're of messages on the old server.
@@ -361,6 +448,9 @@ impl Store {
                 [&account.id],
             )?;
             tx.execute("DELETE FROM snoozes WHERE account = ?1", [&account.id])?;
+            tx.execute("DELETE FROM put_away WHERE account = ?1", [&account.id])?;
+            // And what sorting learned of where its mail goes.
+            sorting::forget_sorting_of(&tx, &account.id)?;
         }
         upsert_account(&tx, account)?;
         tx.execute(
@@ -472,10 +562,14 @@ impl Store {
     ///
     /// Returns an error when the write fails.
     pub fn remove_account(&self, id: &str) -> Result<bool> {
-        Ok(self
-            .conn
-            .execute("DELETE FROM accounts WHERE id = ?1", [id])?
-            > 0)
+        let tx = self.conn.unchecked_transaction()?;
+        let removed = tx.execute("DELETE FROM accounts WHERE id = ?1", [id])? > 0;
+        // What sorting learned of it goes along, from the sorter's memory too.
+        if removed {
+            sorting::forget_sorting_of(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 
     /// What's cached of `mailbox`, or `None` if it was never synced.
@@ -570,6 +664,12 @@ impl Store {
              AND name NOT IN (SELECT name FROM listed_mailboxes WHERE account = ?1)",
             [account],
         )?;
+        // Mail put away in a mailbox gone says nothing of one made again under its name.
+        tx.execute(
+            "DELETE FROM put_away WHERE account = ?1
+             AND mailbox NOT IN (SELECT name FROM listed_mailboxes WHERE account = ?1)",
+            [account],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -622,7 +722,7 @@ impl Store {
         uid_validity: u32,
         messages: &[Envelope],
     ) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = immediate(&mut self.conn)?;
         if role != Role::Other {
             tx.execute(
                 "DELETE FROM mailboxes WHERE account = ?1 AND role = ?2 AND name != ?3",
@@ -672,7 +772,7 @@ impl Store {
         uid_validity: u32,
         messages: &[Envelope],
     ) -> Result<bool> {
-        let tx = self.conn.transaction()?;
+        let tx = immediate(&mut self.conn)?;
         let cached: Option<u32> = tx
             .query_row(
                 "SELECT uid_validity FROM mailboxes WHERE account = ?1 AND name = ?2",
@@ -765,7 +865,7 @@ impl Store {
             .collect();
         let mut messages = kept(&self.removed, account, mailbox, messages);
         self.with_written(account, mailbox, (uid_validity, asked), &mut messages);
-        let tx = self.conn.transaction()?;
+        let tx = immediate(&mut self.conn)?;
         let current: Option<u32> = tx
             .query_row(
                 "SELECT uid_validity FROM mailboxes WHERE account = ?1 AND name = ?2",
@@ -961,7 +1061,7 @@ impl Store {
                 (uid, self.written_since(account, mailbox, at, asked))
             })
             .collect();
-        let tx = self.conn.transaction()?;
+        let tx = immediate(&mut self.conn)?;
         let cached: Option<u32> = tx
             .query_row(
                 "SELECT uid_validity FROM mailboxes WHERE account = ?1 AND name = ?2",
@@ -1018,6 +1118,58 @@ impl Store {
         self.removed
             .insert((account.to_owned(), mailbox.to_owned(), uid));
         Ok(removed)
+    }
+
+    /// Notes that the message `uid` in `mailbox` was moved to the mailbox `to`, as
+    /// [`Store::put_away_message`] does by its Message-ID, if it has one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read or a write fails.
+    pub fn put_away(&mut self, account: &str, mailbox: &str, uid: u32, to: &str) -> Result<()> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT message_id FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+                params![account, mailbox, uid],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        id.map_or(Ok(()), |id| self.put_away_message(account, &id, to))
+    }
+
+    /// Notes that the message with the Message-ID `message_id` was moved to the mailbox `to`: if
+    /// that isn't an archive, as listed, a copy an archive still lists, as Gmail's All Mail does,
+    /// was put away there rather than archived, while `to` is listed. Moved to an archive, that's
+    /// forgotten. What's noted holds for [`PUT_AWAY_HOLDS`], then goes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a write fails.
+    pub fn put_away_message(&mut self, account: &str, message_id: &str, to: &str) -> Result<()> {
+        let tx = immediate(&mut self.conn)?;
+        tx.execute(
+            "DELETE FROM put_away WHERE account = ?1 AND message_id = ?2",
+            [account, message_id],
+        )?;
+        // As listed, so even before it's synced; as synced, if it isn't listed (yet).
+        tx.execute(
+            "INSERT INTO put_away (account, message_id, mailbox, role, noted)
+             SELECT ?1, ?2, ?3, role, unixepoch() FROM (
+                SELECT role FROM listed_mailboxes WHERE account = ?1 AND name = ?3
+                UNION ALL
+                SELECT role FROM mailboxes WHERE account = ?1 AND name = ?3
+                LIMIT 1)
+             WHERE role != 'archive'",
+            [account, message_id, to],
+        )?;
+        tx.execute(
+            "DELETE FROM put_away WHERE account = ?1 AND noted < unixepoch() - ?2",
+            params![account, PUT_AWAY_HOLDS],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Caches a message's downloaded body, `kept` when that's because it was opened: then
@@ -1193,6 +1345,66 @@ impl Store {
     /// Returns an error when the read fails.
     pub fn recent_messages(&self, role: Role, limit: usize) -> Result<Vec<StoredMessage>> {
         self.newest(Scope::Role(role), false, limit)
+    }
+
+    /// Every cached message, with its mailbox's UIDVALIDITY and role (as [`Learnable::role`]
+    /// says), and the first `text_chars` characters of its body's text, if it
+    /// was downloaded: what sorting mail learns from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails or a row is corrupt.
+    pub fn learning_messages(&self, text_chars: usize) -> Result<Vec<Learnable>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS},
+                CASE WHEN b.role != 'archive' THEN b.role
+                    WHEN EXISTS (
+                        SELECT 1 FROM snoozes s
+                        WHERE s.account = m.account AND s.message_id = m.message_id
+                    ) THEN 'snoozed'
+                    -- Put away elsewhere: the Trash or Junk says so; elsewhere, its copy there
+                    -- does once it's cached, and this one says nothing meanwhile.
+                    ELSE COALESCE((
+                        SELECT CASE WHEN p.role IN ('trash', 'junk') THEN p.role
+                            ELSE 'snoozed' END
+                        FROM put_away p
+                        WHERE p.account = m.account AND p.message_id = m.message_id
+                            AND p.noted >= unixepoch() - {PUT_AWAY_HOLDS}
+                            AND (EXISTS (
+                                SELECT 1 FROM listed_mailboxes l
+                                WHERE l.account = p.account AND l.name = p.mailbox
+                            ) OR EXISTS (
+                                SELECT 1 FROM mailboxes d
+                                WHERE d.account = p.account AND d.name = p.mailbox
+                            ))
+                    ), b.role) END,
+                substr(t.text, 1, ?1), b.uid_validity
+             FROM messages m
+             JOIN mailboxes b ON b.account = m.account AND b.name = m.mailbox
+             LEFT JOIN bodies t
+                ON t.account = m.account AND t.mailbox = m.mailbox AND t.uid = m.uid"
+        ))?;
+        let text_chars = i64::try_from(text_chars).unwrap_or(i64::MAX);
+        let rows = stmt.query_map([text_chars], |row| {
+            Ok((
+                message_from_row(row)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, u32>(13)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (message, role, text, uid_validity) = row?;
+            let role = Role::from_name(&role)
+                .ok_or_else(|| Error::Corrupt(format!("unknown mailbox role {role:?}")))?;
+            Ok(Learnable {
+                message,
+                uid_validity,
+                role,
+                text,
+            })
+        })
+        .collect()
     }
 
     /// The `limit` most recent messages in one of the account's mailboxes, newest first.
@@ -1686,7 +1898,7 @@ fn kept(
 }
 
 fn insert_messages(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     account: &str,
     mailbox: &str,
     messages: &[Envelope],
@@ -1721,7 +1933,7 @@ fn insert_messages(
 mod tests {
     use super::*;
 
-    fn account(id: &str) -> Account {
+    pub(crate) fn account(id: &str) -> Account {
         let server = |host: &str, port, security| Server {
             host: host.into(),
             port,
@@ -2010,6 +2222,199 @@ mod tests {
             .unwrap();
         store.save_signature("me@example.com", None).unwrap();
         assert_eq!(store.signature("me@example.com").unwrap(), None);
+    }
+
+    #[test]
+    fn mail_to_learn_from_comes_with_its_role_and_the_start_of_its_text() {
+        let mut store = Store::open_in_memory().unwrap();
+        let me = "me@example.com";
+        store.save_account(&account(me)).unwrap();
+        store
+            .save_messages(me, "INBOX", Role::Inbox, 1, &[envelope(1, 10)])
+            .unwrap();
+        store
+            .save_messages(me, "Receipts", Role::Other, 7, &[envelope(2, 20)])
+            .unwrap();
+        store
+            .save_messages(me, "[Gmail]/All Mail", Role::Archive, 3, &[envelope(3, 30)])
+            .unwrap();
+        for snoozed in ["3@example.com", "1@example.com"] {
+            store
+                .snooze(&Snooze {
+                    account: me.into(),
+                    message_id: snoozed.into(),
+                    mailbox: "Snoozed".into(),
+                    until: 100,
+                })
+                .unwrap();
+        }
+        let body = Body {
+            text: "Thanks for your order".into(),
+            ..Body::default()
+        };
+        assert!(store.save_body(me, "INBOX", 1, &body, false).unwrap());
+        let mut learnable = store.learning_messages(6).unwrap();
+        learnable.sort_by_key(|l| l.message.envelope.uid);
+        let got: Vec<_> = learnable
+            .iter()
+            .map(|l| {
+                let m = l.message.mailbox.as_str();
+                (m, l.uid_validity, l.role, l.text.as_deref())
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("INBOX", 1, Role::Inbox, Some("Thanks")),
+                ("Receipts", 7, Role::Other, None),
+                ("[Gmail]/All Mail", 3, Role::Snoozed, None),
+            ],
+            "each with its mailbox's UIDVALIDITY and role, snoozed in an archive, not the inbox it's \
+             still in, and the text downloaded, cut"
+        );
+    }
+
+    const ME: &str = "me@example.com";
+
+    /// A Gmail account's store, its Trash and a Receipts label listed but not synced, as `list`
+    /// says, with the inbox's message 1 also in All Mail under UID 9.
+    fn gmail(list: &[Mailbox]) -> Store {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account(ME)).unwrap();
+        store
+            .save_messages(ME, "INBOX", Role::Inbox, 1, &[envelope(1, 10)])
+            .unwrap();
+        store.save_mailbox_list(ME, list).unwrap();
+        let mut copy = envelope(9, 10);
+        copy.message_id = Some("1@example.com".into());
+        store
+            .save_messages(ME, "[Gmail]/All Mail", Role::Archive, 1, &[copy])
+            .unwrap();
+        store
+    }
+
+    fn gmail_list() -> [Mailbox; 4] {
+        let listed = |name: &str, role| Mailbox {
+            name: name.into(),
+            delimiter: Some("/".into()),
+            role,
+        };
+        [
+            listed("INBOX", Role::Inbox),
+            listed("[Gmail]/All Mail", Role::Archive),
+            listed("[Gmail]/Trash", Role::Trash),
+            listed("Receipts", Role::Other),
+        ]
+    }
+
+    /// How All Mail's copy with `uid` is learned from.
+    fn all_mail(store: &Store, uid: u32) -> Option<Role> {
+        store
+            .learning_messages(0)
+            .unwrap()
+            .into_iter()
+            .find(|l| l.message.mailbox == "[Gmail]/All Mail" && l.message.envelope.uid == uid)
+            .map(|l| l.role)
+    }
+
+    #[test]
+    fn mail_put_away_isnt_archived_where_all_mail_still_lists_it() {
+        let mut store = gmail(&gmail_list());
+        assert_eq!(all_mail(&store, 9), Some(Role::Archive));
+        store.put_away(ME, "INBOX", 1, "[Gmail]/Trash").unwrap();
+        assert!(store.remove_message(ME, "INBOX", 1).unwrap());
+        assert_eq!(
+            all_mail(&store, 9),
+            Some(Role::Trash),
+            "deleted, not archived"
+        );
+        store
+            .put_away_message(ME, "1@example.com", "INBOX")
+            .unwrap();
+        assert_eq!(
+            all_mail(&store, 9),
+            Some(Role::Snoozed),
+            "moved back to the inbox by undoing, which says so once its copy is cached"
+        );
+        store
+            .put_away_message(ME, "1@example.com", "[Gmail]/Trash")
+            .unwrap();
+        assert_eq!(all_mail(&store, 9), Some(Role::Trash), "and deleted again");
+        store
+            .put_away_message(ME, "1@example.com", "Receipts")
+            .unwrap();
+        assert_eq!(
+            all_mail(&store, 9),
+            Some(Role::Snoozed),
+            "filed in a folder, not archived: that copy says where once it's cached"
+        );
+        store
+            .put_away_message(ME, "1@example.com", "[Gmail]/All Mail")
+            .unwrap();
+        assert_eq!(all_mail(&store, 9), Some(Role::Archive), "archived since");
+    }
+
+    #[test]
+    fn mail_filed_in_a_folder_isnt_archived_while_the_folder_is_there() {
+        let list = gmail_list();
+        let mut store = gmail(&list);
+        store
+            .put_away_message(ME, "1@example.com", "Receipts")
+            .unwrap();
+        // A message just in, filed before its other copies are cached, then another: what was
+        // noted of the first is kept all the same, for when they are.
+        store
+            .save_messages(
+                ME,
+                "INBOX",
+                Role::Inbox,
+                1,
+                &[envelope(3, 10), envelope(5, 10)],
+            )
+            .unwrap();
+        for uid in [3, 5] {
+            store.put_away(ME, "INBOX", uid, "Receipts").unwrap();
+            assert!(store.remove_message(ME, "INBOX", uid).unwrap());
+        }
+        let mut later = envelope(4, 10);
+        later.message_id = Some("3@example.com".into());
+        store
+            .save_messages(ME, "[Gmail]/All Mail", Role::Archive, 1, &[later])
+            .unwrap();
+        assert_eq!(all_mail(&store, 4), Some(Role::Snoozed), "both filed");
+        assert_eq!(all_mail(&store, 9), Some(Role::Snoozed));
+        // The folder gone from the server, its copies with it: All Mail's is archived now, and
+        // stays so once a folder of the same name is made again.
+        store.save_mailbox_list(ME, &list[..3]).unwrap();
+        assert_eq!(
+            all_mail(&store, 9),
+            Some(Role::Archive),
+            "the folder's gone"
+        );
+        store.save_mailbox_list(ME, &list).unwrap();
+        assert_eq!(
+            all_mail(&store, 9),
+            Some(Role::Archive),
+            "another folder now"
+        );
+    }
+
+    #[test]
+    fn what_was_noted_of_mail_put_away_holds_a_week() {
+        let mut store = gmail(&gmail_list());
+        store
+            .put_away_message(ME, "1@example.com", "Receipts")
+            .unwrap();
+        assert_eq!(all_mail(&store, 9), Some(Role::Snoozed));
+        // Moved since by another mail app, it may be archived: a week on, it's learned as such.
+        store
+            .conn
+            .execute(
+                "UPDATE put_away SET noted = noted - ?1 - 1",
+                [PUT_AWAY_HOLDS],
+            )
+            .unwrap();
+        assert_eq!(all_mail(&store, 9), Some(Role::Archive));
     }
 
     #[test]
