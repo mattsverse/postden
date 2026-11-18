@@ -3054,8 +3054,8 @@ impl Mail {
 
     /// Opens System Settings where Postden can be given Full Disk Access. macOS can't be asked
     /// for it any other way.
-    pub(crate) fn open_full_disk_access(&mut self, tx: &mut Tx) {
-        if let Err(e) = tx.open_url(import::FULL_DISK_ACCESS_SETTINGS) {
+    pub(crate) fn open_full_disk_access(&mut self) {
+        if let Err(e) = import::open_full_disk_access_settings() {
             self.form.error = Some(format!("Couldn't open System Settings: {e}"));
         }
     }
