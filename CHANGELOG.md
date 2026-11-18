@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.8.0](https://github.com/mattsverse/postden/compare/v0.7.0...v0.8.0) (2026-11-18)
+
+
+### Features
+
+* add a nightly release track ([42a190b](https://github.com/mattsverse/postden/commit/42a190ba8d54576efdfa4d1bc88cb838bb8881ec))
+* **app:** read accounts set up in Spark ([9c92051](https://github.com/mattsverse/postden/commit/9c92051c2b64e31b571b09eb77899f776e6937ad))
+* **desktop:** set up accounts from Spark in the add-account form ([b8d290a](https://github.com/mattsverse/postden/commit/b8d290a7ba81146e18615d8c56b6482d78abadcd))
+* take mail out of spam, and mark spam for the server's filter ([2937538](https://github.com/mattsverse/postden/commit/29375380231a050914901f31a25798755bc856e9))
+
 ## [0.7.0](https://github.com/mattsverse/postden/compare/v0.6.0...v0.7.0) (2026-11-18)
 
 
