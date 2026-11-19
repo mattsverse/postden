@@ -12,9 +12,11 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use jiff::Timestamp;
-pub use postden_ai::Tags;
-use postden_ai::{Class, Example, FEATURES, Kind, Learning, Weight, sort};
-use postden_store::{Sorting, SortingChanges, SortingClass, SortingTaught, SortingWeight, Store};
+use postden_ai::{Class, Example, FEATURES, Kind, Learning, SETTLED_AFTER, Weight, sort};
+pub use postden_ai::{Tags, is_filed_in};
+use postden_store::{
+    AutosortState, Sorting, SortingChanges, SortingClass, SortingTaught, SortingWeight, Store,
+};
 
 use crate::Result;
 use crate::settings::Settings;
@@ -32,6 +34,20 @@ pub struct Sorted {
     /// The UIDVALIDITY each of their mailboxes was cached under, by account and mailbox: their
     /// UIDs name the messages tagged only while it holds.
     pub uid_validity: HashMap<(String, String), u32>,
+    /// The tagged messages to move by themselves to where they're suggested to go, as that's a
+    /// mailbox autosorted to, by account, mailbox and UID, each with its Message-ID.
+    pub autosort: Vec<Autosort>,
+}
+
+/// An inbox message to move by itself to where sorting says it goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Autosort {
+    /// The message, by account, mailbox and UID.
+    pub key: (String, String, u32),
+    /// Its Message-ID, which autosort notes it moved by, so it's moved once.
+    pub message_id: String,
+    /// Where it goes: the mailbox it's suggested to go to.
+    pub to: String,
 }
 
 /// Learns where mail goes and what matters from the mail cached, in the background.
@@ -127,7 +143,40 @@ impl Learner {
                 .collect();
             mailboxes.insert(account.id, names);
         }
+        // Read before the mail: a move landing in between leaves the message under way here,
+        // which teaches nothing, rather than moved while still in the inbox, which would teach
+        // that it was moved back.
+        let autosorted = store.autosorted()?;
         let cached = store.learning_messages(TEXT_CHARS)?;
+        let cached_in: HashSet<(&str, &str, &str)> = cached
+            .iter()
+            .filter_map(|l| {
+                let m = &l.message;
+                Some((
+                    m.account.as_str(),
+                    m.envelope.message_id.as_deref()?,
+                    m.mailbox.as_str(),
+                ))
+            })
+            .collect();
+        let autosorted_to = |account: &str, id: Option<&str>| {
+            let id = id?;
+            let a = autosorted.get(&(account.to_owned(), id.to_owned()))?;
+            // Refused, or kept, it stayed where it was: what's done with it since was done by
+            // hand. Whether it moved unknown, it did if it's where it was going.
+            let moved = match a.state {
+                AutosortState::Refused | AutosortState::Kept => return None,
+                AutosortState::Unknown if !cached_in.contains(&(account, id, &a.mailbox)) => {
+                    return None;
+                }
+                AutosortState::Moving => false,
+                AutosortState::Moved | AutosortState::Unknown => true,
+            };
+            Some(postden_ai::Autosorted {
+                to: &a.mailbox,
+                moved,
+            })
+        };
         let examples: Vec<Example<'_>> = cached
             .iter()
             .map(|l| Example {
@@ -136,6 +185,10 @@ impl Learner {
                 role: l.role,
                 envelope: &l.message.envelope,
                 text: l.text.as_deref(),
+                autosorted: autosorted_to(
+                    &l.message.account,
+                    l.message.envelope.message_id.as_deref(),
+                ),
             })
             .collect();
         let sorting = sort(&mut learning, &examples, &mailboxes, now);
@@ -145,13 +198,17 @@ impl Learner {
             // time.
             return Ok(None);
         }
-        self.kept = Some((generation, learning));
+        let autosort_to = store.autosort_mailboxes()?;
         let mut sorted = Sorted::default();
         for (l, tags) in cached.into_iter().zip(sorting.tags) {
             if tags.is_empty() {
                 continue;
             }
             let m = l.message;
+            let autosort = autosort(&learning, &autosort_to, &autosorted, &m, &tags, now);
+            if let Some(autosort) = autosort {
+                sorted.autosort.push(autosort);
+            }
             sorted
                 .uid_validity
                 .insert((m.account.clone(), m.mailbox.clone()), l.uid_validity);
@@ -159,8 +216,40 @@ impl Learner {
                 .tags
                 .insert((m.account, m.mailbox, m.envelope.uid), tags);
         }
+        self.kept = Some((generation, learning));
         Ok(Some(sorted))
     }
+}
+
+/// Whether to move the inbox message `m`, tagged with `tags`, by itself, and where: to where it's
+/// suggested to go, as that's one of `autosort_to`'s mailboxes. Only mail still waiting to be
+/// filed is: not mail that already stayed in the inbox long enough to be learned as staying, or
+/// that was moved back there, or that's older than that at `now` (Unix seconds) anyway; and
+/// not mail autosort moves, moved or tried to before, as in `autosorted`.
+fn autosort(
+    learning: &Learning,
+    autosort_to: &HashSet<(String, String)>,
+    autosorted: &HashMap<(String, String), postden_store::Autosorted>,
+    m: &postden_store::StoredMessage,
+    tags: &Tags,
+    now: i64,
+) -> Option<Autosort> {
+    let to = tags.suggested.as_ref()?;
+    let id = m.envelope.message_id.as_ref()?;
+    let account = &m.account;
+    let recent = m.envelope.date.is_some_and(|d| now - d < SETTLED_AFTER);
+    let waiting = recent
+        && learning
+            .accounts
+            .get(account)
+            .is_none_or(|l| !l.folders.taught.contains_key(id));
+    let wanted = autosort_to.contains(&(account.clone(), to.clone()));
+    let again = autosorted.contains_key(&(account.clone(), id.clone()));
+    (waiting && wanted && !again).then(|| Autosort {
+        key: (account.clone(), m.mailbox.clone(), m.envelope.uid),
+        message_id: id.clone(),
+        to: to.clone(),
+    })
 }
 
 /// What was learned, as `sorting` keeps it. What a newer Postden learned, of models this one
@@ -380,6 +469,83 @@ mod tests {
             "{sorted:?}"
         );
         assert_eq!(sorted.len(), 1, "only what has a tag: {sorted:?}");
+    }
+
+    #[test]
+    fn mail_is_autosorted_only_to_the_mailboxes_chosen() {
+        let mut store = Store::open_in_memory().unwrap();
+        let me = "me@example.com";
+        cache_receipts(&mut store, me);
+        let mut learner = Learner::default();
+        let sorted = learner.sort(&mut store, NOW).unwrap().unwrap();
+        assert!(sorted.autosort.is_empty(), "none chosen: {sorted:?}");
+        store.set_autosort(me, "Receipts", true).unwrap();
+        let sorted = learner.sort(&mut store, NOW).unwrap().unwrap();
+        assert_eq!(
+            sorted.autosort,
+            vec![Autosort {
+                key: receipt(me),
+                message_id: "30@example.com".into(),
+                to: "Receipts".into(),
+            }],
+            "only the receipt just in, not the mail kept in the inbox"
+        );
+    }
+
+    #[test]
+    fn mail_is_autosorted_once() {
+        let mut store = Store::open_in_memory().unwrap();
+        let me = "me@example.com";
+        cache_receipts(&mut store, me);
+        store.set_autosort(me, "Receipts", true).unwrap();
+        // Moved back to the inbox since: it stays there.
+        assert!(
+            store
+                .note_autosorted(me, "30@example.com", "Receipts")
+                .unwrap()
+        );
+        let sorted = Learner::default().sort(&mut store, NOW).unwrap().unwrap();
+        assert!(sorted.autosort.is_empty(), "{sorted:?}");
+    }
+
+    #[test]
+    fn mail_autosort_may_have_moved_before_a_restart_isnt_learned_from_where_it_went() {
+        let mut store = Store::open_in_memory().unwrap();
+        let me = "me@example.com";
+        cache_receipts(&mut store, me);
+        // Moved before the app quit, unanswered: it's in Receipts.
+        store
+            .note_autosorted(me, "30@example.com", "Receipts")
+            .unwrap();
+        store.settle_autosorts().unwrap();
+        store.remove_message(me, "INBOX", 30).unwrap();
+        let moved = envelope(31, "orders@shop.example", "Your receipt", NOW - DAY);
+        let moved = Envelope {
+            message_id: Some("30@example.com".into()),
+            ..moved
+        };
+        store
+            .save_messages(me, "Receipts", Role::Other, 1, &[moved])
+            .unwrap();
+        let mut learner = Learner::default();
+        let _sorted = learner.sort(&mut store, NOW).unwrap().unwrap();
+        let taught = store.sorting().unwrap().taught;
+        assert!(
+            !taught.iter().any(|t| t.message_id == "30@example.com"),
+            "{taught:?}"
+        );
+    }
+
+    #[test]
+    fn mail_kept_in_the_inbox_isnt_autosorted() {
+        let mut store = Store::open_in_memory().unwrap();
+        let me = "me@example.com";
+        cache_receipts(&mut store, me);
+        store.set_autosort(me, "Receipts", true).unwrap();
+        // The receipt just in, left in the inbox for days, is learned as staying.
+        let later = NOW + 5 * DAY;
+        let sorted = Learner::default().sort(&mut store, later).unwrap().unwrap();
+        assert!(sorted.autosort.is_empty(), "{sorted:?}");
     }
 
     #[test]

@@ -14,7 +14,9 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehav
 
 mod sorting;
 
-pub use sorting::{Sorting, SortingChanges, SortingClass, SortingTaught, SortingWeight};
+pub use sorting::{
+    AutosortState, Autosorted, Sorting, SortingChanges, SortingClass, SortingTaught, SortingWeight,
+};
 
 /// Why a [`Store`] call failed.
 #[derive(Debug, thiserror::Error)]
@@ -240,6 +242,26 @@ CREATE TABLE IF NOT EXISTS sorting_taught (
     class      TEXT NOT NULL,
     PRIMARY KEY (account, model, message_id)
 ) STRICT;
+
+-- The mailboxes inbox mail is moved to by itself, once sorting is sure it belongs there.
+CREATE TABLE IF NOT EXISTS autosort_mailboxes (
+    account TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    name    TEXT NOT NULL,
+    PRIMARY KEY (account, name)
+) STRICT;
+
+-- The messages autosort moves or moved, by Message-ID, and where to: each is moved once, and
+-- isn't learned from as filed there by hand.
+CREATE TABLE IF NOT EXISTS autosorted (
+    account    TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL,
+    mailbox    TEXT NOT NULL,
+    -- 'moving' while it's on its way, 'moved' once the server moved it, 'refused' if it didn't,
+    -- 'unknown' if the app quit before it answered;
+    -- 'kept' for a message the user keeps in the inbox, as one snoozed there, never moved.
+    state      TEXT NOT NULL DEFAULT 'moving',
+    PRIMARY KEY (account, message_id)
+) STRICT;
 ";
 
 /// The schema version [`SCHEMA`] creates, kept in `PRAGMA user_version`.
@@ -418,6 +440,8 @@ impl Store {
         // What sorting learned of where another server's or user's mail goes is of no use.
         if !same_mailboxes(&tx, account)? {
             sorting::forget_sorting_of(&tx, &account.id)?;
+            // Nor are the mailboxes it autosorted to, which are another server's or user's.
+            sorting::forget_autosort_of(&tx, &account.id)?;
         }
         upsert_account(&tx, account)?;
         tx.commit()?;
@@ -449,8 +473,9 @@ impl Store {
             )?;
             tx.execute("DELETE FROM snoozes WHERE account = ?1", [&account.id])?;
             tx.execute("DELETE FROM put_away WHERE account = ?1", [&account.id])?;
-            // And what sorting learned of where its mail goes.
+            // And what sorting learned of where its mail goes, and where it autosorts to.
             sorting::forget_sorting_of(&tx, &account.id)?;
+            sorting::forget_autosort_of(&tx, &account.id)?;
         }
         upsert_account(&tx, account)?;
         tx.execute(

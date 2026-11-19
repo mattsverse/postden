@@ -51,7 +51,7 @@ pub use profile::{
     ImportOptions, Imported, MIN_PASSPHRASE, Profile, ProfileAccount, ProfileSettings, is_sealed,
 };
 pub use settings::{POLL_INTERVALS, PREFETCH_COUNTS, Settings, Theme};
-pub use sorting::{Sorted, Sorter, Tags};
+pub use sorting::{Autosort, Sorted, Sorter, Tags, is_filed_in};
 
 /// Why a Postden operation failed, phrased for the user.
 #[derive(Debug, thiserror::Error)]
