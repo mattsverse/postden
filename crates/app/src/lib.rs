@@ -81,8 +81,16 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// The platform data directory's name: debug builds keep their own, as a schema still changing on
+/// a branch would otherwise be written into the installed app's database, which then can't save.
+const DATA_DIR_NAME: &str = if cfg!(debug_assertions) {
+    "postden-dev"
+} else {
+    "postden"
+};
+
 /// The directory holding the local mail cache: `dir` if given, else `POSTDEN_DATA_DIR`, else the
-/// platform's data directory. It's created if missing.
+/// platform's data directory (a separate one for debug builds). It's created if missing.
 ///
 /// # Errors
 ///
@@ -90,7 +98,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub fn data_dir(dir: Option<PathBuf>) -> Result<PathBuf> {
     let dir = match dir.or_else(|| std::env::var_os("POSTDEN_DATA_DIR").map(PathBuf::from)) {
         Some(dir) => dir,
-        None => directories::ProjectDirs::from("", "", "postden")
+        None => directories::ProjectDirs::from("", "", DATA_DIR_NAME)
             .ok_or(Error::NoHome)?
             .data_dir()
             .to_owned(),
