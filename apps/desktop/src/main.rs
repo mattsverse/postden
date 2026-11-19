@@ -95,7 +95,7 @@ fn on_reopen(s: &mut Mail, _visible: bool, _: &mut Tx) -> bool {
 /// inbox). Z undoes the last of those, replies and forwards aside. G then I, T, E, H, #, ! or L
 /// goes to all inboxes, Sent, the account's Archive, Snoozed, Trash or Junk, or any mailbox. Keys
 /// on their own only count while no field takes what's typed, and none at all while a mailbox is
-/// being named, whose dialog Escape closes. Escape also closes the settings (or the update announcement over them, or an account's
+/// being named or confirmed deleted, whose dialog Escape closes. Escape also closes the settings (or the update announcement over them, or an account's
 /// settings with nothing unsaved), and in the search field ends the search and leaves the field.
 /// While writing, ⌘↩ sends, and ⌘K links the selected text, as it does in a signature. A key that
 /// gets here with the From picker open, as after Tab leaves its search, closes it; Escape only that.
@@ -117,6 +117,15 @@ fn on_key(s: &mut Mail, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if s.new_mailbox.open {
         if ev.key == Key::Escape {
             s.close_new_mailbox();
+            return true;
+        }
+        return false;
+    }
+    // Likewise confirming a mailbox is to be deleted, where Return presses Delete, the dialog's
+    // default button.
+    if s.delete_mailbox.mailbox.is_some() {
+        if ev.key == Key::Escape {
+            s.close_delete_mailbox();
             return true;
         }
         return false;

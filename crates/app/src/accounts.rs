@@ -213,7 +213,8 @@ pub async fn check_logins(account: &Account, login: &Login) -> Result<()> {
 ///
 /// With a read-only secret store (a password command), passwords aren't saved: they come from the
 /// command. Without an SMTP password, any stored one is deleted, so sending falls back to the IMAP
-/// password. Secrets are saved first, so an account is never listed without them.
+/// password. Secrets are saved first, so an account is never listed without them; if the
+/// settings then can't be saved, the secrets it had are put back, so it still logs in as it did.
 ///
 /// # Errors
 ///
@@ -226,6 +227,20 @@ pub fn save_account(
     login: &Login,
 ) -> Result<()> {
     let smtp_key = smtp_password_key(&account.id);
+    let before = if secrets.is_read_only() {
+        None
+    } else {
+        let keys = [
+            password_key(&account.id),
+            smtp_key.clone(),
+            oauth_key(&account.id),
+        ];
+        let read = keys.into_iter().map(|key| {
+            let secret = secrets.get(&key)?;
+            Ok((key, secret))
+        });
+        Some(read.collect::<std::result::Result<Vec<_>, SecretError>>()?)
+    };
     let written = match login {
         Login::Passwords(passwords) => secrets
             .set(&password_key(&account.id), &passwords.imap)
@@ -251,12 +266,19 @@ pub fn save_account(
             }
         }
     };
-    match written {
-        Ok(()) | Err(SecretError::ReadOnly) => {}
-        Err(e) => return Err(e.into()),
+    let saved = match written {
+        Ok(()) | Err(SecretError::ReadOnly) => store.save_account(account).map_err(Error::from),
+        Err(e) => Err(e.into()),
+    };
+    match (saved, before) {
+        (Err(e), Some(before)) => match crate::profile::write_secrets(secrets, &before) {
+            Ok(_) => Err(e),
+            Err(undo) => Err(Error::Invalid(format!(
+                "{e}; and its previous passwords couldn't be put back: {undo}"
+            ))),
+        },
+        (saved, _) => saved,
     }
-    store.save_account(account)?;
-    Ok(())
 }
 
 /// Removes an account, its cached mail and its stored passwords or tokens. Returns whether it

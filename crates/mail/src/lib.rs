@@ -48,6 +48,22 @@ pub enum Error {
     /// others.
     #[error("the server can't move messages")]
     CantMove,
+    /// The mailbox's name has a `"`, `\` or control character in it. The IMAP parser keeps a
+    /// quoted name's escapes, so it can't be told from another mailbox's, and deleting it could
+    /// delete that one.
+    #[error("{0} can't be deleted here: its name has a quote, backslash or control character")]
+    AmbiguousName(String),
+    /// The server doesn't list the mailbox as one that can be deleted: it's gone, the inbox, or
+    /// marked for special mail such as drafts or sent mail.
+    #[error("{name} can't be deleted: {why}")]
+    Undeletable { name: String, why: &'static str },
+    /// DELETE was sent, but the server didn't say how it went: the mailbox may be gone or not.
+    #[error("the server didn't say whether {name} was deleted: {source}")]
+    Unconfirmed {
+        name: String,
+        #[source]
+        source: Box<Self>,
+    },
     #[error("SMTP error: {0}")]
     Smtp(#[source] lettre::transport::smtp::Error),
     #[error("{0:?} isn't a valid email address")]
@@ -70,6 +86,23 @@ pub enum Error {
     /// Google no longer accepts the refresh token (revoked, expired, or the password changed).
     #[error("Google refused the sign-in ({0}); sign in with Google again")]
     SignInRefused(String),
+}
+
+impl Error {
+    /// Whether what was asked may have been done anyway: the server never answered, as when the
+    /// connection dropped or timed out once the command was sent, rather than refusing it.
+    #[must_use]
+    pub const fn may_have_happened(&self) -> bool {
+        matches!(
+            self,
+            Self::Unconfirmed { .. }
+                | Self::Timeout
+                | Self::Closed
+                | Self::Imap(
+                    async_imap::error::Error::Io(_) | async_imap::error::Error::ConnectionLost
+                )
+        )
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

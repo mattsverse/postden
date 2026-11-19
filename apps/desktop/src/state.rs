@@ -15,7 +15,7 @@ use postden_app::{
 use postden_core::account::{Account, Signature};
 use postden_core::message::{Address, Body, Envelope, Mailbox, Role};
 use postden_core::secrets::{SecretStore, SecretString};
-use postden_mail::imap::{Status, WatchConfig};
+use postden_mail::imap::{Status, WatchConfig, has_kept_name};
 use postden_secrets::Backend;
 use postden_store::{Scope, Store, StoredMessage};
 use postden_transfer::{Code, Offer};
@@ -124,6 +124,32 @@ pub(crate) struct NewMailbox {
     pub(crate) creating: Option<String>,
     /// Why the server refused the last name asked for.
     pub(crate) error: Option<String>,
+}
+
+/// The dialog confirming a mailbox is to be deleted, with the mail in it, opened from the
+/// mailbox's menu.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct DeleteMailbox {
+    /// The mailbox to delete, while the dialog is open.
+    pub(crate) mailbox: Option<MailboxKey>,
+    /// Its UIDVALIDITY when the dialog opened, if it was synced: the server deletes no other
+    /// mailbox under its name since.
+    uid_validity: Option<u32>,
+    /// Why it can't be deleted: it wasn't synced, or the server refused. The dialog then says so,
+    /// and only closes; opened again, it's on the mailbox as it is then.
+    pub(crate) error: Option<String>,
+}
+
+/// A mailbox asked to be deleted, whose server hasn't answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Deleting {
+    /// The number it was asked with.
+    id: u64,
+    /// The UIDVALIDITY it was asked under: another mailbox made under its name since has another.
+    uid_validity: u32,
+    /// The name it showed with, which its answer says it by: listed again meanwhile, it may be
+    /// gone from what's listed.
+    label: String,
 }
 
 /// A body's HTML as Markdown, to show, if it has HTML with something in it.
@@ -485,6 +511,12 @@ pub(crate) struct Mail {
     pub(crate) account_menu: Option<AccountMenu>,
     /// The dialog creating a mailbox.
     pub(crate) new_mailbox: NewMailbox,
+    pub(crate) delete_mailbox: DeleteMailbox,
+    /// Mailboxes asked to be deleted, whose server hasn't answered, whether their dialog is open
+    /// or not, each with the number it was asked with.
+    deleting_mailboxes: HashMap<MailboxKey, Deleting>,
+    /// The number the next mailbox asked to be deleted is asked with.
+    next_delete: u64,
     /// A reply asked for before its message was downloaded: the message, and whether to everyone.
     /// It starts once the message opens.
     pending_reply: Option<(MessageKey, Answer)>,
@@ -606,6 +638,9 @@ impl Mail {
             mailbox_menu: None,
             account_menu: None,
             new_mailbox: NewMailbox::default(),
+            delete_mailbox: DeleteMailbox::default(),
+            deleting_mailboxes: HashMap::new(),
+            next_delete: 0,
             pending_reply: None,
             moving: HashSet::new(),
             marking_seen: HashSet::new(),
@@ -1076,6 +1111,7 @@ impl Mail {
                 name,
                 result,
             } => self.mailbox_created(&account, &name, result),
+            update @ Update::MailboxDeleted { .. } => self.mailbox_deleted(update),
             Update::Searched {
                 id,
                 account,
@@ -1122,8 +1158,40 @@ impl Mail {
         let gone = |a: &str, m: &str| {
             a == account && !listed.is_some_and(|l| l.iter().any(|b| b.name == m))
         };
-        if self.search.forget_gone(gone) {
+        // Deleted, here or elsewhere, or renamed: what showed it shows the inbox instead.
+        let left = |a: &str, m: &str| !m.eq_ignore_ascii_case(INBOX) && gone(a, m);
+        let shown = match &self.showing {
+            Showing::Mailbox { account: a, name } if left(a, name) => Some(name.clone()),
+            _ => None,
+        };
+        let read = (self.reader.as_ref())
+            .map(|r| &r.message)
+            .filter(|m| left(&m.account, &m.mailbox))
+            .map(|m| m.mailbox.clone());
+        let forgot = self.search.forget_gone(gone);
+        for m in shown.iter().chain(&read) {
+            self.leave_gone_mailbox(account, m);
+        }
+        if forgot {
             self.reload();
+        }
+        // A mailbox to delete that's gone, or now kept for special mail, isn't deleted: unless
+        // it's being deleted, whose answer closes the dialog, or the dialog already says why it
+        // can't be, which stays for the user to close.
+        if let Some((a, m)) = self.delete_mailbox.mailbox.clone()
+            && a == account
+            && self.delete_mailbox.error.is_none()
+            && !self
+                .deleting_mailboxes
+                .contains_key(&(a.clone(), m.clone()))
+            && !self.can_delete_mailbox(&a, &m)
+        {
+            self.close_delete_mailbox();
+            let label = self.label(&a).to_owned();
+            self.notify(format!(
+                "{label}: {} changed on the server, so it wasn't deleted",
+                self.mailbox_label(&a, &m)
+            ));
         }
     }
 
@@ -2299,8 +2367,13 @@ impl Mail {
         };
         let (account, mailbox, uid) = (&key.0, &key.1, key.2);
         let current = self.uid_validity(account, mailbox);
+        let deleting = match &deferred {
+            Deferred::Move(to) => self.deleting_destination(account, to),
+            Deferred::Snooze(..) => None,
+        };
         let sent = match (&self.services, &deferred) {
             (Err(e), _) => Err(e.clone()),
+            (_, Deferred::Move(_)) if let Some(why) = deleting => Err(why),
             _ if current.is_none() || current != asked_under => Err(format!(
                 "{} changed on the server",
                 self.mailbox_label(account, mailbox)
@@ -2611,6 +2684,234 @@ impl Mail {
         }
     }
 
+    /// Opens the dialog confirming the mailbox `mailbox` of `account` is to be deleted. Asked to
+    /// be deleted already, it says it's busy.
+    pub(crate) fn open_delete_mailbox(&mut self, account: &str, mailbox: &str) {
+        self.close_mailbox_menu();
+        let state = self.services.as_ref().map_or(Ok(None), |services| {
+            services.store.mailbox_state(account, mailbox)
+        });
+        let shown = self.mailbox_label(account, mailbox);
+        // Without its UIDVALIDITY, another mailbox made under its name meanwhile couldn't be told.
+        let (uid_validity, error) = match state {
+            Ok(Some(state)) => (Some(state.uid_validity), self.snoozed_in(account, mailbox)),
+            Ok(None) => (
+                None,
+                Some(format!("{shown} hasn't synced yet. Try again once it has.")),
+            ),
+            Err(e) => (
+                None,
+                Some(format!("Couldn't read what's known of {shown}: {e}")),
+            ),
+        };
+        self.delete_mailbox = DeleteMailbox {
+            mailbox: Some((account.to_owned(), mailbox.to_owned())),
+            uid_validity,
+            error,
+        };
+    }
+
+    /// Closes the delete dialog. A mailbox already asked to be deleted still is, and a notice
+    /// says so.
+    pub(crate) fn close_delete_mailbox(&mut self) {
+        self.delete_mailbox = DeleteMailbox::default();
+    }
+
+    /// Whether accounts `a` and `b` read the same mailboxes: they're one, or log in as the same
+    /// user of the same IMAP server.
+    fn same_login(&self, a: &str, b: &str) -> bool {
+        let owner = |id: &str| self.accounts.iter().find(|x| x.id == id).map(imap_owner);
+        a == b || owner(a).is_some_and(|o| owner(b) == Some(o))
+    }
+
+    /// Whether `account`'s mailbox `name` was asked to be deleted, and the server hasn't answered.
+    pub(crate) fn mailbox_deleting(&self, account: &str, name: &str) -> bool {
+        self.deleting_mailboxes
+            .contains_key(&(account.to_owned(), name.to_owned()))
+    }
+
+    /// Why mail isn't moved to `account`'s mailbox `to`, if it's being deleted: it'd be deleted
+    /// with it.
+    fn deleting_destination(&self, account: &str, to: &str) -> Option<String> {
+        self.mailbox_deleting(account, to).then(|| {
+            let label = self.label(account);
+            let shown = self.mailbox_label(account, to);
+            format!("{label}: {shown} is being deleted, so nothing's moved there")
+        })
+    }
+
+    /// Whether the mailbox in the delete dialog was asked to be deleted, and the server hasn't
+    /// answered.
+    pub(crate) fn deleting_mailbox(&self) -> bool {
+        self.delete_mailbox
+            .mailbox
+            .as_ref()
+            .is_some_and(|key| self.deleting_mailboxes.contains_key(key))
+    }
+
+    /// Whether `account`'s mailbox `name`, as last listed, may be deleted: one made for no special
+    /// mail. The server checks again before it deletes.
+    pub(crate) fn can_delete_mailbox(&self, account: &str, name: &str) -> bool {
+        self.mailboxes
+            .get(account)
+            .and_then(|l| l.iter().find(|m| m.name == name))
+            .is_some_and(|m| {
+                m.role == Role::Other && !has_kept_name(&m.name, m.delimiter.as_deref())
+            })
+    }
+
+    /// Why `account`'s mailbox `name` can't be deleted now, though it's one the app keeps no mail
+    /// in: mail snoozed there is still to come back to the inbox from it.
+    fn snoozed_in(&self, account: &str, name: &str) -> Option<String> {
+        let Ok(services) = &self.services else {
+            return None;
+        };
+        let shown = self.mailbox_label(account, name);
+        match services.store.has_snoozed_in(account, name) {
+            Ok(false) => None,
+            Ok(true) => Some(format!(
+                "{shown} holds snoozed mail that's still to come back to the inbox."
+            )),
+            Err(e) => Some(format!(
+                "Couldn't tell whether {shown} holds snoozed mail: {e}"
+            )),
+        }
+    }
+
+    /// Asks the account's server to delete the mailbox in the dialog, and the mail in it, unless
+    /// it was asked already or may no longer be. The dialog stays open, and says it's busy, until
+    /// the server answers.
+    pub(crate) fn delete_mailbox(&mut self) {
+        let Some(key) = self.delete_mailbox.mailbox.clone() else {
+            return;
+        };
+        let Some(uid_validity) = self.delete_mailbox.uid_validity else {
+            return;
+        };
+        if self.delete_mailbox.error.is_some()
+            || self.deleting_mailboxes.contains_key(&key)
+            || !self.can_delete_mailbox(&key.0, &key.1)
+        {
+            return;
+        }
+        // Snoozed there since the dialog opened: waking it would find it gone.
+        if let Some(why) = self.snoozed_in(&key.0, &key.1) {
+            self.delete_mailbox.error = Some(why);
+            return;
+        }
+        // A move out of it waiting to be sent, by any account on its login, would find it gone,
+        // and the message with it.
+        if self
+            .deferred
+            .keys()
+            .any(|k| k.1 == key.1 && self.same_login(&k.0, &key.0))
+        {
+            let shown = self.mailbox_label(&key.0, &key.1);
+            self.delete_mailbox.error = Some(format!(
+                "A message is still waiting to be moved out of {shown}; try again once it's moved."
+            ));
+            return;
+        }
+        let Ok(services) = &self.services else { return };
+        let id = self.next_delete;
+        match services
+            .mailroom
+            .delete_mailbox(&key.0, &key.1, uid_validity, id)
+        {
+            Ok(()) => {
+                self.next_delete += 1;
+                let label = self.mailbox_label(&key.0, &key.1);
+                self.deleting_mailboxes.insert(
+                    key,
+                    Deleting {
+                        id,
+                        uid_validity,
+                        label,
+                    },
+                );
+                self.delete_mailbox.error = None;
+            }
+            Err(e) => self.delete_mailbox.error = Some(e.to_string()),
+        }
+    }
+
+    /// The server deleted the mailbox `name` asked for with [`Mail::delete_mailbox`], or refused
+    /// to. Deleted, its dialog closes, a notice says so, the account's inbox shows if the mailbox
+    /// did, and the mailbox and its cached mail go once the account's mailboxes are listed again.
+    /// Refused, its dialog says why; with it closed, a notice does. An answer no longer waited
+    /// for, as when its account was removed meanwhile, is dropped.
+    fn mailbox_deleted(&mut self, update: Update) {
+        let Update::MailboxDeleted {
+            id,
+            account,
+            name,
+            result,
+        } = update
+        else {
+            return;
+        };
+        let key = (account, name);
+        if self.deleting_mailboxes.get(&key).map(|d| d.id) != Some(id) {
+            return;
+        }
+        let Some(Deleting {
+            label: shown,
+            uid_validity,
+            ..
+        }) = self.deleting_mailboxes.remove(&key)
+        else {
+            return;
+        };
+        // Listed again by whichever refresher watches the account now, as one asked before its
+        // interval changed may have stopped.
+        if let Ok(services) = &self.services {
+            services.mailroom.refresh(&key.0);
+        }
+        let (account, name) = (key.0.as_str(), key.1.as_str());
+        // Another mailbox made under its name since, and synced, stays shown.
+        let replaced = self
+            .uid_validity(account, name)
+            .is_some_and(|v| v != uid_validity);
+        if result.is_ok() && !replaced {
+            self.leave_gone_mailbox(account, name);
+        }
+        // Gone, it's no place to autosort to, nor is another made under its name later.
+        if result.is_ok() && self.autosort_to.contains(&key) {
+            self.set_autosort(&key.0, &key.1, false);
+        }
+        let open = self.delete_mailbox.mailbox.as_ref() == Some(&key);
+        let label = self.label(account).to_owned();
+        match (open, result) {
+            (true, Err(e)) => self.delete_mailbox.error = Some(e),
+            (open, Ok(())) => {
+                if open {
+                    self.close_delete_mailbox();
+                }
+                self.notify(format!("{label}: deleted the mailbox {shown}"));
+            }
+            (false, Err(e)) => {
+                self.notify(format!("{label}: deleting the mailbox {shown}: {e}"));
+            }
+        }
+    }
+
+    /// Stops showing `account`'s mailbox `name`, gone from the server: its message closes if one
+    /// is open, and the list behind shows the account's inbox if it showed the mailbox. Nothing
+    /// else changes, as Settings, the account form or a message from another mailbox open.
+    fn leave_gone_mailbox(&mut self, account: &str, name: &str) {
+        if self
+            .reader
+            .as_ref()
+            .is_some_and(|r| r.message.account == account && r.message.mailbox == name)
+        {
+            self.leave_reader();
+        }
+        if !self.showing.is(account, name) {
+            return;
+        }
+        self.switch_list(Showing::inbox(account));
+    }
+
     /// Syncs one of an account's mailboxes with the server now, rather than waiting for the server
     /// to report a change or the next interval. What it finds shows as it arrives, and the
     /// mailbox shows it's busy until the sync ends.
@@ -2869,6 +3170,13 @@ impl Mail {
     ) -> bool {
         let key = (account.to_owned(), mailbox.to_owned(), uid);
         if self.moving_back(&key) {
+            return false;
+        }
+        if let Some(why) = self.deleting_destination(account, to) {
+            // Autosort, which isn't undone, leaves it in the inbox without a word.
+            if undoable {
+                self.notify(why);
+            }
             return false;
         }
         if self.pending(&key) {
@@ -3167,6 +3475,23 @@ impl Mail {
         moved
     }
 
+    /// Whether a message moved from `account`'s mailbox `mailbox` to `to` can't be moved back yet,
+    /// said in a notice: a change to its copy in `to` still on its way, or a move of it waiting
+    /// for one, would be lost once it's moved, whichever message of that mailbox it's to; and
+    /// `mailbox` being deleted would take it with it.
+    fn restore_waits(&mut self, account: &str, mailbox: &str, to: &str) -> bool {
+        let busy = |key: &MessageKey| key.0 == account && key.1 == to;
+        if self.unanswered.keys().any(|(key, _)| busy(key)) || self.deferred.keys().any(busy) {
+            self.notify("Still waiting for the server about a message there".into());
+            return true;
+        }
+        if let Some(why) = self.deleting_destination(account, mailbox) {
+            self.notify(why);
+            return true;
+        }
+        false
+    }
+
     /// Undoes the last thing done to a message, as Z does: moves it back, marks it read or unread
     /// again, or gives back or takes away its star.
     pub(crate) fn undo(&mut self) {
@@ -3188,13 +3513,7 @@ impl Mail {
                 done: true,
             } => {
                 let (account, mailbox, _) = &from;
-                // A change to its copy there still on its way, or a move of it waiting for one,
-                // would be lost once it's moved: whichever message of that mailbox it's to.
-                let busy = |key: &MessageKey| key.0 == *account && key.1 == to;
-                if self.unanswered.keys().any(|(key, _)| busy(key))
-                    || self.deferred.keys().any(busy)
-                {
-                    self.notify("Still waiting for the server about a message there".into());
+                if self.restore_waits(account, mailbox, &to) {
                     return;
                 }
                 // Back in the inbox by hand, it's there to be seen, not autosorted away again.
@@ -3730,8 +4049,6 @@ impl Mail {
     /// Lists `showing`. A mailbox other than an inbox is also refreshed from the server, as those
     /// are otherwise only synced every few minutes.
     pub(crate) fn show(&mut self, showing: Showing) {
-        // A message being moved back no longer takes the cursor once it's listed.
-        self.restoring = None;
         self.form.open = false;
         self.settings_open = false;
         self.leave_reader();
@@ -3742,18 +4059,27 @@ impl Mail {
             services.mailroom.refresh(account);
         }
         if self.showing == showing {
+            // A message being moved back no longer takes the cursor once it's listed.
+            self.restoring = None;
             // Shown again, as going back from a message.
             self.forget_read();
         } else {
-            // A search goes on in the mailbox now shown, unless it looks through every inbox.
-            if !self.search.everywhere {
-                self.search.forget_server();
-            }
-            self.showing = showing;
-            self.list_limit = LIST_LIMIT;
-            self.reload();
-            self.find_unread_listed();
+            self.switch_list(showing);
         }
+    }
+
+    /// Lists what `showing` says behind whatever's open in front of the list, which stays.
+    fn switch_list(&mut self, showing: Showing) {
+        // A message being moved back no longer takes the cursor once it's listed.
+        self.restoring = None;
+        // A search goes on in the mailbox now shown, unless it looks through every inbox.
+        if !self.search.everywhere {
+            self.search.forget_server();
+        }
+        self.showing = showing;
+        self.list_limit = LIST_LIMIT;
+        self.reload();
+        self.find_unread_listed();
     }
 
     /// Showing only unread mail, looks for what's older than the cache in each mailbox listed not
@@ -4227,14 +4553,39 @@ impl Mail {
             return;
         };
         let (id, label) = (account.id.clone(), account.label().to_owned());
-        let saved = save_account(&services.store, services.secrets.as_ref(), account, login)
-            .and_then(|()| {
+        // Added again on another server or user: what was asked of its old mailboxes isn't of these.
+        let before = services.store.account(&id).ok().flatten();
+        let moved = before
+            .as_ref()
+            .is_some_and(|before| imap_owner(before) != imap_owner(account));
+        // Its old watch stops first, so nothing it brings is written once saving the account has
+        // forgotten its old mailboxes: none is left to be taken for one there, as one to delete.
+        if moved {
+            services.mailroom.unwatch(&id);
+        }
+        if let Err(e) = save_account(&services.store, services.secrets.as_ref(), account, login) {
+            // Not saved: it's still the account it was, watched again.
+            let rewatched = before.filter(|_| moved).map(|before| {
                 services
                     .mailroom
-                    .watch(account, &services.store, services.secrets.as_ref())
+                    .watch(&before, &services.store, services.secrets.as_ref())
             });
-        if let Err(e) = saved {
+            self.form.error = Some(match rewatched {
+                Some(Err(again)) => format!("{e}; and it couldn't be checked again: {again}"),
+                _ => e.to_string(),
+            });
+            return;
+        }
+        let watched = services
+            .mailroom
+            .watch(account, &services.store, services.secrets.as_ref());
+        // Saved on another login: what was shown of the old one goes, watched or not.
+        if moved {
+            self.forget_mail_of(&id);
+        }
+        if let Err(e) = watched {
             self.form.error = Some(e.to_string());
+            self.reload();
             return;
         }
         self.statuses.insert(id, Ok(Status::Connecting));
@@ -5349,6 +5700,16 @@ impl Mail {
         if self.new_mailbox.account == id {
             self.close_new_mailbox();
         }
+        if self
+            .delete_mailbox
+            .mailbox
+            .as_ref()
+            .is_some_and(|m| m.0 == id)
+        {
+            self.close_delete_mailbox();
+        }
+        // Their answers are dropped: they'd be for a mailbox no longer listed.
+        self.deleting_mailboxes.retain(|m, _| m.0 != id);
     }
 }
 
@@ -5370,6 +5731,224 @@ mod tests {
 
     use super::*;
     use postden_store::AutosortState;
+
+    #[test]
+    fn a_deleted_mailbox_closes_its_dialog_leaves_its_view_and_says_why_it_was_refused() {
+        let me = "me@example.com";
+        let deleting = |id, label: &str| Deleting {
+            id,
+            uid_validity: 1,
+            label: label.into(),
+        };
+        let key = |name: &str| (me.to_owned(), name.to_owned());
+        let deleted = |id, name: &str, result: Result<(), String>| Update::MailboxDeleted {
+            id,
+            account: me.into(),
+            name: name.into(),
+            result,
+        };
+        let mut s = Mail::not_started();
+        s.show(Showing::Mailbox {
+            account: me.into(),
+            name: "Work".into(),
+        });
+        s.open_delete_mailbox(me, "Work");
+        s.deleting_mailboxes
+            .insert(key("Work"), deleting(1, "Work"));
+        assert!(s.deleting_mailbox());
+        // Refused, the dialog says why, and only closes: opened again, it's on the mailbox as it
+        // is then.
+        s.apply(
+            deleted(1, "Work", Err("has children".into())),
+            &mut Tx::default(),
+        );
+        assert!(s.delete_mailbox.mailbox.is_some());
+        assert!(!s.deleting_mailbox());
+        assert_eq!(s.delete_mailbox.error.as_deref(), Some("has children"));
+        assert_eq!(s.notice, None);
+        assert!(s.showing.is(me, "Work"));
+        s.close_delete_mailbox();
+
+        // Closed while busy and opened again, it's still busy, and asks nothing twice.
+        s.open_delete_mailbox(me, "Work");
+        s.deleting_mailboxes
+            .insert(key("Work"), deleting(2, "Work"));
+        s.close_delete_mailbox();
+        s.open_delete_mailbox(me, "Work");
+        assert!(s.deleting_mailbox());
+        // An answer to an earlier request isn't this one's.
+        s.apply(deleted(1, "Work", Ok(())), &mut Tx::default());
+        assert!(s.deleting_mailbox());
+        // Settings, and a removal waiting to be confirmed there, stay open.
+        s.settings_open = true;
+        s.confirm_remove = Some(me.into());
+        s.apply(deleted(2, "Work", Ok(())), &mut Tx::default());
+        assert_eq!(s.delete_mailbox, DeleteMailbox::default());
+        assert_eq!(s.showing, Showing::inbox(me));
+        assert!(s.settings_open);
+        assert_eq!(s.confirm_remove.as_deref(), Some(me));
+        assert_eq!(
+            s.notice.as_deref(),
+            Some("me@example.com: deleted the mailbox Work")
+        );
+
+        // Closed before the server answered, a notice tells too.
+        s.deleting_mailboxes.insert(key("Old"), deleting(3, "Old"));
+        s.apply(deleted(3, "Old", Ok(())), &mut Tx::default());
+        assert_eq!(
+            s.notice.as_deref(),
+            Some("me@example.com: deleted the mailbox Old")
+        );
+
+        // Not waited for, as when its account was removed meanwhile, it's dropped.
+        s.notice = None;
+        s.apply(deleted(4, "Gone", Ok(())), &mut Tx::default());
+        assert_eq!(s.notice, None);
+    }
+
+    #[test]
+    fn a_mailbox_isnt_deleted_while_a_move_out_of_it_waits_on_any_account_of_its_login() {
+        use postden_core::account::{Auth, Server};
+        let server = Server {
+            host: "imap.example.com".into(),
+            port: 993,
+            security: Security::Tls,
+            username: "me".into(),
+        };
+        let mut s = Mail::not_started();
+        for id in ["a@example.com", "b@example.com"] {
+            s.accounts.push(Account {
+                id: id.into(),
+                display_name: None,
+                label: None,
+                imap: Server {
+                    host: if id.starts_with('a') {
+                        "IMAP.example.com".into()
+                    } else {
+                        server.host.clone()
+                    },
+                    ..server.clone()
+                },
+                smtp: server.clone(),
+                auth: Auth::Password,
+            });
+            s.mailboxes.insert(
+                id.into(),
+                vec![Mailbox {
+                    name: "Work".into(),
+                    delimiter: None,
+                    role: Role::Other,
+                }],
+            );
+        }
+        // Waiting for a star to be answered, a move out of Work through a@.
+        let key = ("a@example.com".to_owned(), "Work".to_owned(), 1);
+        s.deferred
+            .insert(key, (Deferred::Move("INBOX".into()), Some(1)));
+        // Deleting Work through b@, armed as when synced.
+        s.open_delete_mailbox("b@example.com", "Work");
+        s.delete_mailbox.uid_validity = Some(1);
+        s.delete_mailbox.error = None;
+        s.delete_mailbox();
+        assert_eq!(
+            s.delete_mailbox.error.as_deref(),
+            Some("A message is still waiting to be moved out of Work; try again once it's moved.")
+        );
+    }
+
+    #[test]
+    fn nothing_is_moved_to_a_mailbox_being_deleted() {
+        let me = "me@example.com";
+        let mut s = Mail::not_started();
+        s.deleting_mailboxes.insert(
+            (me.into(), "Work".into()),
+            Deleting {
+                id: 0,
+                uid_validity: 1,
+                label: "Work".into(),
+            },
+        );
+        assert!(s.mailbox_deleting(me, "Work"));
+        s.move_message(me, "INBOX", 1, "Work");
+        assert_eq!(
+            s.notice.as_deref(),
+            Some("me@example.com: Work is being deleted, so nothing's moved there")
+        );
+        assert!(s.deferred.is_empty());
+    }
+
+    #[test]
+    fn a_mailbox_not_synced_yet_isnt_deleted() {
+        let mut s = Mail::not_started();
+        s.mailboxes.insert(
+            "me@example.com".into(),
+            vec![Mailbox {
+                name: "Work".into(),
+                delimiter: None,
+                role: Role::Other,
+            }],
+        );
+        // Nothing's known of its UIDVALIDITY, as with no store here: it can't be confirmed.
+        s.open_delete_mailbox("me@example.com", "Work");
+        assert_eq!(
+            s.delete_mailbox.error.as_deref(),
+            Some("Work hasn't synced yet. Try again once it has.")
+        );
+        s.delete_mailbox();
+        assert!(!s.deleting_mailbox());
+    }
+
+    #[test]
+    fn a_mailbox_no_longer_listed_stops_showing_and_settings_stay_open() {
+        let me = "me@example.com";
+        let mailbox = |name: &str, role| Mailbox {
+            name: name.into(),
+            delimiter: None,
+            role,
+        };
+        let mut s = Mail::not_started();
+        s.show(Showing::Mailbox {
+            account: me.into(),
+            name: "Work".into(),
+        });
+        s.settings_open = true;
+        s.mailboxes.insert(
+            me.into(),
+            vec![mailbox("INBOX", Role::Inbox), mailbox("Notes", Role::Other)],
+        );
+        // A mailbox to delete, unchanged, stays up; once it's kept for drafts, it doesn't.
+        s.open_delete_mailbox(me, "Notes");
+        // As synced: no store here to say so.
+        s.delete_mailbox.uid_validity = Some(1);
+        s.delete_mailbox.error = None;
+        assert!(s.can_delete_mailbox(me, "Notes"));
+        s.apply(Update::Mailboxes { account: me.into() }, &mut Tx::default());
+        assert_eq!(s.showing, Showing::inbox(me));
+        assert!(s.settings_open);
+        assert!(s.delete_mailbox.mailbox.is_some());
+
+        s.mailboxes.insert(
+            me.into(),
+            vec![
+                mailbox("INBOX", Role::Inbox),
+                mailbox("Notes", Role::Drafts),
+            ],
+        );
+        s.apply(Update::Mailboxes { account: me.into() }, &mut Tx::default());
+        assert_eq!(s.delete_mailbox, DeleteMailbox::default());
+        assert_eq!(
+            s.notice.as_deref(),
+            Some("me@example.com: Notes changed on the server, so it wasn't deleted")
+        );
+
+        // One saying why it can't be deleted stays, for the user to read and close.
+        s.notice = None;
+        s.open_delete_mailbox(me, "Notes");
+        s.delete_mailbox.error = Some("the server keeps it for special mail".into());
+        s.apply(Update::Mailboxes { account: me.into() }, &mut Tx::default());
+        assert!(s.delete_mailbox.mailbox.is_some());
+        assert_eq!(s.notice, None);
+    }
 
     #[test]
     fn a_new_mailbox_closes_its_dialog_once_made_and_says_why_it_was_refused() {

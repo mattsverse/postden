@@ -364,7 +364,7 @@ fn rank(e: &Example<'_>) -> u8 {
         Role::Trash | Role::Junk => 2,
         Role::Snoozed => 3,
         Role::Archive => 4,
-        Role::Sent | Role::Other => 5,
+        Role::Sent | Role::Drafts | Role::Other => 5,
     }
 }
 
@@ -389,7 +389,7 @@ fn filed_in<'a>(e: &Example<'a>) -> Option<&'a str> {
 fn importance(e: &Example<'_>, correspondent: bool, now: i64) -> Option<bool> {
     let ignored = !e.envelope.seen && e.envelope.date.is_some_and(|d| now - d > IGNORED_AFTER);
     match e.role {
-        Role::Sent | Role::Snoozed => None,
+        Role::Sent | Role::Snoozed | Role::Drafts => None,
         // Such as a draft, starred or not: not mail that came.
         Role::Other if is_kept_by_the_app(e.mailbox) => None,
         _ if e.envelope.flagged && !matches!(e.role, Role::Trash | Role::Junk) => Some(true),

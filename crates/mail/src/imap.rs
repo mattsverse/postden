@@ -21,7 +21,7 @@ mod unread;
 mod watch;
 
 pub use connection::{Session, check_login, connect};
-pub use mailboxes::{SNOOZED_NAME, create_mailbox};
+pub use mailboxes::{SNOOZED_NAME, create_mailbox, delete_mailbox, has_kept_name};
 pub use message::{
     Prefetched, Verdict, download_message, mark_all_seen, move_message, open_message,
     prefetch_messages, restore_message, set_flagged, set_seen, snooze_message, wake_message,

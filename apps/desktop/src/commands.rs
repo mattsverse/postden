@@ -417,7 +417,8 @@ fn destinations(s: &Mail, message: &MessageKey) -> Vec<Command> {
     inbox
         .into_iter()
         .chain(rest)
-        .filter(|b| b.name != message.1)
+        // One being deleted would take what's moved there with it.
+        .filter(|b| b.name != message.1 && !s.mailbox_deleting(&message.0, &b.name))
         .map(|b| Command::MoveTo {
             message: message.clone(),
             mailbox: b.name.clone(),
