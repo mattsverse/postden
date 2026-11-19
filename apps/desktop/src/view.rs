@@ -173,6 +173,7 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
     let toolbar = toolbar.trailing(trailing);
     update_dialog(s, &k, &mut layer);
     new_mailbox_dialog(s, &k, &mut layer);
+    delete_mailbox_dialog(s, &k, &mut layer);
     palette(s, &k, &mut layer);
     let window = SplitView::new(main)
         .sidebar(
@@ -488,20 +489,23 @@ fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut 
             let autosort = (s.settings.sort_mail
                 && postden_app::is_filed_in(&mailbox.name, mailbox.role))
             .then(|| s.autosorts_to(account, &mailbox.name));
-            mailbox_menu(menu, marking, autosort, r, k, layer)
+            // The inbox, Drafts and the rest the server or the app keeps mail in stay.
+            let deletable = s.can_delete_mailbox(account, &mailbox.name);
+            mailbox_menu(menu, marking, autosort, deletable, r, k, layer)
         }
         _ => r,
     }
 }
 
 /// A mailbox's menu, open at where it was right-clicked: refreshing it or every mailbox,
-/// marking it all read, and, where `autosort` says whether inbox mail is moved there by itself,
-/// turning that on or off.
+/// marking it all read, where `autosort` says whether inbox mail is moved there by itself,
+/// turning that on or off, and deleting it if it's `deletable`.
 /// While it's `marking` read, it can't be marked again.
 fn mailbox_menu(
     menu: &MailboxMenu,
     marking: bool,
     autosort: Option<bool>,
+    deletable: bool,
     row: El,
     k: &Kit,
     layer: &mut Vec<El>,
@@ -509,6 +513,7 @@ fn mailbox_menu(
     let (account, mailbox) = &menu.mailbox;
     let (a, b) = (account.clone(), mailbox.clone());
     let (refresh_account, refresh_mailbox) = (account.clone(), mailbox.clone());
+    let (delete_account, delete_mailbox) = (account.clone(), mailbox.clone());
     let mut items = context_menu(
         format!("mailbox-menu-{account}-{mailbox}"),
         row,
@@ -548,6 +553,13 @@ fn mailbox_menu(
                     s.close_mailbox_menu();
                     s.set_autosort(&account, &mailbox, !on);
                 }),
+        );
+    }
+    if deletable {
+        items = items.item(
+            MenuItem::new("Delete mailbox…").on_select(move |s: &mut Mail| {
+                s.open_delete_mailbox(&delete_account, &delete_mailbox);
+            }),
         );
     }
     items.build(k, layer).w_full()
@@ -690,6 +702,86 @@ fn new_mailbox_dialog(s: &Mail, k: &Kit, layer: &mut Vec<El>) {
         .child(body)
         .open(true)
         .build(k, layer);
+}
+
+/// The dialog confirming a mailbox is to be deleted with the mail in it: a warning, why the server
+/// refused, and Delete, busy until the server answers.
+fn delete_mailbox_dialog(s: &Mail, k: &Kit, layer: &mut Vec<El>) {
+    let d = &s.delete_mailbox;
+    let Some((account, mailbox)) = &d.mailbox else {
+        return;
+    };
+    let mut body = col().w_full().gap(12.0).padding(16.0).pt(0.0).child(
+        text("The mail in it is deleted on the server too, for good.")
+            .key("delete-mailbox-warning")
+            .wrap(),
+    );
+    if let Some(error) = &d.error {
+        body = body.child(
+            text(error.clone())
+                .key("delete-mailbox-error")
+                .font(k.ty.small)
+                .color(k.c.danger.fg)
+                .wrap()
+                .selectable(true),
+        );
+    }
+    body = body.child(delete_mailbox_actions(
+        s.deleting_mailbox(),
+        d.error.is_none(),
+        k,
+    ));
+    Dialog::new("delete-mailbox", "Delete mailbox")
+        .description(format!(
+            "Delete {} from {}?",
+            s.mailbox_label(account, mailbox),
+            s.label(account),
+        ))
+        .width(400.0)
+        .fit()
+        .on_close(Mail::close_delete_mailbox)
+        .child(body)
+        .open(true)
+        .build(k, layer);
+}
+
+/// Cancel and Delete, the default button Return presses, which waits on the server. While it
+/// waits, Cancel is Close: what was asked goes on. Not `armed`, as when it can't be deleted, it's
+/// Close alone.
+fn delete_mailbox_actions(deleting: bool, armed: bool, k: &Kit) -> El {
+    let actions = row()
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(el().grow(1.0))
+        .child(
+            Button::new(if deleting || !armed {
+                "Close"
+            } else {
+                "Cancel"
+            })
+            .variant(ButtonVariant::Neutral)
+            .on_press(Mail::close_delete_mailbox)
+            .build(k)
+            .key("delete-mailbox-cancel"),
+        );
+    if !armed {
+        return actions;
+    }
+    let delete = Button::new(if deleting { "Deleting…" } else { "Delete" })
+        .variant(if deleting {
+            ButtonVariant::Loading
+        } else {
+            ButtonVariant::Danger
+        })
+        .on_press(Mail::delete_mailbox)
+        .build(k)
+        .key("delete-mailbox-confirm");
+    actions.child(if deleting {
+        delete
+    } else {
+        delete.default_button()
+    })
 }
 
 /// Cancel and Create, which needs a name and waits on the server.
@@ -1239,7 +1331,8 @@ fn message_menu_moves(s: &Mail, m: &StoredMessage, menu: &MessageMenu, mut items
         .get(account)
         .map_or(&[][..], Vec::as_slice)
         .iter()
-        .filter(|b| b.name != mailbox)
+        // One being deleted would take what's moved there with it.
+        .filter(|b| b.name != mailbox && !s.mailbox_deleting(account, &b.name))
         .map(|b| MenuEntry::item(MenuItem::new(b.label()).on_select(move_to(&b.name))))
         .collect();
     if archive.is_some()

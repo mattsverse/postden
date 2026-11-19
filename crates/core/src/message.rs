@@ -69,7 +69,9 @@ pub enum Role {
     Snoozed,
     /// Where spam goes, such as `Junk` or Gmail's `[Gmail]/Spam`.
     Junk,
-    /// Any other mailbox: folders and drafts.
+    /// Where drafts are kept, such as `Drafts` or Gmail's `[Gmail]/Drafts`.
+    Drafts,
+    /// Any other mailbox: folders.
     Other,
 }
 
@@ -84,6 +86,7 @@ impl Role {
             Self::Trash => "trash",
             Self::Snoozed => "snoozed",
             Self::Junk => "junk",
+            Self::Drafts => "drafts",
             Self::Other => "other",
         }
     }
@@ -98,6 +101,7 @@ impl Role {
             Self::Trash,
             Self::Snoozed,
             Self::Junk,
+            Self::Drafts,
             Self::Other,
         ]
         .into_iter()

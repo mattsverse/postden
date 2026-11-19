@@ -15,9 +15,9 @@ use postden_core::message::{Address, Body, Envelope, Mailbox, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
     Event, Flags, Found, Nudge, Older, Prefetched, SNOOZED_NAME, Status, Unread, Verdict,
-    WatchConfig, create_mailbox, download_message, fetch_older, fetch_unread, mark_all_seen,
-    move_message, open_message, prefetch_messages, refresh, restore_message, save_sent_copy,
-    search, set_flagged, set_seen, snooze_message, wake_message, watch,
+    WatchConfig, create_mailbox, delete_mailbox, download_message, fetch_older, fetch_unread,
+    mark_all_seen, move_message, open_message, prefetch_messages, refresh, restore_message,
+    save_sent_copy, search, set_flagged, set_seen, snooze_message, wake_message, watch,
 };
 use postden_mail::{Credentials, smtp};
 use postden_store::{Snooze, Store, Written};
@@ -237,6 +237,128 @@ pub enum Update {
         name: String,
         result: Result<(), String>,
     },
+    /// A mailbox asked for with [`Mailroom::delete_mailbox`] was deleted on the server, its cached
+    /// mail to be dropped once the account's mailboxes are listed as [`Update::Mailboxes`] next;
+    /// or it wasn't. `id` is the one it was asked with.
+    MailboxDeleted {
+        id: u64,
+        account: String,
+        name: String,
+        result: Result<(), String>,
+    },
+}
+
+/// How long a mailbox stays reserved after a move or deletion the server didn't answer: as long
+/// as an IMAP command is waited for again.
+const UNCONFIRMED_HOLD: Duration = Duration::from_secs(120);
+
+/// A mailbox on an IMAP server and user, whichever account reads it: two accounts on the same
+/// login read the same mailboxes.
+type Place = (String, u16, String, String);
+
+fn place(server: &Server, mailbox: &str) -> Place {
+    (
+        server.host.to_ascii_lowercase(),
+        server.port,
+        server.username.clone(),
+        mailbox.to_owned(),
+    )
+}
+
+/// What's under way in each mailbox: messages being moved, moved back or snoozed into or out of
+/// it, and whether it's being deleted. Neither starts while the other is: deleting it would take
+/// the messages moved in with it, or before they're moved out.
+#[derive(Debug, Default)]
+struct Traffic {
+    moving: HashMap<Place, usize>,
+    deleting: HashSet<Place>,
+}
+
+type Traffics = Arc<Mutex<Traffic>>;
+
+/// Messages being moved between two mailboxes, or a mailbox being deleted, held in
+/// [`Mailroom::traffic`] until it's dropped, as its job ends.
+struct Reserved {
+    traffic: Traffics,
+    places: Vec<Place>,
+    deleting: bool,
+}
+
+impl Reserved {
+    /// A message being moved from the mailbox at `from` to the one at `to`, unless either is
+    /// being deleted.
+    fn moving(traffic: &Traffics, from: Place, to: Place) -> Result<Self> {
+        let mut t = traffic.lock().unwrap_or_else(PoisonError::into_inner);
+        if t.deleting.contains(&from) || t.deleting.contains(&to) {
+            return Err(Error::Invalid(
+                "that mailbox is being deleted, so nothing's moved there or from it".to_owned(),
+            ));
+        }
+        for place in [&from, &to] {
+            *t.moving.entry(place.clone()).or_default() += 1;
+        }
+        drop(t);
+        Ok(Self {
+            traffic: Arc::clone(traffic),
+            places: vec![from, to],
+            deleting: false,
+        })
+    }
+
+    /// The mailbox at `place` being deleted, unless a message is being moved into or out of it,
+    /// or it's being deleted already.
+    fn deleting(traffic: &Traffics, place: Place) -> Result<Self> {
+        let mut t = traffic.lock().unwrap_or_else(PoisonError::into_inner);
+        if t.moving.contains_key(&place) {
+            return Err(Error::Invalid(
+                "a message is still being moved into or out of it; try again once it's moved"
+                    .to_owned(),
+            ));
+        }
+        if !t.deleting.insert(place.clone()) {
+            return Err(Error::Invalid("it's being deleted already".to_owned()));
+        }
+        drop(t);
+        Ok(Self {
+            traffic: Arc::clone(traffic),
+            places: vec![place],
+            deleting: true,
+        })
+    }
+
+    /// Lets go once what it was held for surely ended: at once, unless the server didn't answer
+    /// `result`, when it may still be doing it, so as long again as it was waited for.
+    fn release<T>(
+        self,
+        result: &std::result::Result<T, postden_mail::Error>,
+    ) -> impl Future<Output = ()> + use<T> {
+        let unanswered = result
+            .as_ref()
+            .err()
+            .is_some_and(postden_mail::Error::may_have_happened);
+        async move {
+            if unanswered {
+                tokio::time::sleep(UNCONFIRMED_HOLD).await;
+            }
+            drop(self);
+        }
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        let mut t = self.traffic.lock().unwrap_or_else(PoisonError::into_inner);
+        for place in &self.places {
+            if self.deleting {
+                t.deleting.remove(place);
+            } else if let Some(n) = t.moving.get_mut(place) {
+                *n -= 1;
+                if *n == 0 {
+                    t.moving.remove(place);
+                }
+            }
+        }
+    }
 }
 
 /// Marks a mailbox read in the store once the server did, up to the UIDNEXT it was marked under.
@@ -687,6 +809,8 @@ pub struct Mailroom {
     refreshes: Arc<AtomicU64>,
     /// The accounts whose due snoozes are being brought back, not to be asked for twice at once.
     waking: Arc<Mutex<HashSet<String>>>,
+    /// Messages on their way into each mailbox, and the mailboxes being deleted: see [`Traffic`].
+    traffic: Traffics,
     /// Snoozed messages being moved back by [`Mailroom::restore`], by account and Message-ID:
     /// their snoozes are kept until they're moved, but not brought back meanwhile.
     unsnoozing: Arc<Mutex<HashSet<(String, String)>>>,
@@ -787,6 +911,7 @@ impl Mailroom {
             last_watch: 0,
             refreshes: Arc::default(),
             waking: Arc::default(),
+            traffic: Arc::default(),
             unsnoozing: Arc::default(),
             finding_unread: Finding::default(),
         })
@@ -1199,6 +1324,8 @@ impl Mailroom {
             self.target_under(store, account, mailbox, uid_validity)?;
         let nudge = Arc::clone(&self.watched(account)?.nudge);
         let verdict = verdict(store, account, mailbox, to)?;
+        let reserved =
+            Reserved::moving(&self.traffic, place(&server, mailbox), place(&server, to))?;
         let (account, mailbox, to) = (account.to_owned(), mailbox.to_owned(), to.to_owned());
         self.handle.spawn(async move {
             let result = move_message(
@@ -1210,8 +1337,9 @@ impl Mailroom {
                 &to,
                 verdict,
             )
-            .await
-            .map_err(|e| e.to_string());
+            .await;
+            let release = reserved.release(&result);
+            let result = result.map_err(|e| e.to_string());
             // The inbox's watcher sees mail moved there on its own; the refresher syncs the rest.
             if result.is_ok() {
                 let _asked = nudge.ask();
@@ -1225,6 +1353,7 @@ impl Mailroom {
                 snooze: None,
             };
             let _ignored = jobs.send(Job::Moved(moving, result));
+            release.await;
         });
         Ok(())
     }
@@ -1273,6 +1402,8 @@ impl Mailroom {
         let nudge = Arc::clone(&self.watched(account)?.nudge);
         let create = snoozed.is_none();
         let to = snoozed.unwrap_or_else(|| SNOOZED_NAME.to_owned());
+        let reserved =
+            Reserved::moving(&self.traffic, place(&server, mailbox), place(&server, &to))?;
         store.snooze(&Snooze {
             account: account.to_owned(),
             message_id,
@@ -1290,8 +1421,9 @@ impl Mailroom {
                 &to,
                 create,
             )
-            .await
-            .map_err(|e| e.to_string());
+            .await;
+            let release = reserved.release(&result);
+            let result = result.map_err(|e| e.to_string());
             if result.is_ok() {
                 let _asked = nudge.ask();
             }
@@ -1304,6 +1436,7 @@ impl Mailroom {
                 snooze: Some(until),
             };
             let _ignored = jobs.send(Job::Moved(moving, result));
+            release.await;
         });
         Ok(())
     }
@@ -1343,6 +1476,12 @@ impl Mailroom {
         let nudge = Arc::clone(&watched.nudge);
         // Not while snoozes are being brought back, which may have taken it already; and not
         // brought back while it's being moved.
+        // First, so a refusal leaves nothing taken.
+        let moving = Reserved::moving(
+            &self.traffic,
+            place(&watched.server, mailbox),
+            place(&watched.server, to),
+        )?;
         let reserved = (account.to_owned(), message_id.to_owned());
         if snoozed.is_some() {
             let busy = || {
@@ -1384,8 +1523,9 @@ impl Mailroom {
                 &restoring.to,
                 verdict,
             )
-            .await
-            .map_err(|e| e.to_string());
+            .await;
+            let release = moving.release(&result);
+            let result = result.map_err(|e| e.to_string());
             if result.is_ok() {
                 let _asked = nudge.ask();
             }
@@ -1397,6 +1537,7 @@ impl Mailroom {
                     .remove(&reserved);
             }
             let _ignored = jobs.send(Job::Restored(restoring, result));
+            release.await;
         });
         Ok(())
     }
@@ -1621,6 +1762,49 @@ impl Mailroom {
                 name,
                 result,
             }));
+        });
+        Ok(())
+    }
+
+    /// Deletes the mailbox `name`, as the server lists it, and the mail in it from `account`'s
+    /// server in the background, then lists the account's mailboxes, deleted or not, so it's
+    /// gone, cached mail and all. `uid_validity` is the mailbox's when it was asked to be
+    /// deleted: another mailbox under its name since isn't deleted. The result arrives as
+    /// [`Update::MailboxDeleted`], with `id`, which tells answers to requests for the same mailbox
+    /// apart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, and deletes nothing, when the account isn't watched, or a message is on
+    /// its way into the mailbox, moved or moved back there through any account on its login.
+    pub fn delete_mailbox(
+        &self,
+        account: &str,
+        name: &str,
+        uid_validity: u32,
+        id: u64,
+    ) -> Result<()> {
+        let watched = self.watched(account)?;
+        let (server, credentials) = (watched.server.clone(), watched.credentials.clone());
+        let deleting = Reserved::deleting(&self.traffic, place(&server, name))?;
+        let nudge = Arc::clone(&watched.nudge);
+        let (account, name) = (account.to_owned(), name.to_owned());
+        let jobs = self.jobs.clone();
+        self.handle.spawn(async move {
+            let result = delete_mailbox(&server, &credentials, &name, uid_validity).await;
+            // Sent, but not answered: the server may still be deleting it. Nothing's moved there
+            // until it surely isn't.
+            let release = deleting.release(&result);
+            let result = result.map_err(|e| e.to_string());
+            // Refused too: what's on the server may have changed since it was last listed.
+            let _asked = nudge.ask();
+            let _ignored = jobs.send(Job::Done(Update::MailboxDeleted {
+                id,
+                account,
+                name,
+                result,
+            }));
+            release.await;
         });
         Ok(())
     }
@@ -2641,6 +2825,36 @@ mod tests {
                 .collect(),
             asked: 0,
         })
+    }
+
+    #[test]
+    fn a_mailbox_isnt_deleted_while_mail_is_moved_in_or_out_nor_the_other_way() {
+        let server = |host: &str| Server {
+            host: host.into(),
+            port: 993,
+            security: Security::Tls,
+            username: "me".into(),
+        };
+        let traffic = Traffics::default();
+        let at = |host: &str, mailbox: &str| place(&server(host), mailbox);
+        let work = || at("IMAP.example.com", "Work");
+        let inbox = || at("imap.example.com", "INBOX");
+        // Into it, and out of it, through another account on the same login.
+        let into = Reserved::moving(&traffic, inbox(), work()).unwrap();
+        let out = Reserved::moving(&traffic, at("imap.example.com", "Work"), inbox()).unwrap();
+        assert!(Reserved::deleting(&traffic, work()).is_err());
+        assert!(Reserved::deleting(&traffic, at("other.example", "Work")).is_ok());
+        drop(into);
+        assert!(Reserved::deleting(&traffic, work()).is_err());
+        drop(out);
+        let deleting = Reserved::deleting(&traffic, work()).unwrap();
+        assert!(Reserved::moving(&traffic, inbox(), work()).is_err());
+        assert!(Reserved::moving(&traffic, work(), inbox()).is_err());
+        assert!(Reserved::deleting(&traffic, work()).is_err());
+        // Nothing's taken by a refusal.
+        assert!(Reserved::deleting(&traffic, inbox()).is_ok());
+        drop(deleting);
+        assert!(Reserved::moving(&traffic, inbox(), work()).is_ok());
     }
 
     #[test]

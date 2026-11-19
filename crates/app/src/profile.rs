@@ -686,7 +686,7 @@ pub fn is_sealed(file: &[u8]) -> bool {
 
 /// Sets each key to its secret, or deletes it for `None`, so a replaced account doesn't keep
 /// an old password. Returns `false`, having written nothing, when `secrets` is read-only.
-fn write_secrets(
+pub(crate) fn write_secrets(
     secrets: &dyn SecretStore,
     writes: &[(SecretKey, Option<SecretString>)],
 ) -> Result<bool, SecretError> {

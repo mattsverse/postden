@@ -315,6 +315,21 @@ fn same_mailboxes(conn: &Connection, account: &Account) -> Result<bool> {
     }))
 }
 
+/// Forgets what's known of account `id`'s mailboxes, as it reads another server's or user's
+/// now: what's cached of the old ones, down to their UIDs and UIDVALIDITY, says nothing about
+/// the new ones. Messages and bodies go with their mailbox; snoozes too, as they're of messages
+/// on the old server; and what sorting learned of where its mail goes, and the mailboxes it
+/// autosorts to.
+fn forget_mailboxes_of(tx: &Transaction<'_>, id: &str) -> Result<()> {
+    tx.execute("DELETE FROM mailboxes WHERE account = ?1", [id])?;
+    tx.execute("DELETE FROM listed_mailboxes WHERE account = ?1", [id])?;
+    tx.execute("DELETE FROM snoozes WHERE account = ?1", [id])?;
+    tx.execute("DELETE FROM put_away WHERE account = ?1", [id])?;
+    sorting::forget_sorting_of(tx, id)?;
+    sorting::forget_autosort_of(tx, id)?;
+    Ok(())
+}
+
 /// A message, by account, mailbox and UID, or a whole mailbox with `None`.
 type Touched = (String, String, Option<u32>);
 
@@ -428,8 +443,9 @@ impl Store {
     }
 
     /// Adds `account`, or replaces the settings of the account with the same id.
-    /// Replacing keeps its cached mail, its signature and its label, which only
-    /// [`Store::set_names`] changes, so adding an account again doesn't forget what it was called.
+    /// Replacing keeps its signature and its label, which only [`Store::set_names`] changes, so
+    /// adding an account again doesn't forget what it was called; and its cached mail, while its
+    /// mailboxes are the same ones: on the same IMAP server, port and username.
     ///
     /// # Errors
     ///
@@ -437,11 +453,8 @@ impl Store {
     pub fn save_account(&self, account: &Account) -> Result<()> {
         // Immediate: what's read is written on, and the sorter may write meanwhile.
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        // What sorting learned of where another server's or user's mail goes is of no use.
         if !same_mailboxes(&tx, account)? {
-            sorting::forget_sorting_of(&tx, &account.id)?;
-            // Nor are the mailboxes it autosorted to, which are another server's or user's.
-            sorting::forget_autosort_of(&tx, &account.id)?;
+            forget_mailboxes_of(&tx, &account.id)?;
         }
         upsert_account(&tx, account)?;
         tx.commit()?;
@@ -463,19 +476,7 @@ impl Store {
     ) -> Result<()> {
         let tx = immediate(&mut self.conn)?;
         if !same_mailboxes(&tx, account)? {
-            // Another server's or user's mailboxes: what's cached of the old ones, down to its
-            // UIDs and UIDVALIDITY, says nothing about the new ones. Messages and bodies go with
-            // their mailbox. Snoozes too: they're of messages on the old server.
-            tx.execute("DELETE FROM mailboxes WHERE account = ?1", [&account.id])?;
-            tx.execute(
-                "DELETE FROM listed_mailboxes WHERE account = ?1",
-                [&account.id],
-            )?;
-            tx.execute("DELETE FROM snoozes WHERE account = ?1", [&account.id])?;
-            tx.execute("DELETE FROM put_away WHERE account = ?1", [&account.id])?;
-            // And what sorting learned of where its mail goes, and where it autosorts to.
-            sorting::forget_sorting_of(&tx, &account.id)?;
-            sorting::forget_autosort_of(&tx, &account.id)?;
+            forget_mailboxes_of(&tx, &account.id)?;
         }
         upsert_account(&tx, account)?;
         tx.execute(
@@ -670,7 +671,8 @@ impl Store {
     }
 
     /// Replaces the account's list of mailboxes with what the server listed. Cached mail from a
-    /// mailbox that's no longer listed (deleted or renamed on the server) is dropped.
+    /// mailbox that's no longer listed (deleted or renamed on the server) is dropped, and a
+    /// cached mailbox still listed takes the role it's listed with, as when it's now the Drafts.
     ///
     /// # Errors
     ///
@@ -687,6 +689,12 @@ impl Store {
         tx.execute(
             "DELETE FROM mailboxes WHERE account = ?1
              AND name NOT IN (SELECT name FROM listed_mailboxes WHERE account = ?1)",
+            [account],
+        )?;
+        tx.execute(
+            "UPDATE mailboxes SET role = (SELECT l.role FROM listed_mailboxes l
+                WHERE l.account = mailboxes.account AND l.name = mailboxes.name)
+             WHERE account = ?1",
             [account],
         )?;
         // Mail put away in a mailbox gone says nothing of one made again under its name.
@@ -730,8 +738,9 @@ impl Store {
     }
 
     /// Caches `messages` fetched from `mailbox` under `uid_validity`, and files the mailbox under
-    /// `role`. For the inbox and Sent roles, another mailbox the account had with that role, such as
-    /// a renamed Sent folder, is dropped along with its mail.
+    /// `role`. For the inbox, Sent and the other roles but Drafts and [`Role::Other`], another
+    /// mailbox the account had with that role, such as a renamed Sent folder, is dropped along
+    /// with its mail. A server may mark several mailboxes Drafts.
     ///
     /// If `uid_validity` differs from what was cached, the old messages are dropped first: their UIDs
     /// no longer mean anything. Messages already cached are updated in place.
@@ -748,7 +757,7 @@ impl Store {
         messages: &[Envelope],
     ) -> Result<()> {
         let tx = immediate(&mut self.conn)?;
-        if role != Role::Other {
+        if !matches!(role, Role::Other | Role::Drafts) {
             tx.execute(
                 "DELETE FROM mailboxes WHERE account = ?1 AND role = ?2 AND name != ?3",
                 [account, role.as_str(), mailbox],
@@ -1688,6 +1697,28 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Whether a message snoozed in `account`'s mailbox `mailbox` is still to be woken from there,
+    /// due or not: by it or by any account on the same IMAP login, which reads the same mailbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn has_snoozed_in(&self, account: &str, mailbox: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM snoozes s
+                JOIN accounts other ON other.id = s.account
+                JOIN accounts this ON this.id = ?1
+                    AND lower(this.imap_host) = lower(other.imap_host)
+                    AND this.imap_port = other.imap_port
+                    AND this.imap_username = other.imap_username
+                WHERE s.mailbox = ?2
+            )",
+            [account, mailbox],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Remembers that mail went to `addresses` at `at` (Unix seconds), as contacts to suggest.
     /// One already known is counted again, and keeps its name unless this one has one. An
     /// address without an email is skipped.
@@ -2106,6 +2137,33 @@ mod tests {
             mime: "image/png".into(),
             data: data.into(),
         }
+    }
+
+    #[test]
+    fn saving_an_account_on_another_login_forgets_its_mailboxes() {
+        let mut store = Store::open_in_memory().unwrap();
+        let mine = account("me@example.com");
+        store.save_account(&mine).unwrap();
+        let work = Mailbox {
+            name: "Work".into(),
+            delimiter: None,
+            role: Role::Other,
+        };
+        store.save_mailbox_list(&mine.id, &[work]).unwrap();
+        store
+            .save_messages(&mine.id, "Work", Role::Other, 7, &[envelope(1, 10)])
+            .unwrap();
+        // Saved again as it was, as when a password changes: it's all kept.
+        store.save_account(&mine).unwrap();
+        assert!(store.mailbox_state(&mine.id, "Work").unwrap().is_some());
+        assert_eq!(store.mailboxes(&mine.id).unwrap().len(), 1);
+
+        let mut moved = mine.clone();
+        moved.imap.username = "someone-else".into();
+        store.save_account(&moved).unwrap();
+        assert!(store.mailbox_state(&mine.id, "Work").unwrap().is_none());
+        assert_eq!(store.mailboxes(&mine.id).unwrap(), []);
+        assert!(store.message(&mine.id, "Work", 1).unwrap().is_none());
     }
 
     #[test]
@@ -3295,6 +3353,83 @@ mod tests {
         drop(store);
         Store::open(&path).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_mailbox_holding_snoozed_mail_says_so_until_it_wakes() {
+        let me = "me@example.com";
+        let store = Store::open_in_memory().unwrap();
+        store.save_account(&account(me)).unwrap();
+        assert!(!store.has_snoozed_in(me, "Projects/Snoozed").unwrap());
+        let snooze = Snooze {
+            account: me.into(),
+            message_id: "a@example.com".into(),
+            mailbox: "Projects/Snoozed".into(),
+            until: 4_000_000_000,
+        };
+        store.snooze(&snooze).unwrap();
+        // Not due for long, it's still there.
+        assert!(store.has_snoozed_in(me, "Projects/Snoozed").unwrap());
+        assert!(!store.has_snoozed_in(me, "Snoozed").unwrap());
+        // Another account on the same login reads the same mailbox.
+        let mut twin = account("twin@example.com");
+        twin.imap = account(me).imap;
+        twin.imap.host = twin.imap.host.to_uppercase();
+        store.save_account(&twin).unwrap();
+        assert!(
+            store
+                .has_snoozed_in("twin@example.com", "Projects/Snoozed")
+                .unwrap()
+        );
+        store.unsnooze(me, "a@example.com", snooze.until).unwrap();
+        assert!(!store.has_snoozed_in(me, "Projects/Snoozed").unwrap());
+        assert!(
+            !store
+                .has_snoozed_in("twin@example.com", "Projects/Snoozed")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn drafts_moving_to_another_mailbox_keeps_the_first_and_its_mail() {
+        let me = "me@example.com";
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account(me)).unwrap();
+        let mailbox = |name: &str, role| Mailbox {
+            name: name.to_owned(),
+            delimiter: Some("/".to_owned()),
+            role,
+        };
+        // Cached before Drafts had a role of its own.
+        store
+            .save_messages(me, "Brouillons", Role::Other, 1, &[envelope(1, 10)])
+            .unwrap();
+        let listed = [
+            mailbox("INBOX", Role::Inbox),
+            mailbox("Brouillons", Role::Drafts),
+        ];
+        store.save_mailbox_list(me, &listed).unwrap();
+        let drafts = |store: &Store| store.mailbox_for_role(me, Role::Drafts).unwrap();
+        assert_eq!(
+            drafts(&store).map(|(n, _)| n).as_deref(),
+            Some("Brouillons")
+        );
+
+        // The server marks another: the first is a folder again, mail and all.
+        let listed = [
+            mailbox("INBOX", Role::Inbox),
+            mailbox("Brouillons", Role::Other),
+            mailbox("Drafts", Role::Drafts),
+        ];
+        store.save_mailbox_list(me, &listed).unwrap();
+        store
+            .save_messages(me, "Drafts", Role::Drafts, 1, &[envelope(1, 10)])
+            .unwrap();
+        assert_eq!(drafts(&store).map(|(n, _)| n).as_deref(), Some("Drafts"));
+        assert_eq!(
+            store.mailbox_messages(me, "Brouillons", 10).unwrap().len(),
+            1
+        );
     }
 
     #[test]
