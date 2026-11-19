@@ -12,26 +12,34 @@
   --font-serif: "Instrument Serif", ui-serif, Georgia, serif;
   --font-mono: "JetBrains Mono Variable", ui-monospace, SFMono-Regular, monospace;
 
-  /* The site's navy, stretched into a scale. */
-  --color-ink-50: #f5f6f9;
-  --color-ink-100: #e7eaf1;
-  --color-ink-200: #cdd3e0;
-  --color-ink-300: #a7b0c4;
-  --color-ink-400: #7d88a1;
-  --color-ink-500: #5a6681;
-  --color-ink-600: #424e69;
-  --color-ink-700: #313c55;
-  --color-ink-800: #26324a;
-  --color-ink-850: #1a2335;
-  --color-ink-900: #0f1522;
-  --color-ink-950: #0a0f19;
+  /* Plain grays: the screenshot of the app is the only color on the page. */
+  --color-ink-50: #f6f6f6;
+  --color-ink-100: #ebebeb;
+  --color-ink-200: #d6d6d6;
+  --color-ink-300: #b4b4b4;
+  --color-ink-400: #8c8c8c;
+  --color-ink-500: #6a6a6a;
+  --color-ink-600: #515151;
+  --color-ink-700: #3c3c3c;
+  --color-ink-800: #2a2a2a;
+  --color-ink-850: #1e1e1e;
+  --color-ink-900: #161616;
+  --color-ink-950: #0d0d0d;
 
-  --color-paper: #fbfaf7;
-  /* Fills and focus rings. Text uses accent-ink on light and accent-soft on dark, for AA contrast. */
-  --color-accent: #5b7bd5;
-  --color-accent-ink: #3a58ad;
-  --color-accent-soft: #9fb3ec;
-  --color-signal: #d9912f;
+  --color-paper: #fafafa;
+  /* Buttons, links and highlights: near-black on light, near-white on dark (flipped below). */
+  --color-accent: #161616;
+  --color-accent-ink: #000000;
+  --color-accent-soft: #f2f2f2;
+  --color-on-accent: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-accent: #f2f2f2;
+    --color-accent-ink: #ffffff;
+    --color-on-accent: #0d0d0d;
+  }
 }
 
 /* Accent-colored text that passes WCAG AA on both themes. */
@@ -53,8 +61,9 @@ body {
 }
 
 ::selection {
-  @apply bg-accent/25;
+  @apply bg-accent/20;
 }
+
 
 :focus-visible {
   @apply outline-2 outline-offset-2 outline-accent-ink dark:outline-accent-soft;
