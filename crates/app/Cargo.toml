@@ -11,6 +11,7 @@ publish.workspace = true
 postden-core.workspace = true
 postden-mail.workspace = true
 postden-store.workspace = true
+postden-ai.workspace = true
 postden-secrets.workspace = true
 postden-html.workspace = true
 postden-update.workspace = true

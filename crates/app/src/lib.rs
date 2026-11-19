@@ -14,6 +14,8 @@
 //! - [`Profile`]: every account and setting in one passphrase-locked file, to move Postden to
 //!   another computer.
 //! - [`import`]: setting up the accounts another mail app on this computer has, such as Spark.
+//! - [`Sorter`]: sorting mail on this computer, by what was done with the mail cached: which
+//!   mailbox each inbox message seems to belong in, and which seem important.
 //! - [`Settings`]: the app's preferences, such as its [`Theme`] and whether to check for updates.
 //! - [`format_date`] and [`recipients`]: dates and recipients as a mail list shows them.
 //! - [`snooze_times`] and [`format_snooze`]: when a message can be snoozed until, and saying so.
@@ -29,6 +31,7 @@ mod mailroom;
 mod profile;
 mod settings;
 pub mod signature;
+mod sorting;
 #[cfg(test)]
 mod testing;
 
@@ -48,6 +51,7 @@ pub use profile::{
     ImportOptions, Imported, MIN_PASSPHRASE, Profile, ProfileAccount, ProfileSettings, is_sealed,
 };
 pub use settings::{POLL_INTERVALS, PREFETCH_COUNTS, Settings, Theme};
+pub use sorting::{Sorted, Sorter, Tags};
 
 /// Why a Postden operation failed, phrased for the user.
 #[derive(Debug, thiserror::Error)]

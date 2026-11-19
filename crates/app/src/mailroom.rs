@@ -2186,8 +2186,10 @@ fn moved(store: &mut Store, moving: Moving, result: Result<(), String>) -> Updat
         if current != Some(uid_validity) {
             return Ok(false);
         }
+        // Put away in the Trash or Junk, a copy Gmail's All Mail still lists wasn't archived.
         store
-            .remove_message(&account, &mailbox, uid)
+            .put_away(&account, &mailbox, uid, &to)
+            .and_then(|()| store.remove_message(&account, &mailbox, uid))
             .map(|_| true)
             .map_err(|e| e.to_string())
     });
@@ -2420,6 +2422,10 @@ fn restored(
                     return Ok(false);
                 };
                 let moved = !uids.is_empty();
+                if moved {
+                    // Back in the Trash or Junk, or out of them, as Gmail's All Mail can't say.
+                    store.put_away_message(&account, &message_id, &to)?;
+                }
                 let current = is_current(store, &account, &mailbox, uid_validity)?;
                 if current {
                     for uid in uids {

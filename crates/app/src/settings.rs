@@ -1,8 +1,8 @@
 //! The app's preferences: its theme, how often mail is checked, how many messages are downloaded
-//! ahead of their opening, whether opened messages are kept, whether new mail is announced with a system notification, whether the
-//! app keeps running with its window closed, whether updates are checked for and which ones (the
-//! release track), whether the people mail is sent to are remembered, and whether the message
-//! list shows only unread mail, kept in the
+//! ahead of their opening, whether opened messages are kept, whether mail is sorted, whether new
+//! mail is announced with a system notification, whether the app keeps running with its window
+//! closed, whether updates are checked for and which ones (the release track), whether the people
+//! mail is sent to are remembered, and whether the message list shows only unread mail, kept in the
 //! [`Store`].
 
 use std::time::Duration;
@@ -16,6 +16,7 @@ const THEME: &str = "theme";
 const POLL_INTERVAL: &str = "poll_interval_secs";
 const PREFETCH: &str = "prefetch";
 const KEEP_OPENED: &str = "keep_opened";
+const SORT_MAIL: &str = "sort_mail";
 const NOTIFY_NEW_MAIL: &str = "notify_new_mail";
 const KEEP_RUNNING: &str = "keep_running";
 const CHECK_UPDATES: &str = "check_updates";
@@ -98,6 +99,9 @@ pub struct Settings {
     /// Whether a message, once opened, stays downloaded, so it opens again without waiting for
     /// the server. Off by default: only those downloaded ahead are.
     pub keep_opened: bool,
+    /// Whether inbox mail is tagged with where it seems to belong and whether it seems important,
+    /// as learned on this computer from the mail cached. On by default.
+    pub sort_mail: bool,
     /// Whether mail arriving unread in an inbox shows a system notification.
     pub notify_new_mail: bool,
     /// Whether closing the window leaves the app running, to bring back from the tray or Dock.
@@ -122,6 +126,7 @@ impl Default for Settings {
             poll_interval: Duration::from_mins(1),
             prefetch: 0,
             keep_opened: false,
+            sort_mail: true,
             notify_new_mail: true,
             keep_running: true,
             check_updates: true,
@@ -159,6 +164,10 @@ impl Settings {
             .setting(KEEP_OPENED)?
             .and_then(|s| s.parse().ok())
             .unwrap_or(default.keep_opened);
+        let sort_mail = store
+            .setting(SORT_MAIL)?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default.sort_mail);
         let notify_new_mail = store
             .setting(NOTIFY_NEW_MAIL)?
             .and_then(|s| s.parse().ok())
@@ -189,6 +198,7 @@ impl Settings {
             poll_interval,
             prefetch,
             keep_opened,
+            sort_mail,
             notify_new_mail,
             keep_running,
             check_updates,
@@ -214,6 +224,7 @@ impl Settings {
             (POLL_INTERVAL, &self.poll_interval.as_secs().to_string()),
             (PREFETCH, &self.prefetch.to_string()),
             (KEEP_OPENED, &self.keep_opened.to_string()),
+            (SORT_MAIL, &self.sort_mail.to_string()),
             (NOTIFY_NEW_MAIL, &self.notify_new_mail.to_string()),
             (KEEP_RUNNING, &self.keep_running.to_string()),
             (CHECK_UPDATES, &self.check_updates.to_string()),
@@ -239,6 +250,7 @@ mod tests {
             poll_interval: Duration::from_mins(5),
             prefetch: 50,
             keep_opened: true,
+            sort_mail: false,
             notify_new_mail: false,
             keep_running: false,
             check_updates: false,
@@ -258,6 +270,7 @@ mod tests {
         store.set_setting(POLL_INTERVAL, "0").unwrap();
         store.set_setting(PREFETCH, "lots").unwrap();
         store.set_setting(KEEP_OPENED, "forever").unwrap();
+        store.set_setting(SORT_MAIL, "alphabetically").unwrap();
         store.set_setting(NOTIFY_NEW_MAIL, "loudly").unwrap();
         store.set_setting(KEEP_RUNNING, "sometimes").unwrap();
         store.set_setting(CHECK_UPDATES, "maybe").unwrap();
