@@ -495,6 +495,9 @@ pub(crate) struct Mail {
     /// Unread messages, by account id and mailbox name: those cached, and those the server last
     /// had unread that aren't.
     unread: HashMap<MailboxKey, usize>,
+    /// The mailboxes whose unread mail was searched for on the server: their count in `unread`
+    /// is known, even when it's none. The others' may only not be counted yet.
+    counted: HashSet<MailboxKey>,
     /// The latest thing worth telling the user, such as new mail arriving.
     /// It closes on its own after [`NOTICE_SECS`], or when its close button is pressed.
     pub(crate) notice: Option<String>,
@@ -508,6 +511,12 @@ pub(crate) struct Mail {
     pub(crate) reader: Option<Reader>,
     /// Accounts whose mailboxes are hidden in the sidebar.
     pub(crate) collapsed: HashSet<String>,
+    /// Accounts whose group of mailboxes with nothing unread is open in the sidebar, while the
+    /// settings say to group them.
+    read_open: HashSet<String>,
+    /// Whether the mailbox shown, and the one whose menu is open, sat in their account's group of
+    /// mailboxes with nothing unread when picked: they stay there, or out of it, until left.
+    held: HashMap<MailboxKey, bool>,
     /// The toolbar's ⋯ menu is open.
     pub(crate) actions_open: bool,
     /// The menu of a message in the list, while it's open.
@@ -633,6 +642,7 @@ impl Mail {
             showing: Showing::All(Role::Inbox),
             mailboxes: HashMap::new(),
             unread: HashMap::new(),
+            counted: HashSet::new(),
             notice: None,
             notice_id: 0,
             form: AccountForm::default(),
@@ -654,6 +664,8 @@ impl Mail {
             refreshing: HashMap::new(),
             refreshing_all: HashMap::new(),
             collapsed: HashSet::new(),
+            read_open: HashSet::new(),
+            held: HashMap::new(),
             settings: Settings::default(),
             settings_open: false,
             settings_section: SettingsSection::default(),
@@ -945,8 +957,13 @@ impl Mail {
                 .map(|a| Ok((services.store.mailboxes(&a.id)?, a)))
                 .collect::<Result<Vec<_>, _>>()
         });
-        match (mailboxes, messages, services.store.unread_counts()) {
-            (Ok(accounts), Ok(mut messages), Ok(unread)) => {
+        match (
+            mailboxes,
+            messages,
+            services.store.unread_counts(),
+            services.store.counted_mailboxes(),
+        ) {
+            (Ok(accounts), Ok(mut messages), Ok(unread), Ok(counted)) => {
                 messages.retain(|m| {
                     !self
                         .moving
@@ -969,6 +986,7 @@ impl Mail {
                 }
                 self.listed = self.listed_mailboxes();
                 self.unread = unread;
+                self.counted = counted;
                 self.show_badge();
                 if let Some(reader) = &mut self.reader {
                     let m = &reader.message;
@@ -985,7 +1003,7 @@ impl Mail {
                     }
                 }
             }
-            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
                 self.notify(format!("couldn't read mail: {e}"));
             }
         }
@@ -2626,10 +2644,12 @@ impl Mail {
     /// Opens the menu of a mailbox in the sidebar at `point`, where it was right-clicked.
     pub(crate) fn open_mailbox_menu(&mut self, account: &str, mailbox: &str, point: PointerPress) {
         self.forget_go();
+        let grouped = self.in_open_group(account, mailbox);
         self.mailbox_menu = Some(MailboxMenu {
             mailbox: (account.to_owned(), mailbox.to_owned()),
             point,
         });
+        self.hold(account, mailbox, grouped);
     }
 
     pub(crate) fn close_mailbox_menu(&mut self) {
@@ -3081,6 +3101,13 @@ impl Mail {
     /// as every mailbox is looked in after each round. Asked for `again` meanwhile, it looks
     /// again: in the inbox, or in every other mailbox together.
     fn unread_found(&mut self, update: &Update) {
+        // Counted now, even when nothing changed: none unread is known to be none. As the store
+        // says, since a search the mailbox started over during counts nothing.
+        if let (Update::Unread { result: Ok(_), .. }, Ok(services)) = (update, &self.services)
+            && let Ok(counted) = services.store.counted_mailboxes()
+        {
+            self.counted = counted;
+        }
         if let Update::Unread {
             account,
             mailbox,
@@ -4153,6 +4180,86 @@ impl Mail {
         }
     }
 
+    /// An account's mailboxes as the sidebar lists them: the inbox first, then the rest; and,
+    /// while the settings say to group them, apart from those the mailboxes with nothing unread.
+    /// A mailbox not counted yet isn't known to have none, and the inbox always stays out of the
+    /// group.
+    pub(crate) fn sidebar_mailboxes(&self, account: &str) -> (Vec<&Mailbox>, Vec<&Mailbox>) {
+        let listed = self.mailboxes.get(account).map_or(&[][..], Vec::as_slice);
+        let (inbox, rest): (Vec<_>, Vec<_>) = listed.iter().partition(|m| m.role == Role::Inbox);
+        if !self.settings.group_read_mailboxes {
+            return (inbox.into_iter().chain(rest).collect(), Vec::new());
+        }
+        let (read, unread): (Vec<_>, Vec<_>) = rest
+            .into_iter()
+            .partition(|m| self.grouped(account, &m.name));
+        (inbox.into_iter().chain(unread).collect(), read)
+    }
+
+    /// Whether an account's mailbox other than the inbox is in its group of mailboxes with
+    /// nothing unread: counted, with none. The one shown and the one whose menu is open stay
+    /// where they were when picked, so a row doesn't leave from under the pointer as its last
+    /// message is read, or arrives; and out of the group while it's closed, to stay in sight.
+    fn grouped(&self, account: &str, mailbox: &str) -> bool {
+        let key = (account.to_owned(), mailbox.to_owned());
+        if self.picked(account, mailbox) {
+            return self.read_mailboxes_open(account) && self.held.get(&key) == Some(&true);
+        }
+        self.counted.contains(&key) && self.mailbox_unread(account, mailbox) == 0
+    }
+
+    /// Whether an account's mailbox is listed in its open group of mailboxes with nothing unread,
+    /// as the sidebar shows it now.
+    fn in_open_group(&self, account: &str, mailbox: &str) -> bool {
+        self.settings.group_read_mailboxes
+            && self.read_mailboxes_open(account)
+            && self.grouped(account, mailbox)
+    }
+
+    /// Whether an account's mailbox is the one shown, or the one whose menu is open.
+    fn picked(&self, account: &str, mailbox: &str) -> bool {
+        self.showing.is(account, mailbox)
+            || self
+                .mailbox_menu
+                .as_ref()
+                .is_some_and(|menu| menu.is(account, mailbox))
+    }
+
+    /// Keeps a mailbox just picked, shown or with its menu open, in the open group of mailboxes
+    /// with nothing unread or out of it, as `grouped` says it was; and forgets those no longer
+    /// picked.
+    fn hold(&mut self, account: &str, mailbox: &str, grouped: bool) {
+        let held = std::mem::take(&mut self.held);
+        self.held = held
+            .into_iter()
+            .filter(|((a, m), _)| self.picked(a, m))
+            .collect();
+        self.held
+            .insert((account.to_owned(), mailbox.to_owned()), grouped);
+    }
+
+    /// Whether an account's group of mailboxes with nothing unread is open in the sidebar.
+    pub(crate) fn read_mailboxes_open(&self, account: &str) -> bool {
+        self.read_open.contains(account)
+    }
+
+    /// Opens or closes an account's group of mailboxes with nothing unread in the sidebar.
+    pub(crate) fn toggle_read_mailboxes(&mut self, account: &str) {
+        if !self.read_open.remove(account) {
+            self.read_open.insert(account.to_owned());
+        }
+    }
+
+    /// Keeps each account's mailboxes with nothing unread in a group of their own in the
+    /// sidebar, or lists them with the rest again.
+    pub(crate) fn set_group_read_mailboxes(&mut self, on: bool) {
+        if self.settings.group_read_mailboxes == on {
+            return;
+        }
+        self.settings.group_read_mailboxes = on;
+        self.save_settings();
+    }
+
     /// Lists `showing`. A mailbox other than an inbox is also refreshed from the server, as those
     /// are otherwise only synced every few minutes.
     pub(crate) fn show(&mut self, showing: Showing) {
@@ -4183,7 +4290,18 @@ impl Mail {
         if !self.search.everywhere {
             self.search.forget_server();
         }
+        let grouped = match &showing {
+            Showing::Mailbox { account, name } => Some((
+                account.clone(),
+                name.clone(),
+                self.in_open_group(account, name),
+            )),
+            Showing::All(_) => None,
+        };
         self.showing = showing;
+        if let Some((account, name, grouped)) = grouped {
+            self.hold(&account, &name, grouped);
+        }
         self.list_limit = LIST_LIMIT;
         self.reload();
         self.find_unread_listed();
@@ -5975,6 +6093,103 @@ mod tests {
     }
 
     #[test]
+    fn mailboxes_with_nothing_unread_are_grouped_once_counted_unless_shown() {
+        let me = "me@example.com";
+        let mailbox = |name: &str, role| Mailbox {
+            name: name.into(),
+            delimiter: None,
+            role,
+        };
+        let names = |m: Vec<&Mailbox>| m.into_iter().map(|m| m.name.clone()).collect::<Vec<_>>();
+        let listed = |s: &Mail| {
+            let (listed, read) = s.sidebar_mailboxes(me);
+            (names(listed), names(read))
+        };
+        let mut s = Mail::not_started();
+        s.mailboxes.insert(
+            me.into(),
+            vec![
+                mailbox("Archive", Role::Archive),
+                mailbox("INBOX", Role::Inbox),
+                mailbox("Lists", Role::Other),
+                mailbox("Work", Role::Other),
+            ],
+        );
+        s.unread.insert((me.into(), "Lists".into()), 3);
+        let all = || {
+            (
+                vec![
+                    "INBOX".to_owned(),
+                    "Archive".into(),
+                    "Lists".into(),
+                    "Work".into(),
+                ],
+                vec![],
+            )
+        };
+        assert_eq!(listed(&s), all(), "off: listed as before, the inbox first");
+
+        s.set_group_read_mailboxes(true);
+        assert_eq!(listed(&s), all(), "none counted yet: none known to be read");
+        // As the store says once each was searched for unread mail.
+        for name in ["INBOX", "Archive", "Lists", "Work"] {
+            s.counted.insert((me.into(), name.into()));
+        }
+        assert_eq!(
+            listed(&s),
+            (
+                vec!["INBOX".to_owned(), "Lists".into()],
+                vec!["Archive".to_owned(), "Work".into()]
+            ),
+            "the inbox stays at the top, though it's read"
+        );
+        let show = |s: &mut Mail, name: &str| {
+            s.show(Showing::Mailbox {
+                account: me.into(),
+                name: name.into(),
+            });
+        };
+        // Shown from the open group, a mailbox stays in it, not under the pointer's next row.
+        assert!(!s.read_mailboxes_open(me), "closed until opened");
+        s.toggle_read_mailboxes(me);
+        assert!(s.read_mailboxes_open(me));
+        show(&mut s, "Work");
+        assert_eq!(listed(&s).1, ["Archive", "Work"]);
+        // Closed, the group leaves the mailbox shown in sight.
+        s.toggle_read_mailboxes(me);
+        assert_eq!(listed(&s).1, ["Archive"]);
+        s.toggle_read_mailboxes(me);
+
+        // Shown while listed, a mailbox stays listed as its last message is read.
+        show(&mut s, "Lists");
+        s.unread.remove(&(me.into(), "Lists".into()));
+        assert_eq!(listed(&s).0, ["INBOX", "Lists"]);
+        // Its menu open, it stays too; left, it goes to the group.
+        s.open_mailbox_menu(me, "Lists", PointerPress { x: 0.0, y: 0.0 });
+        show(&mut s, "Archive");
+        assert_eq!(listed(&s).0, ["INBOX", "Lists"], "menu still open");
+        s.close_mailbox_menu();
+        assert_eq!(listed(&s).1, ["Archive", "Lists", "Work"]);
+
+        // Picked in the list while grouping is off, a mailbox stays there once it's on.
+        s.set_group_read_mailboxes(false);
+        assert_eq!(listed(&s), all());
+        show(&mut s, "Work");
+        s.set_group_read_mailboxes(true);
+        assert_eq!(
+            listed(&s),
+            (
+                vec!["INBOX".to_owned(), "Work".into()],
+                vec!["Archive".to_owned(), "Lists".into()]
+            ),
+            "the group open, Work isn't in it"
+        );
+
+        s.set_group_read_mailboxes(false);
+        assert_eq!(listed(&s), all());
+    }
+
+    #[test]
     fn nothing_is_moved_to_a_mailbox_being_deleted() {
         let me = "me@example.com";
         let mut s = Mail::not_started();
@@ -7216,6 +7431,42 @@ mod tests {
             )
             .unwrap();
         s.reload();
+    }
+
+    #[test]
+    fn a_search_the_mailbox_started_over_during_doesnt_count_it() {
+        let (_dir, mut s) = synced("counted-stale", &[]);
+        let me = "ada@example.com";
+        let key = (me.to_owned(), "Lists".to_owned());
+        let searched = || Update::Unread {
+            account: me.into(),
+            mailbox: "Lists".into(),
+            result: Ok(0),
+            again: false,
+        };
+        let services = s.services.as_mut().unwrap();
+        services
+            .store
+            .save_messages(me, "Lists", Role::Other, 2, &[])
+            .unwrap();
+        // Begun under UIDVALIDITY 1, the search's answer is dropped, as the mailroom reports.
+        assert_eq!(
+            services
+                .store
+                .save_unread(me, "Lists", (1, 0), (0, 4), &[], &[])
+                .unwrap(),
+            None
+        );
+        s.apply(searched(), &mut Tx::default());
+        assert!(!s.counted.contains(&key), "not counted under UIDVALIDITY 2");
+
+        let services = s.services.as_mut().unwrap();
+        services
+            .store
+            .save_unread(me, "Lists", (2, 0), (0, 4), &[], &[])
+            .unwrap();
+        s.apply(searched(), &mut Tx::default());
+        assert!(s.counted.contains(&key), "none unread, and that's known");
     }
 
     #[test]
