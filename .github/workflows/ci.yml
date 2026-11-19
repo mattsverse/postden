@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The merge queue runs the checks on main with the queued PRs on top, so a PR that passed
+  # against an older main can't merge broken.
+  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -69,9 +72,10 @@ jobs:
 
   bundle:
     name: bundle (release, macos-15)
-    # Post-merge only: a release-only build failure is rare, and the release workflow builds the
-    # same thing before publishing. Its own job keeps release artifacts out of the PR caches.
-    if: github.event_name != 'pull_request'
+    # Post-merge only, not in PRs or the merge queue: a release-only build failure is rare, and
+    # the release workflow builds the same thing before publishing. Its own job keeps release
+    # artifacts out of the PR caches.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
