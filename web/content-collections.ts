@@ -4,12 +4,14 @@ import GithubSlugger from 'github-slugger'
 import rehypeSlug from 'rehype-slug'
 import { z } from 'zod'
 
-const featureIcons = ['inbox', 'lock', 'shield', 'compose', 'sparkles', 'code'] as const
+// Each kind has an icon in src/routes/index.tsx.
+const featureKinds = ['search', 'sorting', 'compat', 'safe', 'transfer', 'eml'] as const
 
-const feature = z.object({ icon: z.enum(featureIcons), title: z.string(), body: z.string() })
 const link = z.object({ label: z.string(), href: z.url() })
-// A real capture of the app in web/public/screenshots: `<name>-light.webp` and `<name>-dark.webp`.
+// A real capture of the app in web/public/screenshots: `<name>-light.webp` and `<name>-dark.webp`,
+// at twice `width` × `height`.
 const screenshot = z.object({ name: z.string(), alt: z.string(), width: z.number(), height: z.number() })
+const feature = z.object({ kind: z.enum(featureKinds), title: z.string(), body: z.string(), screenshot })
 const installMethod = {
   command: z.string().optional(),
   download: link.optional(),
@@ -26,23 +28,20 @@ const home = defineCollection({
     title: z.string(),
     description: z.string(),
     headline: z.string(),
-    headlineSecond: z.string(),
-    headlineAccent: z.string(),
     intro: z.string(),
     facts: z.array(z.string()),
     heroCommand: z.string(),
     heroCommandNote: z.string(),
     heroScreenshot: screenshot,
     featuresTitle: z.string(),
+    featuresIntro: z.string(),
     features: z.array(feature),
     privacy: z.object({
       title: z.string(),
       intro: z.string(),
-      never: z.array(z.string()),
+      // Everything the app connects to, by how often: always, sometimes, never.
+      groups: z.array(z.object({ title: z.string(), items: z.array(z.object({ name: z.string(), body: z.string() })) })),
       website: z.string(),
-      rules: z.array(
-        z.object({ action: z.enum(['allow', 'deny']), host: z.string(), purpose: z.string(), when: z.string() }),
-      ),
     }),
     installTitle: z.string(),
     installIntro: z.string(),

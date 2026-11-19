@@ -1,7 +1,7 @@
 ---
 title: Privacy Policy
 description: What Postden and this website collect (very little), where your data goes, and your choices.
-updated: 2026-11-14
+updated: 2026-11-19
 ---
 
 Postden is built so that your email is none of our business. This policy explains
@@ -13,8 +13,9 @@ what the Postden desktop app and the Postden website do with your data.
 - The app has no analytics, telemetry or crash reporting.
 - Your mail is stored on your own computer, and your passwords and sign-in tokens are kept
   in your operating system's keychain.
-- The app only talks to your mail provider, to Google if you sign in with Google, and to
-  GitHub to check for updates (which you can turn off). It has no AI features yet.
+- The app only talks to your mail provider, to Google if you sign in with Google, to
+  GitHub to check for updates (which you can turn off), and to n0 while you send your setup
+  to another computer. It has no AI features yet.
 
 ## Data the app stores on your computer
 
@@ -53,6 +54,16 @@ When it starts and once a day, the app asks GitHub's API
 whether a newer release exists, and downloads it from GitHub if you choose to update. GitHub
 sees your IP address and the request, as with any web request. You can turn automatic checks
 off under **Settings → Updates**.
+
+### n0, when you send your setup to another computer
+
+If you send your accounts and settings straight to another computer (**Settings → Accounts →
+Send…**), the two computers connect over [iroh](https://iroh.computer), using servers run by
+n0, the company behind it. They find each other through n0's address lookup, and the connection
+goes through an n0 relay until, or unless, they can connect directly. The connection is
+end-to-end encrypted, and what's sent is still locked with your passphrase, so n0 can't read it.
+n0 sees both computers' IP addresses and the key that identifies the transfer. The app doesn't
+connect to n0 at any other time.
 
 ### AI features, once they exist
 

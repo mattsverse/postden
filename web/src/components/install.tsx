@@ -43,7 +43,7 @@ function DownloadLink({ download, primary }: { download: NonNullable<Method['dow
     <a
       href={download.href}
       className={`inline-flex min-h-11 items-center gap-1.5 rounded-lg px-4 text-sm font-medium transition-colors ${
-        primary ? 'bg-white text-ink-900 hover:bg-ink-100' : 'text-white ring-1 ring-white/20 ring-inset hover:bg-white/5'
+        primary ? 'bg-accent text-on-accent hover:bg-accent-ink' : 'text-ink-800 ring-1 ring-ink-900/15 ring-inset hover:bg-ink-900/[0.04] dark:text-ink-100 dark:ring-white/15 dark:hover:bg-white/5'
       }`}
     >
       {download.label}
@@ -55,7 +55,7 @@ function DownloadLink({ download, primary }: { download: NonNullable<Method['dow
 function Step({ n, children }: { n: number; children: React.ReactNode }) {
   return (
     <li className="grid grid-cols-[24px_minmax(0,1fr)] items-start gap-3">
-      <span className="mt-2.5 grid size-6 place-items-center rounded-full bg-white/10 font-mono text-xs text-ink-200">{n}</span>
+      <span className="mt-2.5 grid size-6 place-items-center rounded-full bg-ink-900/[0.06] font-mono text-xs text-ink-600 dark:bg-white/10 dark:text-ink-200">{n}</span>
       <div>{children}</div>
     </li>
   )
@@ -71,14 +71,14 @@ function MethodBody({ method }: { method: Method }) {
           <DownloadLink download={download} primary />
         </Step>
         <Step n={2}>
-          <CopyCommand command={command} />
+          <CopyCommand command={command} tone="light" />
         </Step>
       </ol>
     )
   }
   return (
     <div className="space-y-4">
-      {command ? <CopyCommand command={command} /> : null}
+      {command ? <CopyCommand command={command} tone="light" /> : null}
       {download ? <DownloadLink download={download} primary={!command} /> : null}
     </div>
   )
@@ -101,8 +101,8 @@ export function Install({ options, footer }: { options: Option[]; footer: string
   const variant = option.variants?.[variants.selected]
 
   return (
-    <div className="self-start overflow-hidden rounded-2xl border border-white/10 bg-ink-900 text-ink-100 shadow-xl shadow-ink-900/10 dark:bg-ink-850">
-      <div role="tablist" aria-label="Platform" onKeyDown={tabs.onKeyDown} className="grid grid-cols-3 gap-1 border-b border-white/10 p-1.5">
+    <div className="self-start overflow-hidden rounded-3xl bg-white shadow-[0_20px_60px_-30px_rgba(0,0,0,0.3)] ring-1 ring-ink-900/10 dark:bg-ink-900 dark:shadow-none dark:ring-white/10">
+      <div role="tablist" aria-label="Platform" onKeyDown={tabs.onKeyDown} className="grid grid-cols-3 gap-1 border-b border-ink-900/[0.07] p-1.5 dark:border-white/[0.07]">
         {options.map((o, i) => (
           <button
             key={o.label}
@@ -117,7 +117,7 @@ export function Install({ options, footer }: { options: Option[]; footer: string
             aria-controls={`${id}-panel`}
             onClick={() => tabs.setSelected(i)}
             className={`min-h-11 rounded-lg px-3 text-sm font-medium transition-colors sm:min-h-10 ${
-              i === tabs.selected ? 'bg-white text-ink-900' : 'text-ink-300 hover:bg-white/5 hover:text-white'
+              i === tabs.selected ? 'bg-accent/10 text-accent-fg dark:bg-accent/25' : 'text-ink-500 hover:bg-ink-900/[0.04] hover:text-ink-900 dark:text-ink-300 dark:hover:bg-white/5 dark:hover:text-white'
             }`}
           >
             {o.label}
@@ -126,7 +126,7 @@ export function Install({ options, footer }: { options: Option[]; footer: string
       </div>
 
       <div id={`${id}-panel`} role="tabpanel" aria-labelledby={`${id}-tab-${tabs.selected}`} className="space-y-4 p-5 sm:p-6">
-        <p className="text-sm leading-relaxed text-ink-300">{option.note}</p>
+        <p className="text-sm leading-relaxed text-ink-600 dark:text-ink-300">{option.note}</p>
 
         {option.variants && variant ? (
           <>
@@ -134,7 +134,7 @@ export function Install({ options, footer }: { options: Option[]; footer: string
               role="tablist"
               aria-label={`${option.label} package`}
               onKeyDown={variants.onKeyDown}
-              className="inline-flex gap-1 rounded-lg bg-black/25 p-1"
+              className="inline-flex gap-1 rounded-lg bg-ink-900/[0.05] p-1 dark:bg-black/25"
             >
               {option.variants.map((v, i) => (
                 <button
@@ -150,7 +150,7 @@ export function Install({ options, footer }: { options: Option[]; footer: string
                   aria-controls={`${id}-variant-panel`}
                   onClick={() => variants.setSelected(i)}
                   className={`min-h-10 rounded-md px-3 font-mono text-[13px] transition-colors sm:min-h-8 ${
-                    i === variants.selected ? 'bg-white/15 text-white' : 'text-ink-300 hover:text-white'
+                    i === variants.selected ? 'bg-white text-ink-900 shadow-sm dark:bg-white/15 dark:text-white' : 'text-ink-500 hover:text-ink-900 dark:text-ink-300 dark:hover:text-white'
                   }`}
                 >
                   {v.label}
@@ -163,7 +163,7 @@ export function Install({ options, footer }: { options: Option[]; footer: string
               aria-labelledby={`${id}-variant-tab-${variants.selected}`}
               className="space-y-4"
             >
-              <p className="text-sm text-ink-300">{variant.note}</p>
+              <p className="text-sm text-ink-600 dark:text-ink-300">{variant.note}</p>
               <MethodBody method={variant} />
             </div>
           </>
@@ -173,7 +173,7 @@ export function Install({ options, footer }: { options: Option[]; footer: string
       </div>
 
       <div
-        className="border-t border-white/10 px-5 py-4 text-sm text-ink-300 sm:px-6 [&_a]:font-medium [&_a]:text-white [&_a]:underline [&_a]:underline-offset-2 [&_p]:m-0"
+        className="border-t border-ink-900/[0.07] px-5 py-4 text-sm text-ink-500 sm:px-6 dark:border-white/[0.07] dark:text-ink-400 [&_a]:font-medium [&_a]:text-accent-fg [&_a]:underline [&_a]:underline-offset-2 [&_p]:m-0"
         dangerouslySetInnerHTML={{ __html: footer }}
       />
     </div>
