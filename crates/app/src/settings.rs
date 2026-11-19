@@ -2,8 +2,8 @@
 //! ahead of their opening, whether opened messages are kept, whether mail is sorted, whether new
 //! mail is announced with a system notification, whether the app keeps running with its window
 //! closed, whether updates are checked for and which ones (the release track), whether the people
-//! mail is sent to are remembered, and whether the message list shows only unread mail, kept in the
-//! [`Store`].
+//! mail is sent to are remembered, whether the message list shows only unread mail, and whether the
+//! sidebar groups the mailboxes with none unread, kept in the [`Store`].
 
 use std::time::Duration;
 
@@ -24,6 +24,7 @@ const SKIPPED_UPDATE: &str = "skipped_update";
 const UPDATE_TRACK: &str = "update_track";
 const REMEMBER_CONTACTS: &str = "remember_contacts";
 const UNREAD_ONLY: &str = "unread_only";
+const GROUP_READ_MAILBOXES: &str = "group_read_mailboxes";
 
 /// Whether the window is light, dark, or follows the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -117,6 +118,9 @@ pub struct Settings {
     pub remember_contacts: bool,
     /// Whether the message list shows only unread mail. Off by default.
     pub unread_only: bool,
+    /// Whether the sidebar keeps each account's mailboxes with nothing unread in a group of their
+    /// own, closed until opened. Off by default.
+    pub group_read_mailboxes: bool,
 }
 
 impl Default for Settings {
@@ -134,6 +138,7 @@ impl Default for Settings {
             update_track: Track::default(),
             remember_contacts: false,
             unread_only: false,
+            group_read_mailboxes: false,
         }
     }
 }
@@ -193,6 +198,10 @@ impl Settings {
             .setting(UNREAD_ONLY)?
             .and_then(|s| s.parse().ok())
             .unwrap_or(default.unread_only);
+        let group_read_mailboxes = store
+            .setting(GROUP_READ_MAILBOXES)?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default.group_read_mailboxes);
         Ok(Self {
             theme,
             poll_interval,
@@ -206,6 +215,7 @@ impl Settings {
             update_track,
             remember_contacts,
             unread_only,
+            group_read_mailboxes,
         })
     }
 
@@ -232,6 +242,7 @@ impl Settings {
             (UPDATE_TRACK, self.update_track.key()),
             (REMEMBER_CONTACTS, &self.remember_contacts.to_string()),
             (UNREAD_ONLY, &self.unread_only.to_string()),
+            (GROUP_READ_MAILBOXES, &self.group_read_mailboxes.to_string()),
         ])?;
         Ok(())
     }
@@ -258,6 +269,7 @@ mod tests {
             update_track: Track::Nightly,
             remember_contacts: true,
             unread_only: true,
+            group_read_mailboxes: true,
         };
         settings.save(&store).unwrap();
         assert_eq!(Settings::load(&store).unwrap(), settings);
@@ -278,6 +290,7 @@ mod tests {
         store.set_setting(UPDATE_TRACK, "beta").unwrap();
         store.set_setting(REMEMBER_CONTACTS, "everyone").unwrap();
         store.set_setting(UNREAD_ONLY, "mostly").unwrap();
+        store.set_setting(GROUP_READ_MAILBOXES, "some").unwrap();
         assert_eq!(Settings::load(&store).unwrap(), Settings::default());
     }
 

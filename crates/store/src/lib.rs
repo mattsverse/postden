@@ -104,6 +104,9 @@ CREATE TABLE IF NOT EXISTS mailboxes (
     -- older mail is fetched below it. NULL until unread mail was first looked for, as every
     -- message from the lowest UID cached up is then.
     floor        INTEGER,
+    -- 1 once its unread mail was searched for on the server under this UIDVALIDITY: its unread
+    -- count is the server's, even when it's none.
+    counted      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account, name)
 ) STRICT;
 
@@ -275,7 +278,7 @@ CREATE TABLE IF NOT EXISTS autosorted (
 ";
 
 /// The schema version [`SCHEMA`] creates, kept in `PRAGMA user_version`.
-const VERSION: i64 = 6;
+const VERSION: i64 = 7;
 
 /// How long, in seconds, what [`Store::put_away_message`] noted of a message holds: a week. Its
 /// copy where it went is cached by then, and says so itself; and moved since by another mail
@@ -284,7 +287,7 @@ const PUT_AWAY_HOLDS: i64 = 7 * 24 * 60 * 60;
 
 /// Columns added since version 0, for databases created before them. Tables added since are
 /// created by [`SCHEMA`] itself.
-const MIGRATIONS: [(&str, &str, &str); 7] = [
+const MIGRATIONS: [(&str, &str, &str); 8] = [
     ("mailboxes", "role", "TEXT NOT NULL DEFAULT 'inbox'"),
     ("messages", "to_list", "TEXT"),
     // Version 2.
@@ -297,6 +300,8 @@ const MIGRATIONS: [(&str, &str, &str); 7] = [
     ("bodies", "kept", "INTEGER NOT NULL DEFAULT 0"),
     // Version 6.
     ("mailboxes", "floor", "INTEGER"),
+    // Version 7.
+    ("mailboxes", "counted", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 const MESSAGE_COLUMNS: &str = "m.account, m.mailbox, m.uid, m.message_id, m.from_name, m.from_email, m.subject, m.date, m.seen, m.to_list, m.flagged";
@@ -797,6 +802,7 @@ impl Store {
             "INSERT INTO mailboxes (account, name, uid_validity, role) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(account, name) DO UPDATE SET
                 floor = CASE WHEN uid_validity = excluded.uid_validity THEN floor END,
+                counted = CASE WHEN uid_validity = excluded.uid_validity THEN counted ELSE 0 END,
                 uid_validity = excluded.uid_validity, role = excluded.role",
             params![account, mailbox, uid_validity, role.as_str()],
         )?;
@@ -947,6 +953,10 @@ impl Store {
         if current != Some(uid_validity) {
             return Ok(None);
         }
+        tx.execute(
+            "UPDATE mailboxes SET counted = 1 WHERE account = ?1 AND name = ?2",
+            [account, mailbox],
+        )?;
         // Before what's below is added: every message from the lowest UID cached up was. With
         // nothing cached (`below` at 0), there's no such UID yet.
         if below > 0 {
@@ -1663,6 +1673,21 @@ impl Store {
                 .collect::<rusqlite::Result<_>>()?,
         };
         Ok(rows)
+    }
+
+    /// The mailboxes whose unread mail was searched for on the server since they were last
+    /// started over, by account id and mailbox name: their [unread count](Store::unread_counts)
+    /// is known, even when it's none. The others' may only not be counted yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn counted_mailboxes(&self) -> Result<HashSet<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT account, name FROM mailboxes WHERE counted")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// How many messages each mailbox has unread, by account id and mailbox name: those cached,
@@ -3431,6 +3456,30 @@ mod tests {
             !store.unread_searched(me, lists).unwrap(),
             "unread mail waits to be cached: a list of unread mail isn't empty yet"
         );
+    }
+
+    #[test]
+    fn a_mailbox_is_counted_once_searched_until_it_starts_over() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (me, lists) = ("me@example.com", "Lists");
+        let counted = |store: &Store| store.counted_mailboxes().unwrap().contains(&key(me, lists));
+        store.save_account(&account(me)).unwrap();
+        store.save_messages(me, lists, Role::Other, 1, &[]).unwrap();
+        assert!(!counted(&store), "cached, but never searched");
+        // Under a UIDVALIDITY it no longer has: nothing's known of it.
+        store
+            .save_unread(me, lists, (2, 0), (0, 4), &[], &[])
+            .unwrap();
+        assert!(!counted(&store), "a stale search");
+        store
+            .save_unread(me, lists, (1, 0), (0, 4), &[], &[])
+            .unwrap();
+        assert!(counted(&store), "none unread, and that's known");
+        assert_eq!(store.unread_counts().unwrap().get(&key(me, lists)), None);
+        store.save_messages(me, lists, Role::Other, 1, &[]).unwrap();
+        assert!(counted(&store), "synced again as it was");
+        store.save_messages(me, lists, Role::Other, 2, &[]).unwrap();
+        assert!(!counted(&store), "started over");
     }
 
     #[test]

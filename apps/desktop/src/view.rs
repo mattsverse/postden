@@ -417,12 +417,17 @@ fn sidebar(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     for account in &s.accounts {
         sidebar = sidebar.child(account_row(s, account, k, layer));
         if !s.collapsed.contains(&account.id) {
-            let listed = s.mailboxes.get(&account.id).map_or(&[][..], Vec::as_slice);
-            // The inbox first, so it stands out from the rest.
-            let (inbox, rest): (Vec<_>, Vec<_>) =
-                listed.iter().partition(|m| m.role == Role::Inbox);
-            for mailbox in inbox.into_iter().chain(rest) {
+            let (listed, read) = s.sidebar_mailboxes(&account.id);
+            for mailbox in listed {
                 sidebar = sidebar.child(mailbox_row(s, &account.id, mailbox, k, layer));
+            }
+            if !read.is_empty() {
+                sidebar = sidebar.child(read_mailboxes_row(s, &account.id, read.len(), k));
+                if s.read_mailboxes_open(&account.id) {
+                    for mailbox in read {
+                        sidebar = sidebar.child(mailbox_row(s, &account.id, mailbox, k, layer));
+                    }
+                }
             }
         }
     }
@@ -442,6 +447,44 @@ fn keep_keys_for_list(tx: &mut Tx) {
     if !tx.by_keys() {
         tx.blur();
     }
+}
+
+/// The row that opens or closes an account's group of `count` mailboxes with nothing unread,
+/// listed under it while it's open. A click on it toggles the group. The arrow keys pass over
+/// it, as they select each row they reach; its disclosure button, a stop of its own for Tab,
+/// toggles the group from the keyboard.
+fn read_mailboxes_row(s: &Mail, account: &str, count: usize, k: &Kit) -> El {
+    let open = s.read_mailboxes_open(account);
+    let (pressed, toggle) = (account.to_owned(), account.to_owned());
+    let disclosure = IconButton::new(if open {
+        &glyphs::TRIANGLE_DOWN
+    } else {
+        &glyphs::TRIANGLE_RIGHT
+    })
+    .variant(IconButtonVariant::GhostMuted)
+    .label(if open {
+        "Hide read mailboxes"
+    } else {
+        "Show read mailboxes"
+    })
+    .expanded(open)
+    .on_press_tx(move |s: &mut Mail, tx| {
+        s.toggle_read_mailboxes(&toggle);
+        keep_keys_for_list(tx);
+    })
+    .build(k);
+    SidebarRow::new("Read")
+        .depth(1)
+        .detail(count.to_string())
+        .trailing(disclosure)
+        .on_select(move |s: &mut Mail, tx| {
+            s.toggle_read_mailboxes(&pressed);
+            keep_keys_for_list(tx);
+        })
+        .build(k)
+        .focusable(false)
+        .focus_group()
+        .key(format!("read-mailboxes-{account}"))
 }
 
 /// One of an account's mailboxes, under the account. Right-clicking it opens its menu.
@@ -2472,6 +2515,22 @@ fn general_settings(s: &Mail, k: &Kit, page: El, layer: &mut Vec<El>) -> El {
                 .on_toggle(|s: &mut Mail| s.set_keep_running(!s.settings.keep_running))
                 .build(k)
                 .key("keep-running"),
+        ))
+        .child(setting_section(
+            k,
+            "Sidebar",
+            Some(
+                "Keep each account's mailboxes with nothing unread in a Read group under it, \
+                 closed until you open it, so the ones with new mail stand out. The inbox always \
+                 stays listed, and the mailbox you're looking at stays where it is.",
+            ),
+            Switch::new(s.settings.group_read_mailboxes)
+                .label("Group read mailboxes")
+                .on_toggle(|s: &mut Mail| {
+                    s.set_group_read_mailboxes(!s.settings.group_read_mailboxes);
+                })
+                .build(k)
+                .key("group-read-mailboxes"),
         ))
         .child(contacts_setting(s, k))
         .child(setting_section(
