@@ -84,7 +84,8 @@ async fn mark_verdict(session: &mut Session, uids: &str, verdict: Verdict) -> Re
     Ok(())
 }
 
-/// Downloads message `uid` from `mailbox` and marks it read.
+/// Downloads message `uid` from `mailbox` and marks it read. Returns whether the server marked
+/// it: a mailbox can let a message be read but not marked, as a shared one, and it still opens.
 ///
 /// `uid_validity` is the mailbox's UIDVALIDITY when the message was listed; if the server's differs,
 /// the UID may now name another message, so nothing is fetched.
@@ -98,14 +99,19 @@ pub async fn open_message(
     mailbox: &str,
     uid_validity: u32,
     uid: u32,
-) -> Result<Body> {
+) -> Result<(Body, bool)> {
     let mut session = connect(server, credentials).await?;
     let result = async {
         select(&mut session, mailbox, uid_validity).await?;
         // PEEK, then an explicit STORE: a plain BODY[] marks the message read only on some servers.
         let body = parse_body(&fetch_raw(&mut session, uid).await?);
-        store_flag(&mut session, uid, "\\Seen", true).await?;
-        Ok(body)
+        match store_flag(&mut session, uid, "\\Seen", true).await {
+            Ok(()) => Ok((body, true)),
+            Err(Error::Imap(
+                async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_),
+            )) => Ok((body, false)),
+            Err(e) => Err(e),
+        }
     }
     .await;
     // The work is done or failed already; a failed goodbye doesn't change that.
@@ -315,13 +321,10 @@ pub async fn mark_all_seen(
         } else {
             format!("1:{}", up_to - 1)
         };
-        with_timeout(async {
-            session
-                .uid_store(range, "+FLAGS.SILENT (\\Seen)")
-                .await?
-                .try_for_each(|_fetch| async { Ok(()) })
-                .await
-        })
+        // Checked: the crate's own STORE drops a refusal, as if it were done.
+        with_timeout(
+            session.run_command_and_check_ok(format!("UID STORE {range} +FLAGS.SILENT (\\Seen)")),
+        )
         .await?;
         Ok(up_to)
     }
@@ -536,22 +539,13 @@ async fn move_selected(
         with_timeout(session.uid_mv(uids, to)).await
     } else if capabilities.has_str("UIDPLUS") {
         with_timeout(session.uid_copy(uids, to)).await?;
-        with_timeout(async {
-            session
-                .uid_store(uids, "+FLAGS.SILENT (\\Deleted)")
-                .await?
-                .try_for_each(|_fetch| async { Ok(()) })
-                .await
-        })
+        // Checked: the crate's own STORE and EXPUNGE drop a refusal, as if the original were
+        // gone.
+        with_timeout(
+            session.run_command_and_check_ok(format!("UID STORE {uids} +FLAGS.SILENT (\\Deleted)")),
+        )
         .await?;
-        with_timeout(async {
-            session
-                .uid_expunge(uids)
-                .await?
-                .try_for_each(|_uid| async { Ok(()) })
-                .await
-        })
-        .await
+        with_timeout(session.run_command_and_check_ok(format!("UID EXPUNGE {uids}"))).await
     } else {
         Err(Error::CantMove)
     }
@@ -567,16 +561,12 @@ async fn select(session: &mut Session, mailbox: &str, uid_validity: u32) -> Resu
 }
 
 /// Adds `flag` to message `uid` of the selected mailbox, or with `on` unset, takes it away.
+/// Checked: the crate's own STORE drops a refusal, as if it were done.
 async fn store_flag(session: &mut Session, uid: u32, flag: &str, on: bool) -> Result<()> {
     let change = if on { '+' } else { '-' };
-    let query = format!("{change}FLAGS.SILENT ({flag})");
-    with_timeout(async {
-        session
-            .uid_store(uid.to_string(), query)
-            .await?
-            .try_for_each(|_fetch| async { Ok(()) })
-            .await
-    })
+    with_timeout(
+        session.run_command_and_check_ok(format!("UID STORE {uid} {change}FLAGS.SILENT ({flag})")),
+    )
     .await
 }
 

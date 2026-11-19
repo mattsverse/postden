@@ -127,6 +127,16 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS messages_by_date ON messages(date DESC);
 
+-- Messages the server last had unread that aren't cached, for the mailbox's unread count: the
+-- cache holds only the newest, and the newest of the older unread mail.
+CREATE TABLE IF NOT EXISTS unseen (
+    account TEXT NOT NULL,
+    mailbox TEXT NOT NULL,
+    uid     INTEGER NOT NULL,
+    PRIMARY KEY (account, mailbox, uid),
+    FOREIGN KEY (account, mailbox) REFERENCES mailboxes(account, name) ON DELETE CASCADE
+) STRICT;
+
 -- Messages downloaded ahead of their opening, or kept once opened. Address lists are encoded as
 -- in messages.to_list; references and attachment names are separated by U+001E.
 CREATE TABLE IF NOT EXISTS bodies (
@@ -775,6 +785,10 @@ impl Store {
                 "DELETE FROM messages WHERE account = ?1 AND mailbox = ?2",
                 [account, mailbox],
             )?;
+            tx.execute(
+                "DELETE FROM unseen WHERE account = ?1 AND mailbox = ?2",
+                [account, mailbox],
+            )?;
             // Its UIDs now name other messages.
             self.removed
                 .retain(|(a, m, _)| !(a == account && m == mailbox));
@@ -863,15 +877,18 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Saves what a search for unread mail below `below` in `mailbox` found, under the mailbox's
-    /// `uid_validity`, in a search that started at `asked`: the messages cached below it are read
-    /// unless in `unseen`, sorted ascending, and `messages`, the unread ones not cached, are added.
-    /// From then on, older mail is fetched below where it was fetched below before, and the
-    /// mailbox's unread mail [was looked for](Store::unread_searched). What was
-    /// [written](Store::written) since is newer, and wins.
+    /// Saves what a search for unread mail below `upto` in `mailbox` found, under the mailbox's
+    /// `uid_validity`, in a search that started at `asked`: the messages cached below `upto` are
+    /// read unless in `unseen`, sorted ascending, and `messages`, unread ones from below `below`
+    /// not cached, are added. The rest of `unseen` not cached is kept, for the mailbox's
+    /// [unread count](Store::unread_counts). From then on, older mail is fetched below where it
+    /// was fetched below before, and the mailbox's unread mail
+    /// [was looked for](Store::unread_searched). What was [written](Store::written) since is
+    /// newer, and wins.
     ///
     /// If the mailbox is no longer cached under `uid_validity`, nothing is saved. Returns how many
-    /// messages changed or were added, or `None` then.
+    /// messages changed or were added, and by how much the unread mail not cached changed, or
+    /// `None` then.
     ///
     /// # Errors
     ///
@@ -881,11 +898,11 @@ impl Store {
         account: &str,
         mailbox: &str,
         (uid_validity, asked): (u32, u64),
-        below: u32,
+        (below, upto): (u32, u32),
         unseen: &[u32],
         messages: &[Envelope],
     ) -> Result<Option<usize>> {
-        let cached = self.uids_below(account, mailbox, below)?;
+        let cached = self.uids_below(account, mailbox, upto)?;
         let seen: Vec<(u32, bool)> = cached
             .iter()
             .map(|&uid| {
@@ -899,6 +916,26 @@ impl Store {
             .collect();
         let mut messages = kept(&self.removed, account, mailbox, messages);
         self.with_written(account, mailbox, (uid_validity, asked), &mut messages);
+        // Unread on the server and not cached, unless put away or marked read since. Only what
+        // the server found counts: it says OK to marking unread a message that's gone.
+        let mut uncached: Vec<u32> = unseen
+            .iter()
+            .copied()
+            .filter(|&uid| {
+                uid < upto
+                    && cached.binary_search(&uid).is_err()
+                    && !messages.iter().any(|m| m.uid == uid)
+                    && !self
+                        .removed
+                        .contains(&(account.to_owned(), mailbox.to_owned(), uid))
+                    && self
+                        .written_since(account, mailbox, (uid_validity, uid), asked)
+                        .0
+                        != Some(true)
+            })
+            .collect();
+        uncached.sort_unstable();
+        uncached.dedup();
         let tx = immediate(&mut self.conn)?;
         let current: Option<u32> = tx
             .query_row(
@@ -910,13 +947,16 @@ impl Store {
         if current != Some(uid_validity) {
             return Ok(None);
         }
-        // Before what's below is added: every message from the lowest UID cached up was.
-        tx.execute(
-            "UPDATE mailboxes SET floor = COALESCE(floor,
-                (SELECT MIN(uid) FROM messages WHERE account = ?1 AND mailbox = ?2), ?3)
-             WHERE account = ?1 AND name = ?2",
-            params![account, mailbox, below],
-        )?;
+        // Before what's below is added: every message from the lowest UID cached up was. With
+        // nothing cached (`below` at 0), there's no such UID yet.
+        if below > 0 {
+            tx.execute(
+                "UPDATE mailboxes SET floor = COALESCE(floor,
+                    (SELECT MIN(uid) FROM messages WHERE account = ?1 AND mailbox = ?2), ?3)
+                 WHERE account = ?1 AND name = ?2",
+                params![account, mailbox, below],
+            )?;
+        }
         let mut changed = 0;
         {
             let mut update = tx.prepare(
@@ -927,13 +967,36 @@ impl Store {
                 changed += update.execute(params![account, mailbox, uid, seen])?;
             }
         }
+        let before = uncached_unread(&tx, account, mailbox)?;
         insert_messages(&tx, account, mailbox, &messages)?;
+        // Only what was searched: a search that stopped short says nothing of what's above.
+        tx.execute(
+            "DELETE FROM unseen WHERE account = ?1 AND mailbox = ?2 AND uid < ?3",
+            params![account, mailbox, upto],
+        )?;
+        {
+            let mut insert = tx.prepare("INSERT OR IGNORE INTO unseen VALUES (?1, ?2, ?3)")?;
+            for uid in &uncached {
+                insert.execute(params![account, mailbox, uid])?;
+            }
+        }
+        let after = uncached_unread(&tx, account, mailbox)?;
         tx.commit()?;
-        Ok(Some(changed + messages.len()))
+        Ok(Some(changed + messages.len() + before.abs_diff(after)))
+    }
+
+    /// How many of `mailbox`'s unread messages aren't cached, as a search on the server last
+    /// found them, or as marked since.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn uncached_unread(&self, account: &str, mailbox: &str) -> Result<usize> {
+        uncached_unread(&self.conn, account, mailbox)
     }
 
     /// Whether unread mail older than what's cached of `mailbox` was looked for, or there's
-    /// nothing cached to be older than.
+    /// nothing cached to be older than, nor unread mail known of that waits to be cached.
     ///
     /// # Errors
     ///
@@ -942,7 +1005,8 @@ impl Store {
         Ok(self.conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM mailboxes WHERE account = ?1 AND name = ?2
                 AND floor IS NOT NULL)
-             OR NOT EXISTS (SELECT 1 FROM messages WHERE account = ?1 AND mailbox = ?2)",
+             OR NOT EXISTS (SELECT 1 FROM messages WHERE account = ?1 AND mailbox = ?2)
+                AND NOT EXISTS (SELECT 1 FROM unseen WHERE account = ?1 AND mailbox = ?2)",
             [account, mailbox],
             |row| row.get(0),
         )?)
@@ -954,10 +1018,23 @@ impl Store {
     ///
     /// Returns an error when the write fails.
     pub fn set_seen(&self, account: &str, mailbox: &str, uid: u32, seen: bool) -> Result<bool> {
-        Ok(self.conn.execute(
+        // Unchecked, as in `set_settings`.
+        let tx = self.conn.unchecked_transaction()?;
+        let cached = tx.execute(
             "UPDATE messages SET seen = ?4 WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
             params![account, mailbox, uid, seen],
-        )? > 0)
+        )? > 0;
+        // One not cached, as one a search on the server found, no longer counts once read.
+        // Marked unread, it counts once a search finds it there: the server says OK to marking a
+        // message that's gone.
+        if seen {
+            tx.execute(
+                "DELETE FROM unseen WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+                params![account, mailbox, uid],
+            )?;
+        }
+        tx.commit()?;
+        Ok(cached)
     }
 
     /// Notes a read mark or star the server answered for message `uid`, under the mailbox's
@@ -1131,11 +1208,20 @@ impl Store {
     ///
     /// Returns an error when the write fails.
     pub fn set_all_seen(&self, account: &str, mailbox: &str, up_to: u32) -> Result<usize> {
-        Ok(self.conn.execute(
+        // Unchecked, as in `set_settings`.
+        let tx = self.conn.unchecked_transaction()?;
+        // Unread mail not cached is read too.
+        tx.execute(
+            "DELETE FROM unseen WHERE account = ?1 AND mailbox = ?2 AND uid < ?3",
+            params![account, mailbox, up_to],
+        )?;
+        let changed = tx.execute(
             "UPDATE messages SET seen = 1
              WHERE account = ?1 AND mailbox = ?2 AND uid < ?3 AND NOT seen",
             params![account, mailbox, up_to],
-        )?)
+        )?;
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// Drops a cached message, such as one moved to another mailbox. Returns whether it was cached.
@@ -1145,10 +1231,16 @@ impl Store {
     /// Returns an error when the write fails.
     /// Mail fetched before then and saved after doesn't bring it back.
     pub fn remove_message(&mut self, account: &str, mailbox: &str, uid: u32) -> Result<bool> {
-        let removed = self.conn.execute(
+        let tx = self.conn.transaction()?;
+        let removed = tx.execute(
             "DELETE FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
             params![account, mailbox, uid],
         )? > 0;
+        tx.execute(
+            "DELETE FROM unseen WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+            params![account, mailbox, uid],
+        )?;
+        tx.commit()?;
         self.removed
             .insert((account.to_owned(), mailbox.to_owned(), uid));
         Ok(removed)
@@ -1573,26 +1665,34 @@ impl Store {
         Ok(rows)
     }
 
-    /// How many messages each account has unread in its inbox, by account id. Accounts with none
-    /// are left out.
+    /// How many messages each mailbox has unread, by account id and mailbox name: those cached,
+    /// and those the server last had unread that aren't. Mailboxes with none are left out.
     ///
     /// # Errors
     ///
     /// Returns an error when the read fails.
-    pub fn unread_counts(&self) -> Result<HashMap<String, usize>> {
+    pub fn unread_counts(&self) -> Result<HashMap<(String, String), usize>> {
         let mut stmt = self.conn.prepare(
-            "SELECT m.account, COUNT(*) FROM messages m
-             JOIN mailboxes b ON b.account = m.account AND b.name = m.mailbox
-             WHERE b.role = 'inbox' AND NOT m.seen
-             GROUP BY m.account",
+            "SELECT account, mailbox, COUNT(*) FROM (
+                SELECT account, mailbox FROM messages WHERE NOT seen
+                UNION ALL
+                SELECT u.account, u.mailbox FROM unseen u
+                WHERE NOT EXISTS (SELECT 1 FROM messages m
+                    WHERE m.account = u.account AND m.mailbox = u.mailbox AND m.uid = u.uid)
+             )
+             GROUP BY account, mailbox",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
         rows.map(|row| {
-            let (account, count) = row?;
+            let (account, mailbox, count) = row?;
             let count = usize::try_from(count).map_err(|e| Error::Corrupt(e.to_string()))?;
-            Ok((account, count))
+            Ok(((account, mailbox), count))
         })
         .collect()
     }
@@ -1953,6 +2053,18 @@ fn kept(
         .collect()
 }
 
+/// How many of `mailbox`'s unread messages aren't cached, as [`Store::unread_counts`] counts them.
+fn uncached_unread(conn: &Connection, account: &str, mailbox: &str) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM unseen u
+         WHERE u.account = ?1 AND u.mailbox = ?2 AND NOT EXISTS (SELECT 1 FROM messages m
+            WHERE m.account = u.account AND m.mailbox = u.mailbox AND m.uid = u.uid)",
+        [account, mailbox],
+        |row| row.get(0),
+    )?;
+    usize::try_from(count).map_err(|e| Error::Corrupt(e.to_string()))
+}
+
 fn insert_messages(
     tx: &Transaction<'_>,
     account: &str,
@@ -2004,6 +2116,11 @@ mod tests {
             smtp: server("smtp.example.com", 587, Security::StartTls),
             auth: Auth::Password,
         }
+    }
+
+    /// An [`Store::unread_counts`] key.
+    fn key(account: &str, mailbox: &str) -> (String, String) {
+        (account.to_owned(), mailbox.to_owned())
     }
 
     fn envelope(uid: u32, date: i64) -> Envelope {
@@ -2699,7 +2816,10 @@ mod tests {
             .collect();
         assert_eq!(left, [1]);
         assert_eq!(
-            store.unread_counts().unwrap().get("me@example.com"),
+            store
+                .unread_counts()
+                .unwrap()
+                .get(&key("me@example.com", "INBOX")),
             Some(&1)
         );
 
@@ -2957,7 +3077,10 @@ mod tests {
         assert_eq!(seen(2), Some(true));
         assert_eq!(seen(3), Some(false), "arrived after it was marked");
         assert_eq!(
-            store.unread_counts().unwrap().get("me@example.com"),
+            store
+                .unread_counts()
+                .unwrap()
+                .get(&key("me@example.com", "INBOX")),
             Some(&1)
         );
     }
@@ -3020,11 +3143,11 @@ mod tests {
             .save_messages(me, inbox, Role::Inbox, 1, &[read(10, 100), read(11, 110)])
             .unwrap();
         assert!(!store.unread_searched(me, inbox).unwrap());
-        assert_eq!(store.unread_counts().unwrap().get(me), None);
+        assert_eq!(store.unread_counts().unwrap().get(&key(me, inbox)), None);
 
         assert_eq!(
             store
-                .save_unread(me, inbox, (2, 0), 10, &[3], &[envelope(3, 30)])
+                .save_unread(me, inbox, (2, 0), (10, 10), &[3], &[envelope(3, 30)])
                 .unwrap(),
             None,
             "stale"
@@ -3035,7 +3158,7 @@ mod tests {
                     me,
                     inbox,
                     (1, 0),
-                    10,
+                    (10, 10),
                     &[3, 7],
                     &[envelope(3, 30), envelope(7, 70)]
                 )
@@ -3043,7 +3166,10 @@ mod tests {
             Some(2)
         );
         assert!(store.unread_searched(me, inbox).unwrap());
-        assert_eq!(store.unread_counts().unwrap().get(me), Some(&2));
+        assert_eq!(
+            store.unread_counts().unwrap().get(&key(me, inbox)),
+            Some(&2)
+        );
         assert_eq!(
             store.oldest_uid(me, inbox).unwrap(),
             Some(10),
@@ -3063,7 +3189,9 @@ mod tests {
             },
         );
         assert_eq!(
-            store.save_unread(me, inbox, (1, 4), 10, &[3], &[]).unwrap(),
+            store
+                .save_unread(me, inbox, (1, 4), (10, 10), &[3], &[])
+                .unwrap(),
             Some(2)
         );
         assert_eq!(store.seen(me, inbox, 7).unwrap(), Some(true));
@@ -3169,8 +3297,206 @@ mod tests {
         );
         assert_eq!(
             store.unread_counts().unwrap(),
-            HashMap::from([("me@example.com".to_owned(), 1)]),
-            "only the inbox counts"
+            HashMap::from([(key("me@example.com", "INBOX"), 1)]),
+            "read mail isn't counted"
+        );
+    }
+
+    #[test]
+    fn unread_mail_not_cached_counts_until_cached_read_or_gone() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (me, lists) = ("me@example.com", "Lists");
+        store.save_account(&account(me)).unwrap();
+        let mut read = envelope(20, 200);
+        read.seen = true;
+        store
+            .save_messages(me, lists, Role::Other, 1, &[read, envelope(21, 210)])
+            .unwrap();
+        let count = |store: &Store| store.unread_counts().unwrap().get(&key(me, lists)).copied();
+        // 1 to 5 are unread and older than what's cached, and only 5 is fetched; elsewhere, 20
+        // was marked unread and 21 read: everything below 22 was searched.
+        assert_eq!(
+            store
+                .save_unread(
+                    me,
+                    lists,
+                    (1, 0),
+                    (20, 22),
+                    &[1, 2, 3, 4, 5, 20],
+                    &[envelope(5, 50)]
+                )
+                .unwrap(),
+            Some(2 + 1 + 4),
+            "20 and 21 changed, 5 added, 1 to 4 counted"
+        );
+        assert_eq!(
+            store.seen(me, lists, 20).unwrap(),
+            Some(false),
+            "above the floor too"
+        );
+        assert_eq!(store.seen(me, lists, 21).unwrap(), Some(true));
+        assert_eq!(count(&store), Some(6), "1 to 4 not cached, 5 and 20 cached");
+
+        // Fetched as older mail later, they count once.
+        store
+            .save_older_messages(me, lists, 1, &[envelope(4, 40)])
+            .unwrap();
+        assert_eq!(count(&store), Some(6));
+        store.set_seen(me, lists, 4, true).unwrap();
+        assert_eq!(count(&store), Some(5), "read here");
+
+        assert!(
+            !store.remove_message(me, lists, 3).unwrap(),
+            "moved, though not cached"
+        );
+        assert_eq!(count(&store), Some(4));
+        store.set_all_seen(me, lists, 22).unwrap();
+        assert_eq!(count(&store), None, "all read");
+
+        store
+            .save_unread(me, lists, (1, 0), (5, 22), &[1, 2], &[])
+            .unwrap();
+        assert_eq!(count(&store), Some(2));
+        store.save_messages(me, lists, Role::Other, 2, &[]).unwrap();
+        assert_eq!(count(&store), None, "the mailbox started over");
+    }
+
+    #[test]
+    fn unread_mail_not_cached_counts_what_searches_find_even_short() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (me, lists) = ("me@example.com", "Lists");
+        store.save_account(&account(me)).unwrap();
+        store
+            .save_messages(me, lists, Role::Other, 1, &[envelope(20, 200)])
+            .unwrap();
+        let count = |store: &Store| store.unread_counts().unwrap().get(&key(me, lists)).copied();
+        store
+            .save_unread(me, lists, (1, 0), (20, 21), &[1, 2, 20], &[])
+            .unwrap();
+        assert_eq!(count(&store), Some(3));
+
+        // A server search's message, not cached, read and then unread again: it counts again
+        // once a search finds it.
+        assert!(!store.set_seen(me, lists, 1, true).unwrap());
+        assert_eq!(count(&store), Some(2));
+        assert!(!store.set_seen(me, lists, 1, false).unwrap());
+        assert_eq!(count(&store), Some(2));
+        store
+            .save_unread(me, lists, (1, 0), (20, 21), &[1, 2, 20], &[])
+            .unwrap();
+        assert_eq!(count(&store), Some(3));
+
+        // Marked unread after a search started that didn't find it: only what the server finds
+        // counts, as marking a message that's gone is OK too; the next search finds it.
+        store.written(
+            me,
+            lists,
+            (1, 3),
+            Written {
+                at: 5,
+                seen: Some(false),
+                flagged: None,
+            },
+        );
+        assert_eq!(
+            store
+                .save_unread(me, lists, (1, 4), (20, 21), &[1, 2, 20], &[])
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(count(&store), Some(3), "1, 2 and 20");
+
+        // Without UIDNEXT, a search stops at the floor: what's above it stays counted.
+        store
+            .save_unread(me, lists, (1, 4), (20, 20), &[2], &[])
+            .unwrap();
+        assert_eq!(count(&store), Some(2), "1 read elsewhere; 20 cached");
+    }
+
+    #[test]
+    fn a_mailbox_with_nothing_cached_still_counts_without_a_floor() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (me, lists) = ("me@example.com", "Lists");
+        store.save_account(&account(me)).unwrap();
+        store.save_messages(me, lists, Role::Other, 1, &[]).unwrap();
+        assert_eq!(
+            store
+                .save_unread(me, lists, (1, 0), (0, 4), &[2, 3], &[])
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(store.uncached_unread(me, lists).unwrap(), 2);
+        assert_eq!(store.oldest_uid(me, lists).unwrap(), None, "no floor yet");
+        assert!(
+            !store.unread_searched(me, lists).unwrap(),
+            "unread mail waits to be cached: a list of unread mail isn't empty yet"
+        );
+    }
+
+    #[test]
+    fn a_badge_that_changes_while_rows_dont_still_reports_a_change() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (me, lists) = ("me@example.com", "Lists");
+        store.save_account(&account(me)).unwrap();
+        store
+            .save_messages(me, lists, Role::Other, 1, &[envelope(20, 200)])
+            .unwrap();
+        store
+            .save_unread(me, lists, (1, 0), (20, 21), &[5, 20], &[])
+            .unwrap();
+        // Cached since, as older mail, and read: its row no longer counts.
+        let mut read = envelope(5, 50);
+        read.seen = true;
+        store.save_older_messages(me, lists, 1, &[read]).unwrap();
+        let count = |store: &Store| {
+            store
+                .unread_counts()
+                .unwrap()
+                .get(&key(me, lists))
+                .copied()
+                .unwrap_or_default()
+        };
+        assert_eq!(count(&store), 1, "5 is cached read: only 20");
+        // Another arrived unread below the floor, uncached: one row for another.
+        assert_eq!(
+            store
+                .save_unread(me, lists, (1, 0), (20, 21), &[6, 20], &[])
+                .unwrap(),
+            Some(1),
+            "the same row count, but 6 counts where 5 didn't"
+        );
+        assert_eq!(count(&store), 2);
+    }
+
+    #[test]
+    fn every_mailbox_counts_its_unread_mail() {
+        let mut store = Store::open_in_memory().unwrap();
+        let me = "me@example.com";
+        store.save_account(&account(me)).unwrap();
+        let mut read = envelope(3, 30);
+        read.seen = true;
+        store
+            .save_messages(me, "INBOX", Role::Inbox, 1, &[envelope(1, 10), read])
+            .unwrap();
+        store
+            .save_messages(
+                me,
+                "Lists",
+                Role::Other,
+                2,
+                &[envelope(1, 10), envelope(2, 20)],
+            )
+            .unwrap();
+        store
+            .save_messages(me, "Junk", Role::Junk, 3, &[envelope(1, 10)])
+            .unwrap();
+        assert_eq!(
+            store.unread_counts().unwrap(),
+            HashMap::from([
+                (key(me, "INBOX"), 1),
+                (key(me, "Lists"), 2),
+                (key(me, "Junk"), 1),
+            ])
         );
     }
 

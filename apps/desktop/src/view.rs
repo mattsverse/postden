@@ -461,8 +461,12 @@ fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut 
         .depth(1)
         .selected(selected)
         .on_select(move |s: &mut Mail, tx| show_from_sidebar(s, tx, showing.clone()));
-    let unread = s.unread(Some(account));
-    if mailbox.role == Role::Inbox && unread > 0 {
+    // The inbox's count is the account's, whatever case the server lists it in.
+    let unread = match mailbox.role {
+        Role::Inbox => s.unread(Some(account)),
+        _ => s.mailbox_unread(account, &mailbox.name),
+    };
+    if unread > 0 {
         r = r.badge(unread.to_string());
     }
     if s.marking_seen(account, &mailbox.name) || s.refreshing(account, &mailbox.name) {
@@ -983,6 +987,9 @@ fn empty_list(s: &Mail, k: &Kit) -> El {
         "No cached mail matches."
     } else if s.accounts.is_empty() {
         "Add an account to get started."
+    } else if s.settings.unread_only && s.listed_unread() > 0 {
+        // Counted, but not listed: not fetched yet, or read and still being marked so.
+        "Some unread mail here isn't shown yet."
     } else if s.settings.unread_only && s.listing_synced() {
         return nothing_unread(s, k);
     } else if s.showing_sent() {

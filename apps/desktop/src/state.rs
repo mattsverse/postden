@@ -64,6 +64,9 @@ pub(crate) struct Reader {
     /// The UIDVALIDITY its mailbox was cached under when it opened: a download made under
     /// another is of another message.
     uid_validity: Option<u32>,
+    /// Whether it was read before it opened, shown read since: as it shows again when the server
+    /// won't mark it.
+    seen_before: bool,
 }
 
 impl Reader {
@@ -243,7 +246,10 @@ const fn changes_mail(update: &Update) -> bool {
             | Update::Mail { .. }
             | Update::FlagsChanged { .. }
             | Update::Older { .. }
-            | Update::Unread { .. }
+            | Update::Unread {
+                result: Ok(1..),
+                ..
+            }
             | Update::Opened { .. }
             | Update::Seen { .. }
             | Update::Flagged { .. }
@@ -486,8 +492,9 @@ pub(crate) struct Mail {
     no_older: HashSet<MailboxKey>,
     /// Each account's mailboxes as the server last listed them, by account id.
     pub(crate) mailboxes: HashMap<String, Vec<Mailbox>>,
-    /// Unread inbox messages, by account id.
-    unread: HashMap<String, usize>,
+    /// Unread messages, by account id and mailbox name: those cached, and those the server last
+    /// had unread that aren't.
+    unread: HashMap<MailboxKey, usize>,
     /// The latest thing worth telling the user, such as new mail arriving.
     /// It closes on its own after [`NOTICE_SECS`], or when its close button is pressed.
     pub(crate) notice: Option<String>,
@@ -1061,13 +1068,7 @@ impl Mail {
             Update::ReleaseFailed(error) => {
                 self.notify(format!("Couldn't drop the opened messages kept: {error}"));
             }
-            Update::Opened {
-                account,
-                mailbox,
-                uid_validity,
-                uid,
-                body,
-            } => self.opened(&(account, mailbox, uid), uid_validity, body, tx),
+            update @ Update::Opened { .. } => self.opened_update(update, tx),
             // Sent mail is shown as it's listed, without a notice.
             Update::Mail { .. } => self.reload(),
             update @ Update::Unread { .. } => self.unread_found(&update),
@@ -1238,6 +1239,8 @@ impl Mail {
                     && reader.message.envelope.uid < up_to
                 {
                     reader.message.envelope.seen = true;
+                    // Read now, should a read mark asked as it opened be refused after.
+                    reader.seen_before = true;
                 }
             }
             Err(error) => {
@@ -1286,20 +1289,46 @@ impl Mail {
         self.reload();
     }
 
+    /// [`Update::Opened`], as [`Mail::opened`].
+    fn opened_update(&mut self, update: Update, tx: &mut Tx) {
+        if let Update::Opened {
+            account,
+            mailbox,
+            uid_validity,
+            uid,
+            body,
+            marked,
+        } = update
+        {
+            self.opened(&(account, mailbox, uid), uid_validity, (body, marked), tx);
+        }
+    }
+
     /// A message asked for with [`Mail::open_message`] was downloaded, or couldn't be.
     fn opened(
         &mut self,
         key: &MessageKey,
         uid_validity: u32,
-        body: Result<Body, String>,
+        (body, marked): (Result<Body, String>, bool),
         tx: &mut Tx,
     ) {
         let (account, mailbox, uid) = (key.0.as_str(), key.1.as_str(), key.2);
-        self.search
-            .settle(account, mailbox, uid, body.is_ok().then_some(true));
+        // Downloaded and marked, it's read; refused, it's as it was last confirmed.
+        let read = (body.is_ok() && marked).then_some(true);
+        self.search.settle(account, mailbox, uid, read);
         // Not downloaded, it isn't read either.
         if body.is_err() {
             self.read_later.remove(key);
+        }
+        // Refused, it shows as it was before it opened, shown read since: first, so what the
+        // store says as the mark is answered below wins.
+        if body.is_ok()
+            && !marked
+            && let Some(reader) = &mut self.reader
+            && reader.is(account, mailbox, uid)
+            && reader.uid_validity.is_none_or(|v| v == uid_validity)
+        {
+            reader.message.envelope.seen = reader.seen_before;
         }
         // Its read mark is answered; a download failing isn't a U refused, so the undo stays,
         // and is done once nothing else is awaited, as a U refused would have dropped it.
@@ -1316,8 +1345,8 @@ impl Mail {
         {
             reader.markdown = body.as_ref().ok().and_then(markdown);
             let downloaded = body.is_ok();
-            if downloaded {
-                reader.message.envelope.seen = true;
+            if let Some(read) = read {
+                reader.message.envelope.seen = read;
             }
             reader.body = Some(body);
             // The server, not a click, brought it, which would land the text at once:
@@ -1966,6 +1995,7 @@ impl Mail {
             self.stale_marks.remove(&key);
         }
         let mut reader = Reader {
+            seen_before: message.envelope.seen,
             message,
             body: None,
             markdown: None,
@@ -2997,20 +3027,19 @@ impl Mail {
             _ => return,
         };
         let inbox = |name: &str| name.eq_ignore_ascii_case(INBOX);
-        // Unread mail older than what's cached is looked for as each mailbox syncs: every inbox,
-        // for the unread counts, and what's listed, showing only unread mail.
+        // Unread mail older than what's cached is looked for as each inbox syncs, for its unread
+        // count; the other mailboxes are looked in together once the round syncing them ends.
         if let (Ok(services), Some(synced)) = (&self.services, mailbox.as_deref())
-            && (inbox(synced)
-                || (self.settings.unread_only
-                    && self
-                        .listed
-                        .iter()
-                        .any(|(a, m)| *a == account && m == synced)))
+            && inbox(synced)
         {
             // One that isn't watched looks once it syncs.
             let _ignored = services
                 .mailroom
                 .find_unread(&services.store, &account, synced);
+        }
+        if mailbox.is_none() {
+            // The refresher's round ended.
+            self.find_unread_each(&account);
         }
         if mailbox.is_none()
             && self
@@ -3029,24 +3058,75 @@ impl Mail {
         });
     }
 
+    /// Looks in every mailbox of `account` but the inbox for its unread mail, all over one
+    /// connection, for their unread counts.
+    fn find_unread_each(&self, account: &str) {
+        let (Ok(services), Some(mailboxes)) = (&self.services, self.mailboxes.get(account)) else {
+            return;
+        };
+        let others: Vec<String> = mailboxes
+            .iter()
+            .filter(|m| m.role != Role::Inbox)
+            .map(|m| m.name.clone())
+            .collect();
+        // An account that isn't connected looks after its next round.
+        let _ignored = services
+            .mailroom
+            .find_unread_each(&services.store, account, &others);
+    }
+
     /// Older unread mail was looked for in one of an account's mailboxes ([`Update::Unread`]): it
     /// isn't new, so it's only listed. Failing to look isn't shown, as the account's status says
-    /// whether its server answers, and the next sync looks again. Asked for `again` meanwhile,
-    /// it looks again.
+    /// whether its server answers, and the next sync looks again; nor is what changed nothing,
+    /// as every mailbox is looked in after each round. Asked for `again` meanwhile, it looks
+    /// again: in the inbox, or in every other mailbox together.
     fn unread_found(&mut self, update: &Update) {
-        self.reload();
+        if let Update::Unread {
+            account,
+            mailbox,
+            result: Ok(1..),
+            ..
+        } = update
+        {
+            self.reload();
+            // Open, though not listed, it's read or not as the store now says.
+            self.reader_flags_changed(account, mailbox);
+        }
         if let Update::Unread {
             account,
             mailbox,
             again: true,
             ..
         } = update
-            && let Ok(services) = &self.services
         {
-            let _ignored = services
-                .mailroom
-                .find_unread(&services.store, account, mailbox);
+            self.recount(account, mailbox);
         }
+    }
+
+    /// Looks for unread mail again in an account's mailbox: the inbox alone, any other with the
+    /// rest, together.
+    fn recount(&self, account: &str, mailbox: &str) {
+        if mailbox.eq_ignore_ascii_case(INBOX) {
+            self.recount_one(account, mailbox);
+        } else {
+            self.find_unread_each(account);
+        }
+    }
+
+    /// Looks for unread mail again in an account's mailbox alone: the inbox, or another over the
+    /// connection the others are looked in over, after them if they're being looked in.
+    fn recount_one(&self, account: &str, mailbox: &str) {
+        let Ok(services) = &self.services else { return };
+        // An account that isn't connected looks once it syncs.
+        let _ignored = if mailbox.eq_ignore_ascii_case(INBOX) {
+            services
+                .mailroom
+                .find_unread(&services.store, account, mailbox)
+        } else {
+            services
+                .mailroom
+                .find_unread_each(&services.store, account, &[mailbox.to_owned()])
+        };
     }
 
     /// The accounts and mailboxes the list shows, which [`Self::refresh_shown`] syncs: searching
@@ -3633,6 +3713,16 @@ impl Mail {
                 uid,
                 seen,
             } => {
+                // Marked unread and not cached, as a server search's: it counts once the server
+                // says it's there.
+                let uncached = |s: &Services| {
+                    s.store
+                        .seen(&account, &mailbox, uid)
+                        .is_ok_and(|c| c.is_none())
+                };
+                if !seen && self.services.as_ref().is_ok_and(uncached) {
+                    self.recount_one(&account, &mailbox);
+                }
                 self.search.settle(&account, &mailbox, uid, Some(seen));
                 self.changed_for_undo(&(account, mailbox, uid), false, Ok(seen));
                 self.reload();
@@ -4033,10 +4123,27 @@ impl Mail {
 
     /// How many inbox messages are unread, in one account or all of them.
     pub(crate) fn unread(&self, account: Option<&str>) -> usize {
-        account.map_or_else(
-            || self.unread.values().sum(),
-            |id| self.unread.get(id).copied().unwrap_or_default(),
-        )
+        self.unread
+            .iter()
+            .filter(|((a, m), _)| account.is_none_or(|id| a == id) && m.eq_ignore_ascii_case(INBOX))
+            .map(|(_, n)| n)
+            .sum()
+    }
+
+    /// How many messages are unread in the mailboxes the list shows.
+    pub(crate) fn listed_unread(&self) -> usize {
+        self.listed
+            .iter()
+            .map(|(account, name)| self.mailbox_unread(account, name))
+            .sum()
+    }
+
+    /// How many messages in an account's mailbox are unread.
+    pub(crate) fn mailbox_unread(&self, account: &str, mailbox: &str) -> usize {
+        self.unread
+            .get(&(account.to_owned(), mailbox.to_owned()))
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Shows or hides an account's mailboxes in the sidebar.
@@ -4082,24 +4189,35 @@ impl Mail {
         self.find_unread_listed();
     }
 
-    /// Showing only unread mail, looks for what's older than the cache in each mailbox listed not
-    /// looked in yet. Each looks again as it syncs.
+    /// Showing only unread mail, looks for unread mail in each mailbox listed not looked in yet:
+    /// an inbox alone, the others together. An inbox looks again as it syncs, the others after
+    /// each round syncing them.
     fn find_unread_listed(&self) {
         let Ok(services) = &self.services else { return };
         if !self.settings.unread_only {
             return;
         }
+        let mut others: Vec<&str> = Vec::new();
         for (account, name) in &self.listed {
-            if !services
+            if services
                 .store
                 .unread_searched(account, name)
                 .unwrap_or(true)
             {
+                continue;
+            }
+            if name.eq_ignore_ascii_case(INBOX) {
                 // An account that isn't connected looks once it syncs.
                 let _ignored = services
                     .mailroom
                     .find_unread(&services.store, account, name);
+            } else if !others.contains(&account.as_str()) {
+                others.push(account);
             }
+        }
+        // The others are looked in together, as after a round.
+        for account in others {
+            self.find_unread_each(account);
         }
     }
 
@@ -4163,8 +4281,8 @@ impl Mail {
 
     /// Whether the list has more to show past its end: cached, or still on a server.
     /// While searching, that's only more cached matches: the server is searched as a whole.
-    /// Showing only unread mail, that's only more cached: the cache holds what's unread, as the
-    /// unread counts say.
+    /// Showing only unread mail, that's only more cached: the cache holds the newest of what's
+    /// unread, and the unread counts can say more than it lists.
     pub(crate) fn has_older(&self) -> bool {
         if self.search.is_active() || self.settings.unread_only {
             return self.messages.len() >= self.list_limit;
@@ -6659,6 +6777,7 @@ mod tests {
             body: None,
             markdown: None,
             uid_validity: Some(1),
+            seen_before: true,
         });
         s.leaving = vec![Restoring {
             account: "ada@example.com".into(),
@@ -6721,7 +6840,12 @@ mod tests {
         s.changed_for_undo(&ada(1), false, Ok(false));
         assert!(matches!(s.undo, Some(Undo::Seen { done: false, .. })));
         s.read_later.insert(ada(1), Some(1));
-        s.opened(&ada(1), 1, Err("offline".into()), &mut Tx::default());
+        s.opened(
+            &ada(1),
+            1,
+            (Err("offline".into()), false),
+            &mut Tx::default(),
+        );
         assert!(matches!(s.undo, Some(Undo::Seen { done: true, .. })));
         assert!(
             s.read_later.is_empty(),
@@ -6759,6 +6883,7 @@ mod tests {
             body: None,
             markdown: None,
             uid_validity: Some(1),
+            seen_before: seen,
         });
     }
 
@@ -6770,12 +6895,27 @@ mod tests {
             reader.uid_validity = Some(2);
         }
         s.pending_reply = Some((ada(1), Answer::Forward));
-        s.opened(&ada(1), 1, Ok(Body::default()), &mut Tx::default());
+        s.opened(&ada(1), 1, (Ok(Body::default()), true), &mut Tx::default());
         let reader = s.reader.as_ref().unwrap();
         assert!(reader.body.is_none(), "still waiting for its own download");
         assert!(s.pending_reply.is_some(), "the forward waits for it too");
-        s.opened(&ada(1), 2, Ok(Body::default()), &mut Tx::default());
+        s.opened(&ada(1), 2, (Ok(Body::default()), true), &mut Tx::default());
         assert!(s.reader.as_ref().unwrap().body.is_some());
+    }
+
+    #[test]
+    fn a_read_mark_the_server_refuses_leaves_the_message_open_as_it_was() {
+        for seen in [true, false] {
+            let mut s = Mail::not_started();
+            open(&mut s, "INBOX", 1, seen);
+            // Shown read as it opened, as opening it does, and not in the list: a server
+            // search's.
+            s.reader.as_mut().unwrap().message.envelope.seen = true;
+            s.opened(&ada(1), 1, (Ok(Body::default()), false), &mut Tx::default());
+            let reader = s.reader.as_ref().unwrap();
+            assert!(reader.body.is_some(), "it still opens");
+            assert_eq!(reader.message.envelope.seen, seen, "read: {seen}");
+        }
     }
 
     #[test]
@@ -7066,9 +7206,71 @@ mod tests {
         let services = s.services.as_mut().unwrap();
         services
             .store
-            .save_unread("ada@example.com", INBOX, (1, 0), below, unseen, fetched)
+            .save_unread(
+                "ada@example.com",
+                INBOX,
+                (1, 0),
+                (below, below),
+                unseen,
+                fetched,
+            )
             .unwrap();
         s.reload();
+    }
+
+    #[test]
+    fn each_mailbox_counts_its_own_unread_mail() {
+        let (_dir, mut s) = synced("unread-each", &[hello(1, false), hello(2, true)]);
+        let services = s.services.as_mut().unwrap();
+        services
+            .store
+            .save_messages(
+                "ada@example.com",
+                "Lists",
+                Role::Other,
+                2,
+                &[hello(1, false), hello(2, false), hello(3, true)],
+            )
+            .unwrap();
+        s.reload();
+        assert_eq!(s.mailbox_unread("ada@example.com", "Lists"), 2);
+        assert_eq!(s.mailbox_unread("ada@example.com", "Archive"), 0);
+        assert_eq!(
+            s.unread(Some("ada@example.com")),
+            1,
+            "only the inbox counts for the account and the app's icon"
+        );
+        assert_eq!(s.unread(None), 1);
+    }
+
+    #[test]
+    fn a_refused_read_mark_leaves_the_message_open_as_the_store_says_if_newer() {
+        // Read since it opened unread, as elsewhere, and not listed: opened from a notice while
+        // the list shows sent mail.
+        let (_dir, mut s) = synced("refused-newer", &[hello(1, true)]);
+        s.showing = Showing::All(Role::Sent);
+        s.reload();
+        assert_eq!(uids(&s), Vec::<u32>::new());
+        open(&mut s, INBOX, 1, false);
+        s.reader.as_mut().unwrap().message.envelope.seen = true;
+        s.opened(&ada(1), 1, (Ok(Body::default()), false), &mut Tx::default());
+        assert!(
+            s.reader.as_ref().unwrap().message.envelope.seen,
+            "the store's read, not the unread it opened as"
+        );
+    }
+
+    #[test]
+    fn unread_mail_counted_but_not_cached_isnt_an_inbox_at_zero() {
+        let (_dir, mut s) = synced("unread-uncached", &[hello(10, true), hello(11, true)]);
+        s.set_unread_only(true);
+        // Searched: 3 is unread and older than what's cached, but wasn't fetched.
+        searched_unread(&mut s, 10, &[3], &[]);
+        assert_eq!(uids(&s), Vec::<u32>::new());
+        assert!(s.listing_synced());
+        assert_eq!(s.listed_unread(), 1, "so the list doesn't say all is read");
+        searched_unread(&mut s, 10, &[], &[]);
+        assert_eq!(s.listed_unread(), 0);
     }
 
     #[test]
@@ -7082,7 +7284,7 @@ mod tests {
         );
         searched_unread(&mut s, 10, &[3], &[hello(3, false)]);
         assert_eq!(uids(&s), [3]);
-        assert_eq!(s.unread.get("ada@example.com"), Some(&1), "counted too");
+        assert_eq!(s.unread(Some("ada@example.com")), 1, "counted too");
         // Read elsewhere, it's gone at the next search: now the inbox is at zero.
         searched_unread(&mut s, 10, &[], &[]);
         assert_eq!(uids(&s), Vec::<u32>::new());
@@ -7403,7 +7605,7 @@ mod tests {
         s.close_reader();
         assert_eq!(uids(&s), [1]);
         // The older download fails; the new read mark is still on its way.
-        s.opened(&ada(3), 1, Err("gone".into()), &mut Tx::default());
+        s.opened(&ada(3), 1, (Err("gone".into()), false), &mut Tx::default());
         assert_eq!(uids(&s), [1]);
     }
 
