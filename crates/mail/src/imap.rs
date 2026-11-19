@@ -30,5 +30,5 @@ pub use older::{Older, fetch_older};
 pub use refresh::refresh;
 pub use search::{Found, search};
 pub use sent::save_sent_copy;
-pub use unread::{Unread, fetch_unread};
+pub use unread::{Unread, UnreadIn, fetch_unread, fetch_unread_each};
 pub use watch::{Changes, Event, Flags, Nudge, Status, WatchConfig, watch};

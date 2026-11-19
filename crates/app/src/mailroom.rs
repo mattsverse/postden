@@ -14,10 +14,11 @@ use postden_core::account::{Account, Server};
 use postden_core::message::{Address, Body, Envelope, Mailbox, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
-    Event, Flags, Found, Nudge, Older, Prefetched, SNOOZED_NAME, Status, Unread, Verdict,
+    Event, Flags, Found, Nudge, Older, Prefetched, SNOOZED_NAME, Status, Unread, UnreadIn, Verdict,
     WatchConfig, create_mailbox, delete_mailbox, download_message, fetch_older, fetch_unread,
-    mark_all_seen, move_message, open_message, prefetch_messages, refresh, restore_message,
-    save_sent_copy, search, set_flagged, set_seen, snooze_message, wake_message, watch,
+    fetch_unread_each, mark_all_seen, move_message, open_message, prefetch_messages, refresh,
+    restore_message, save_sent_copy, search, set_flagged, set_seen, snooze_message, wake_message,
+    watch,
 };
 use postden_mail::{Credentials, smtp};
 use postden_store::{Snooze, Store, Written};
@@ -100,9 +101,11 @@ pub enum Update {
         mailbox: String,
         result: Result<Found, String>,
     },
-    /// Unread mail older than what was cached, looked for with [`Mailroom::find_unread`], was
-    /// saved, and what was cached below it is read or not as the server says; or it couldn't be
-    /// looked for. `count` is how many messages were added or changed.
+    /// A mailbox's unread mail was looked for, with [`Mailroom::find_unread`] or
+    /// [`Mailroom::find_unread_each`], and saved: the newest older than what was cached, how many
+    /// more there are, and what's cached read or not as the server says; or it couldn't be looked
+    /// for. `result` holds how many messages were added or changed, and by how much the unread
+    /// mail that isn't cached did.
     Unread {
         account: String,
         mailbox: String,
@@ -114,7 +117,7 @@ pub enum Update {
     /// Fetched mail couldn't be saved.
     SaveFailed { account: String, error: String },
     /// A message asked for with [`Mailroom::open`] was downloaded, or couldn't be. Once downloaded
-    /// it's read, on the server and in the store.
+    /// it's read, on the server and in the store, unless the server wouldn't mark it: `marked`.
     Opened {
         account: String,
         mailbox: String,
@@ -123,6 +126,9 @@ pub enum Update {
         uid_validity: u32,
         uid: u32,
         body: Result<Body, String>,
+        /// Whether the server agreed to mark it read: it can refuse, as on a shared mailbox, and
+        /// the message stays as it was.
+        marked: bool,
     },
     /// A message asked for with [`Mailroom::export`] was saved to `path` as an `.eml` file, or
     /// couldn't be.
@@ -427,7 +433,10 @@ enum Job {
         uid_validity: u32,
         uid: u32,
         body: Result<Body, String>,
-        /// When it was answered, as [`WatchConfig::changes`] counts: downloaded, it's read.
+        /// Whether the server agreed to mark it read: it can refuse, as on a shared mailbox, and
+        /// the message still opens, as it was.
+        marked: bool,
+        /// When it was answered, as [`WatchConfig::changes`] counts.
         at: u64,
         /// How many times downloaded messages were cleared when it was asked: cleared since,
         /// it's shown but not kept.
@@ -652,6 +661,7 @@ impl Job {
                 uid_validity,
                 uid,
                 body: replaced(),
+                marked: false,
                 at,
                 cleared,
             },
@@ -817,6 +827,9 @@ pub struct Mailroom {
     /// The mailboxes being searched for unread mail by [`Mailroom::find_unread`], not to be
     /// searched twice at once: see [`Finding`].
     finding_unread: Finding,
+    /// The accounts whose mailboxes [`Mailroom::find_unread_each`] is looking in, each with
+    /// whether it was asked for again meanwhile.
+    unread_rounds: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 /// The mailboxes being searched for unread mail, by account and name, each with whether it was
@@ -914,6 +927,7 @@ impl Mailroom {
             traffic: Arc::default(),
             unsnoozing: Arc::default(),
             finding_unread: Finding::default(),
+            unread_rounds: Arc::default(),
         })
     }
 
@@ -1118,8 +1132,8 @@ impl Mailroom {
     /// Opens a message, and marks it read. One downloaded ahead is returned at once, and marked
     /// read in the background, arriving as [`Update::Seen`] or [`Update::SeenFailed`], unless
     /// `mark` isn't set, as when that's asked already; the `bool` says whether it was asked of
-    /// the server. Any other is downloaded in the background, which marks it read, arriving as
-    /// [`Update::Opened`], and `None` is returned.
+    /// the server. Any other is downloaded in the background and arrives as [`Update::Opened`],
+    /// with whether the server agreed to mark it read, and `None` is returned.
     ///
     /// # Errors
     ///
@@ -1152,9 +1166,11 @@ impl Mailroom {
         let changes = self.config.changes.clone();
         let cleared = self.cleared.load(Ordering::Relaxed);
         self.handle.spawn(async move {
-            let body = open_message(&server, &credentials, &mailbox, uid_validity, uid)
+            let opened = open_message(&server, &credentials, &mailbox, uid_validity, uid)
                 .await
                 .map_err(|e| e.to_string());
+            let marked = matches!(opened, Ok((_, true)));
+            let body = opened.map(|(body, _)| body);
             // Nobody is listening only as the app quits.
             let _ignored = jobs.send(Job::Opened {
                 account,
@@ -1162,6 +1178,7 @@ impl Mailroom {
                 uid_validity,
                 uid,
                 body,
+                marked,
                 at: changes.answered(),
                 cleared,
             });
@@ -1643,20 +1660,18 @@ impl Mailroom {
         Ok(())
     }
 
-    /// Looks in `mailbox` on the server, in the background, for unread mail older than what's
-    /// cached, which a sync never fetches, and caches the newest [`UNREAD_KEPT`] of it; and has
-    /// what was cached of it before read or not as the server says now. The result arrives as
-    /// [`Update::Unread`]. Asked while it's already looking there, it looks again after, as that
-    /// update says. Does nothing when nothing is cached: the next sync fetches the newest.
+    /// Looks in `mailbox` on the server, in the background, for every message it has unread: it
+    /// caches the newest [`UNREAD_KEPT`] of those older than what's cached, which a sync never
+    /// fetches, counts the rest, and has what's cached read or not as the server says now. The
+    /// result arrives as [`Update::Unread`]. Asked while it's already looking there, it looks
+    /// again after, as that update says.
     ///
     /// # Errors
     ///
     /// As [`Mailroom::open`].
     pub fn find_unread(&self, store: &Store, account: &str, mailbox: &str) -> Result<()> {
         let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
-        let Some(below) = store.oldest_uid(account, mailbox)? else {
-            return Ok(());
-        };
+        let below = store.oldest_uid(account, mailbox)?.unwrap_or(0);
         let cached = store.uids_below(account, mailbox, below)?;
         let key = (account.to_owned(), mailbox.to_owned());
         if !self.finding_unread.start(&key) {
@@ -1689,6 +1704,108 @@ impl Mailroom {
                 asked,
                 again,
             });
+        });
+        Ok(())
+    }
+
+    /// As [`Mailroom::find_unread`] for each of `account`'s `mailboxes`, one after the other over
+    /// one connection, so an account with many mailboxes doesn't open as many at once. Each
+    /// result arrives as its own [`Update::Unread`]. Those not synced yet, or already being looked
+    /// in, are left out: the latter look again after. Asked while it's already looking in the
+    /// account's mailboxes, the last result says to look again, as `again`, once. It stops once
+    /// the account's watch does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the account isn't connected, or the store can't be read.
+    pub fn find_unread_each(
+        &self,
+        store: &Store,
+        account: &str,
+        mailboxes: &[String],
+    ) -> Result<()> {
+        let watched = self.watched(account)?;
+        let (server, credentials) = (watched.server.clone(), watched.credentials.clone());
+        let asking = Asking {
+            jobs: self.jobs.clone(),
+            watch: watched.number,
+        };
+        // Read before any is claimed, so a failed read leaves none claimed.
+        let synced = unread_targets(store, account, mailboxes)?;
+        let account = account.to_owned();
+        let rounds = Arc::clone(&self.unread_rounds);
+        {
+            let mut running = rounds.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(again) = running.get_mut(&account) {
+                *again = true;
+                return Ok(());
+            }
+            running.insert(account.clone(), false);
+        }
+        let wanted: Vec<UnreadIn> = synced
+            .into_iter()
+            .filter(|m| {
+                self.finding_unread
+                    .start(&(account.clone(), m.mailbox.clone()))
+            })
+            .collect();
+        // Whether it was asked for again meanwhile.
+        let end = move |account: &str| {
+            rounds
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(account)
+                .unwrap_or(false)
+        };
+        let Some(last) = wanted.last().map(|m| m.mailbox.clone()) else {
+            end(&account);
+            return Ok(());
+        };
+        let changes = self.config.changes.clone();
+        let (finding, live) = (self.finding_unread.clone(), Arc::clone(&self.watches));
+        self.handle.spawn(async move {
+            let current = || {
+                live.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&account)
+                    == Some(&asking.watch)
+            };
+            let mut held = None;
+            fetch_unread_each(
+                &server,
+                &credentials,
+                &wanted,
+                (UNREAD_KEPT, &changes),
+                current,
+                |m, asked, result| {
+                    let key = (account.clone(), m.mailbox.clone());
+                    // Ended before it's saved, so asking again once it's saved starts another.
+                    let job = Job::Unread {
+                        account: account.clone(),
+                        mailbox: m.mailbox.clone(),
+                        uid_validity: m.uid_validity,
+                        below: m.below,
+                        result,
+                        asked,
+                        again: finding.end(&key),
+                    };
+                    if m.mailbox == last {
+                        held = Some(job);
+                    } else {
+                        let _ignored = asking.send(job);
+                    }
+                },
+            )
+            .await;
+            // The round ends once its connection is closed, so another doesn't open beside it;
+            // the last result says whether it was asked for again meanwhile.
+            let asked_again = end(&account);
+            if let Some(mut job) = held {
+                if let Job::Unread { again, .. } = &mut job {
+                    *again |= asked_again;
+                }
+                let _ignored = asking.send(job);
+            }
         });
         Ok(())
     }
@@ -1910,6 +2027,28 @@ impl Mailroom {
     }
 }
 
+/// What [`Mailroom::find_unread_each`] looks in: each of the account's `mailboxes` that synced,
+/// once.
+fn unread_targets(store: &Store, account: &str, mailboxes: &[String]) -> Result<Vec<UnreadIn>> {
+    let mut synced: Vec<UnreadIn> = Vec::new();
+    for mailbox in mailboxes {
+        if synced.iter().any(|m| m.mailbox == *mailbox) {
+            continue;
+        }
+        if let Some(state) = store.mailbox_state(account, mailbox)? {
+            // With nothing cached, there's nothing older to fetch, but there's still a count.
+            let below = store.oldest_uid(account, mailbox)?.unwrap_or(0);
+            synced.push(UnreadIn {
+                mailbox: mailbox.clone(),
+                uid_validity: state.uid_validity,
+                below,
+                cached: store.uids_below(account, mailbox, below)?,
+            });
+        }
+    }
+    Ok(synced)
+}
+
 /// What moving a message from the account's mailbox `from` to `to` says about whether it's spam,
 /// by their roles as last listed.
 fn verdict(store: &Store, account: &str, from: &str, to: &str) -> Result<Option<Verdict>> {
@@ -2016,6 +2155,7 @@ impl Prefetcher {
                 uid_validity,
                 uid,
                 body: Ok(body),
+                marked,
                 at,
                 cleared,
             } if self.keeps_opened(&mailbox, keep)
@@ -2045,6 +2185,7 @@ impl Prefetcher {
                     uid_validity,
                     uid,
                     body: Ok(body),
+                    marked,
                     at,
                     cleared,
                 };
@@ -2304,9 +2445,16 @@ fn save_answered(store: &Store, job: Job) -> Vec<Update> {
             uid_validity,
             uid,
             body,
+            marked,
             at,
             ..
-        } => opened(store, (account, mailbox, uid_validity), uid, body, at),
+        } => opened(
+            store,
+            (account, mailbox, uid_validity),
+            uid,
+            (body, marked),
+            at,
+        ),
         Job::Seen {
             account,
             mailbox,
@@ -2466,27 +2614,29 @@ fn save_flags(
     }
 }
 
-/// A message was downloaded, and so marked read on the server, or couldn't be: read in the
-/// store too, unless its mailbox, given with the UIDVALIDITY it was downloaded under, started
-/// over since.
+/// A message was downloaded, or couldn't be. It's read in the store once the server agreed to
+/// mark it, unless its mailbox, given with the UIDVALIDITY it was downloaded under, started over
+/// since.
 fn opened(
     store: &Store,
     (account, mailbox, uid_validity): (String, String, u32),
     uid: u32,
-    body: Result<Body, String>,
+    (body, marked): (Result<Body, String>, bool),
     at: u64,
 ) -> Vec<Update> {
     let mut updates = Vec::new();
     // Unless the mailbox started over meanwhile: its UID names another message now.
-    let marked = || {
+    let read_here = || {
         if is_current(store, &account, &mailbox, uid_validity)? {
             store.set_seen(&account, &mailbox, uid, true)?;
             store.written(&account, &mailbox, (uid_validity, uid), read(at));
         }
         Ok::<_, postden_store::Error>(())
     };
+    // Read once downloaded, unless the server wouldn't mark it: then it's as it was.
     if body.is_ok()
-        && let Err(e) = marked()
+        && marked
+        && let Err(e) = read_here()
     {
         updates.push(Update::SaveFailed {
             account: account.clone(),
@@ -2498,6 +2648,7 @@ fn opened(
         mailbox,
         uid_validity,
         uid,
+        marked: marked && body.is_ok(),
         body,
     });
     updates
@@ -2718,7 +2869,7 @@ fn save_unread(
                 &account,
                 &mailbox,
                 (uid_validity, asked),
-                below,
+                (below, unread.upto),
                 &unread.unseen,
                 &unread.messages,
             )
@@ -2986,6 +3137,58 @@ mod tests {
     }
 
     #[test]
+    fn a_message_the_server_wont_mark_read_opens_and_stays_unread() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        save(&mut store, messages(1, &[1]));
+        let updates = save(
+            &mut store,
+            Job::Opened {
+                account: "me@example.com".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                uid: 1,
+                body: Ok(Body::default()),
+                marked: false,
+                at: 1,
+                cleared: 0,
+            },
+        );
+        assert!(
+            matches!(updates.as_slice(), [Update::Opened { body: Ok(_), .. }]),
+            "{updates:?}"
+        );
+        assert_eq!(
+            store.seen("me@example.com", "INBOX", 1).unwrap(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn a_search_that_found_nothing_unread_counts_as_looked_in() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        save(&mut store, messages(1, &[1, 2]));
+        assert!(!store.unread_searched("me@example.com", "INBOX").unwrap());
+        // Cached from its first message, and nothing unread.
+        let skipped = Job::Unread {
+            account: "me@example.com".into(),
+            mailbox: "INBOX".into(),
+            uid_validity: 1,
+            below: 1,
+            result: Ok(Unread::default()),
+            asked: 0,
+            again: false,
+        };
+        save(&mut store, skipped);
+        assert!(store.unread_searched("me@example.com", "INBOX").unwrap());
+        assert_eq!(
+            store.seen("me@example.com", "INBOX", 1).unwrap(),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn an_unread_search_from_a_replaced_watch_still_runs_again_if_asked() {
         let job = |again| Job::Unread {
             account: "me@example.com".into(),
@@ -2993,6 +3196,7 @@ mod tests {
             uid_validity: 1,
             below: 10,
             result: Ok(Unread {
+                upto: 10,
                 unseen: vec![3],
                 messages: Vec::new(),
             }),
@@ -3293,6 +3497,7 @@ mod tests {
             uid_validity,
             uid: 1,
             body: Ok(Body::default()),
+            marked: true,
             at: 0,
             cleared: 0,
         };
@@ -3356,6 +3561,7 @@ mod tests {
             uid_validity: 1,
             uid: 1,
             body: Ok(Body::default()),
+            marked: true,
             at: 0,
             cleared,
         }
@@ -3448,6 +3654,7 @@ mod tests {
             uid_validity: 1,
             uid: 1,
             body,
+            marked: true,
             at: 0,
             cleared: 0,
         };
@@ -3871,6 +4078,7 @@ mod tests {
                 uid_validity: 1,
                 uid: 1,
                 body: Ok(Body::default()),
+                marked: true,
                 at: 0,
                 cleared: 0,
             },
