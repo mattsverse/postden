@@ -467,6 +467,13 @@ fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut 
     if s.marking_seen(account, &mailbox.name) || s.refreshing(account, &mailbox.name) {
         r = r.status(RowStatus::Busy);
     }
+    if s.settings.sort_mail && s.autosorts_to(account, &mailbox.name) {
+        r = r.trailing(
+            icon(&glyphs::SPARKLE, 12.0)
+                .color(k.c.text_faint)
+                .label("Autosorted to"),
+        );
+    }
     let (menu_account, menu_mailbox) = (account.to_owned(), mailbox.name.clone());
     let r = r
         .build(k)
@@ -477,25 +484,37 @@ fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut 
     match &s.mailbox_menu {
         Some(menu) if menu.is(account, &mailbox.name) => {
             let marking = s.marking_seen(account, &mailbox.name);
-            mailbox_menu(menu, marking, r, k, layer)
+            // Only where sorting can suggest mail goes, while it does.
+            let autosort = (s.settings.sort_mail
+                && postden_app::is_filed_in(&mailbox.name, mailbox.role))
+            .then(|| s.autosorts_to(account, &mailbox.name));
+            mailbox_menu(menu, marking, autosort, r, k, layer)
         }
         _ => r,
     }
 }
 
-/// A mailbox's menu, open at where it was right-clicked: refreshing it or every mailbox, and
-/// marking it all read.
+/// A mailbox's menu, open at where it was right-clicked: refreshing it or every mailbox,
+/// marking it all read, and, where `autosort` says whether inbox mail is moved there by itself,
+/// turning that on or off.
 /// While it's `marking` read, it can't be marked again.
-fn mailbox_menu(menu: &MailboxMenu, marking: bool, row: El, k: &Kit, layer: &mut Vec<El>) -> El {
+fn mailbox_menu(
+    menu: &MailboxMenu,
+    marking: bool,
+    autosort: Option<bool>,
+    row: El,
+    k: &Kit,
+    layer: &mut Vec<El>,
+) -> El {
     let (account, mailbox) = &menu.mailbox;
     let (a, b) = (account.clone(), mailbox.clone());
     let (refresh_account, refresh_mailbox) = (account.clone(), mailbox.clone());
-    context_menu(
+    let mut items = context_menu(
         format!("mailbox-menu-{account}-{mailbox}"),
         row,
         Some(menu.point),
     )
-    .min_width(200.0)
+    .min_width(220.0)
     .on_close(Mail::close_mailbox_menu)
     .item(MenuItem::new("Refresh").on_select(move |s: &mut Mail| {
         s.close_mailbox_menu();
@@ -518,9 +537,20 @@ fn mailbox_menu(menu: &MailboxMenu, marking: bool, row: El, k: &Kit, layer: &mut
             s.close_mailbox_menu();
             s.mark_all_seen(&a, &b);
         }),
-    )
-    .build(k, layer)
-    .w_full()
+    );
+    if let Some(on) = autosort {
+        let (account, mailbox) = (account.clone(), mailbox.clone());
+        items = items.item(
+            MenuItem::new("Autosort mail here")
+                .description("Moves mail that belongs here")
+                .checked(on)
+                .on_select(move |s: &mut Mail| {
+                    s.close_mailbox_menu();
+                    s.set_autosort(&account, &mailbox, !on);
+                }),
+        );
+    }
+    items.build(k, layer).w_full()
 }
 
 /// An account, standing for its inbox, over its mailboxes. Right-clicking it opens its menu.
@@ -2296,8 +2326,11 @@ fn general_settings(s: &Mail, k: &Kit, page: El, layer: &mut Vec<El>) -> El {
                  file it, what you keep in your inbox, what you star or delete, and who you \
                  write to. Once it's often right, inbox mail that looks like it belongs in a \
                  mailbox is tagged with it (press the tag, or M, to move it there), and mail \
-                 that looks important says so. Nothing leaves your computer, unless you export \
-                 what it learned with your accounts.",
+                 that looks important says so. To have mail moved by itself instead, right-click \
+                 a mailbox and choose Autosort mail here: inbox mail from the last few days that \
+                 it's sure belongs there goes there, and so does new mail as it comes, each \
+                 message once. Nothing leaves your computer, unless you export what it learned \
+                 with your accounts.",
             ),
             row()
                 .gap(12.0)

@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use jiff::{Timestamp, Zoned};
 use postden_app::{
-    Draft, Imported, Login, Mailroom, Passwords, Profile, Settings, Sorted, Sorter, Tags, Theme,
-    Update, check_logins, contacts, eml_file_name, finish_google_sign_in, import, is_sealed,
+    Autosort, Draft, Imported, Login, Mailroom, Passwords, Profile, Settings, Sorted, Sorter, Tags,
+    Theme, Update, check_logins, contacts, eml_file_name, finish_google_sign_in, import, is_sealed,
     password_key, remove_account, save_account, signature, smtp_password_key, start_google_sign_in,
 };
 use postden_core::account::{Account, Signature};
@@ -194,6 +194,9 @@ fn imported_notice(imported: &Imported) -> String {
     notice.extend(failed);
     notice
 }
+
+/// How many messages autosort moves at once in each account.
+const AUTOSORT_AT_ONCE: usize = 3;
 
 /// Starts sorting the mail cached in `database`: what it says of the inbox shows as it's done.
 fn start_sorter(handle: &AppHandle<Mail>, database: &std::path::Path) -> Result<Sorter, String> {
@@ -527,6 +530,15 @@ pub(crate) struct Mail {
     /// suggested move is made only while it holds, as the tags' UIDs name their messages only
     /// then.
     tagged_under: HashMap<(String, String), u32>,
+    /// The mailboxes inbox mail is moved to by itself once sorting says it goes there, by
+    /// account and name.
+    pub(crate) autosort_to: HashSet<(String, String)>,
+    /// The messages autosort is moving, by message, each with its Message-ID, until the server
+    /// answers.
+    autosorting: HashMap<MessageKey, String>,
+    /// The message open, or whose menu is open, that autosort left alone, if it did: it's
+    /// sorted again once that's closed.
+    autosort_waits_for: Option<MessageKey>,
     /// A message being moved back by undoing: the list's cursor goes to it once it's listed
     /// there again, unless another mailbox is shown meanwhile.
     restoring: Option<Restoring>,
@@ -613,6 +625,9 @@ impl Mail {
             undo: None,
             tags: HashMap::new(),
             tagged_under: HashMap::new(),
+            autosort_to: HashSet::new(),
+            autosorting: HashMap::new(),
+            autosort_waits_for: None,
             restoring: None,
             returning: Vec::new(),
             undoing: Vec::new(),
@@ -638,6 +653,7 @@ impl Mail {
                 })));
                 mail.services = Ok(services);
                 mail.settings = settings;
+                mail.load_autosort();
                 mail.reload();
                 mail.sort_mail();
                 let failed = mail
@@ -704,6 +720,9 @@ impl Mail {
             format!("{e}. Without a keyring, set POSTDEN_PASSWORD_COMMAND to a command that prints the password.")
         })?;
         let settings = Settings::load(&store).map_err(|e| e.to_string())?;
+        // What autosort was moving when the app last quit was never answered: it's left where
+        // it is.
+        store.settle_autosorts().map_err(|e| e.to_string())?;
         let config = WatchConfig {
             poll_interval: settings.poll_interval,
             ..WatchConfig::default()
@@ -1174,6 +1193,7 @@ impl Mail {
         let key = (account.to_owned(), mailbox.to_owned(), uid);
         self.moving.remove(&key);
         let undoable = self.moved_for_undo(&key, result.is_ok());
+        let autosorted = self.autosort_answered(&key, result.is_ok());
         let to = self.mailbox_label(account, to);
         match result {
             Ok(current) => {
@@ -1182,7 +1202,11 @@ impl Mail {
                 if current {
                     self.search.forget_message(account, mailbox, uid);
                 }
-                self.notify(format!("Moved to {to}{}", undo_hint(undoable)));
+                if autosorted {
+                    self.notify(format!("Autosorted a new message to {to}"));
+                } else {
+                    self.notify(format!("Moved to {to}{}", undo_hint(undoable)));
+                }
             }
             Err(error) => {
                 let label = self.label(account).to_owned();
@@ -1923,6 +1947,14 @@ impl Mail {
         if started && later {
             self.read_later.insert(key, uid_validity);
         }
+        // What autosort left alone while another was open may go now.
+        if self
+            .autosort_waits_for
+            .take_if(|waiting| *waiting != message_key(&reader.message))
+            .is_some()
+        {
+            self.sort_mail();
+        }
         self.reader = Some(reader);
     }
 
@@ -1946,6 +1978,10 @@ impl Mail {
         let Some(reader) = self.reader.take() else {
             return;
         };
+        // What autosort left alone while it was open may go now.
+        if self.autosort_waits_for.take().is_some() {
+            self.sort_mail();
+        }
         // Whether the list shows only unread mail or not, as it may again before they're answered.
         // Those kept listed too, though pushed past the list's end since.
         let listed = self.messages.iter().map(message_key);
@@ -2460,6 +2496,10 @@ impl Mail {
 
     pub(crate) fn close_message_menu(&mut self) {
         self.message_menu = None;
+        // What autosort left alone while its menu was open may go now.
+        if self.autosort_waits_for.take().is_some() {
+            self.sort_mail();
+        }
         // Escape in the menu doesn't reach the window: a G pressed before goes nowhere.
         self.forget_go();
     }
@@ -2640,7 +2680,12 @@ impl Mail {
     fn watching(&mut self, update: Update) {
         let (account, mailbox, asked) = match update {
             Update::Status { account, status } => {
-                self.statuses.insert(account, Ok(status));
+                let was = self.connected(&account);
+                self.statuses.insert(account.clone(), Ok(status));
+                // What autosort waited for the connection for may go now.
+                if !was && self.connected(&account) {
+                    self.sort_mail();
+                }
                 return;
             }
             Update::Synced {
@@ -2786,11 +2831,33 @@ impl Mail {
     /// Moves a message to another of its account's mailboxes. It leaves the list at once, and
     /// comes back if the server refuses.
     pub(crate) fn move_message(&mut self, account: &str, mailbox: &str, uid: u32, to: &str) {
-        self.move_message_under(account, mailbox, uid, to, None);
+        self.keep_in_the_inbox(&(account.to_owned(), mailbox.to_owned(), uid), to);
+        self.move_message_under(account, mailbox, uid, to, None, true);
+    }
+
+    /// Has autosort leave the message `key` names alone if it's moved to `to`, its account's
+    /// inbox, by hand: it's there to be seen, as when it isn't spam after all.
+    fn keep_in_the_inbox(&mut self, key: &MessageKey, to: &str) {
+        let inbox = self.mailbox_with_role(&key.0, Role::Inbox);
+        if inbox.is_none_or(|b| b.name != to) {
+            return;
+        }
+        let Some(id) = self
+            .find_message(key)
+            .and_then(|m| m.envelope.message_id.clone())
+        else {
+            return;
+        };
+        if let Ok(services) = &self.services
+            && let Err(e) = services.store.keep_from_autosort(&key.0, &id)
+        {
+            self.notify(format!("Couldn't keep the message from autosort: {e}"));
+        }
     }
 
     /// Moves a message as [`Mail::move_message`] does, only while its mailbox is cached under
-    /// `uid_validity`, if given: its UID names another message under another.
+    /// `uid_validity`, if given: its UID names another message under another. Z undoes it if
+    /// `undoable`. Returns whether it's on its way.
     fn move_message_under(
         &mut self,
         account: &str,
@@ -2798,20 +2865,25 @@ impl Mail {
         uid: u32,
         to: &str,
         uid_validity: Option<u32>,
-    ) {
+        undoable: bool,
+    ) -> bool {
         let key = (account.to_owned(), mailbox.to_owned(), uid);
         if self.moving_back(&key) {
-            return;
+            return false;
         }
         if self.pending(&key) {
             let uid_validity = uid_validity.or_else(|| self.uid_validity(account, mailbox));
             let deferred = (Deferred::Move(to.to_owned()), uid_validity);
             self.deferred.insert(key.clone(), deferred);
-            self.undo_move(&key, to, None);
+            if undoable {
+                self.undo_move(&key, to, None);
+            }
             self.left_list(key);
-            return;
+            return true;
         }
-        let Ok(services) = &self.services else { return };
+        let Ok(services) = &self.services else {
+            return false;
+        };
         if let Err(e) =
             services
                 .mailroom
@@ -2819,11 +2891,14 @@ impl Mail {
         {
             let label = self.label(account).to_owned();
             self.notify(format!("{label}: couldn't move the message: {e}"));
-            return;
+            return false;
         }
         let key = (account.to_owned(), mailbox.to_owned(), uid);
-        self.undo_move(&key, to, None);
+        if undoable {
+            self.undo_move(&key, to, None);
+        }
         self.left_list(key);
+        true
     }
 
     /// Moves the focused message to its account's mailbox with `role`: its Archive, Trash or Junk,
@@ -2884,6 +2959,9 @@ impl Mail {
                         .is_none_or(|now| then == Some(&now))
                 })
         });
+        // Its menu open as this came, a message stays where the user was looking at it, even
+        // once the menu closes below.
+        let menu = self.message_menu.as_ref().map(|m| m.message.clone());
         // A menu showing a suggestion that changed would act on another item where it was.
         if let Some(menu) = &self.message_menu
             && self
@@ -2896,6 +2974,7 @@ impl Mail {
         }
         self.tags = tags;
         self.tagged_under = sorted.uid_validity;
+        self.autosort(sorted.autosort, menu.as_ref());
     }
 
     /// What sorting says of a message: where it seems to belong, and whether it seems important.
@@ -2924,7 +3003,134 @@ impl Mail {
             .tagged_under
             .get(&(key.0.clone(), key.1.clone()))
             .copied();
-        self.move_message_under(&key.0, &key.1, key.2, to, under);
+        self.move_message_under(&key.0, &key.1, key.2, to, under, true);
+    }
+
+    /// Moves by themselves the inbox messages sorting says go to a mailbox autosorted to, while
+    /// that's still what it says: each once. Not one the user is acting on, which waits for a
+    /// later pass: open to be read (until it's closed), already moving or snoozing, or with a
+    /// read mark or star on its way, which a move would wait for. Z doesn't undo them: they're
+    /// not what was last done by hand.
+    fn autosort(&mut self, autosort: Vec<Autosort>, menu: Option<&MessageKey>) {
+        let open = self.reader.as_ref().map(|r| message_key(&r.message));
+        for a in autosort {
+            let (account, mailbox, uid) = &a.key;
+            let wanted = self.autosort_to.contains(&(account.clone(), a.to.clone()));
+            if !wanted || self.suggested(&a.key) != Some(a.to.as_str()) {
+                continue;
+            }
+            // Not under the user's eyes: open, or its menu open.
+            if open.as_ref() == Some(&a.key) || menu == Some(&a.key) {
+                self.autosort_waits_for = Some(a.key);
+                continue;
+            }
+            // Offline, the move would fail, and autosort tries once: it waits to be connected.
+            // Nor one being marked read with the rest of its mailbox: once that's answered.
+            if !self.connected(account)
+                || self.marking_seen(account, mailbox)
+                || self.moving.contains(&a.key)
+                || self.deferred.contains_key(&a.key)
+                || self.pending(&a.key)
+            {
+                continue;
+            }
+            // A few at a time, each on a connection of its own: the rest go once they're
+            // answered, which sorts again.
+            let under_way = self.autosorting.keys().filter(|k| k.0 == *account);
+            if under_way.count() >= AUTOSORT_AT_ONCE {
+                continue;
+            }
+            let Ok(services) = &self.services else { return };
+            // Only to a mailbox mail is still filed in, as last listed: as the move reads it.
+            let filed_in = services.store.mailboxes(account).is_ok_and(|list| {
+                list.iter()
+                    .any(|m| m.name == a.to && postden_app::is_filed_in(&m.name, m.role))
+            });
+            if !filed_in {
+                continue;
+            }
+            match services
+                .store
+                .note_autosorted(account, &a.message_id, &a.to)
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    self.notify(format!("Couldn't autosort mail: {e}"));
+                    return;
+                }
+            }
+            let under = self
+                .tagged_under
+                .get(&(account.clone(), mailbox.clone()))
+                .copied();
+            self.autosorting.insert(a.key.clone(), a.message_id);
+            // Selected, it leaves no selection behind rather than the next row's: a key pressed
+            // for it mustn't act on another message.
+            let selected = self.cursor.take_if(|c| *c == a.key);
+            // Not sent, it stays in the inbox, tagged, with why it wasn't moved said instead.
+            if !self.move_message_under(account, mailbox, *uid, &a.to, under, false) {
+                self.autosort_answered(&a.key, false);
+                self.cursor = self.cursor.take().or(selected);
+            }
+        }
+    }
+
+    /// The server moved a message, or refused to: if autosort was moving it, notes so, and
+    /// returns true. Refused, it was never autosorted, and may be later.
+    fn autosort_answered(&mut self, key: &MessageKey, moved: bool) -> bool {
+        let Some(message_id) = self.autosorting.remove(key) else {
+            return false;
+        };
+        let Ok(services) = &self.services else {
+            return true;
+        };
+        if let Err(e) = services.store.autosort_answered(&key.0, &message_id, moved) {
+            self.notify(format!("Couldn't note what autosort did: {e}"));
+        }
+        true
+    }
+
+    /// Whether `account`'s watcher is connected to its server.
+    fn connected(&self, account: &str) -> bool {
+        matches!(
+            self.statuses.get(account),
+            Some(Ok(Status::Push | Status::Polling(_)))
+        )
+    }
+
+    /// Reads which mailboxes inbox mail is autosorted to.
+    fn load_autosort(&mut self) {
+        let Ok(services) = &self.services else { return };
+        match services.store.autosort_mailboxes() {
+            Ok(to) => self.autosort_to = to,
+            Err(e) => self.notify(format!("Couldn't read where mail is autosorted to: {e}")),
+        }
+    }
+
+    /// Whether inbox mail is moved to `account`'s `mailbox` by itself once sorting says it goes
+    /// there.
+    pub(crate) fn autosorts_to(&self, account: &str, mailbox: &str) -> bool {
+        self.autosort_to
+            .contains(&(account.to_owned(), mailbox.to_owned()))
+    }
+
+    /// Has inbox mail sorting says goes to `account`'s `mailbox` moved there by itself, or
+    /// stops. Mail already waiting in the inbox that goes there is moved once sorting next says
+    /// so.
+    pub(crate) fn set_autosort(&mut self, account: &str, mailbox: &str, on: bool) {
+        let Ok(services) = &self.services else { return };
+        if let Err(e) = services.store.set_autosort(account, mailbox, on) {
+            self.notify(format!("Couldn't change where mail is autosorted to: {e}"));
+            return;
+        }
+        let key = (account.to_owned(), mailbox.to_owned());
+        if on {
+            self.autosort_to.insert(key);
+            self.sort_mail();
+        } else {
+            self.autosort_to.remove(&key);
+        }
     }
 
     /// What Z will undo once the message `from` names has been moved to `to`, or snoozed until
@@ -2990,6 +3196,16 @@ impl Mail {
                 {
                     self.notify("Still waiting for the server about a message there".into());
                     return;
+                }
+                // Back in the inbox by hand, it's there to be seen, not autosorted away again.
+                let to_inbox = self
+                    .mailbox_with_role(account, Role::Inbox)
+                    .is_some_and(|b| b.name == *mailbox);
+                if to_inbox
+                    && let Ok(services) = &self.services
+                    && let Err(e) = services.store.keep_from_autosort(account, &message_id)
+                {
+                    self.notify(format!("Couldn't keep the message from autosort: {e}"));
                 }
                 let Ok(services) = &self.services else { return };
                 if let Err(e) = services.mailroom.restore(
@@ -3250,6 +3466,12 @@ impl Mail {
             .mailbox_with_role(account, Role::Snoozed)
             .map_or(postden_mail::imap::SNOOZED_NAME, |b| b.name.as_str())
             .to_owned();
+        // Back in the inbox when it wakes, it's there to be seen, not autosorted away.
+        if let (Ok(services), Some(id)) = (&self.services, &message.envelope.message_id)
+            && let Err(e) = services.store.keep_from_autosort(account, id)
+        {
+            self.notify(format!("Couldn't keep the message from autosort: {e}"));
+        }
         if self.pending(&key) {
             let deferred = Deferred::Snooze(Box::new(message.clone()), until);
             let uid_validity = self.uid_validity(account, mailbox);
@@ -4016,6 +4238,8 @@ impl Mail {
             return;
         }
         self.statuses.insert(id, Ok(Status::Connecting));
+        // Saved on another server, it autosorts nowhere anymore.
+        self.load_autosort();
         self.notify(format!("Added {label}"));
         self.form_added();
         self.reload();
@@ -4446,6 +4670,8 @@ impl Mail {
         if imported.sorting == Some(Ok(())) {
             self.tags.clear();
         }
+        // An account replaced by one on another server autosorts nowhere anymore.
+        self.load_autosort();
         self.sort_mail();
         self.notify(imported_notice(&imported));
     }
@@ -5073,6 +5299,9 @@ impl Mail {
         self.refreshing.retain(|key, _| key.0 != id);
         self.refreshing_all.remove(id);
         self.leaving.retain(|r| r.account != id);
+        // The store forgot where it autosorts to as well.
+        self.autosort_to.retain(|(account, _)| account != id);
+        self.autosorting.retain(|key, _| key.0 != id);
         let dropped: Vec<MessageKey> = self
             .deferred
             .extract_if(|key, _| key.0 == id)
@@ -5140,6 +5369,7 @@ mod tests {
     use postden_core::account::Security;
 
     use super::*;
+    use postden_store::AutosortState;
 
     #[test]
     fn a_new_mailbox_closes_its_dialog_once_made_and_says_why_it_was_refused() {
@@ -6866,6 +7096,273 @@ mod tests {
         assert!(s.listing_synced(), "listed, without one");
     }
 
+    /// What sorting says of the first of `synced`'s inbox: it goes to Receipts, by itself if
+    /// that's autosorted to.
+    fn sorted_to_receipts() -> Sorted {
+        let key: MessageKey = ("ada@example.com".into(), INBOX.into(), 1);
+        Sorted {
+            tags: [(
+                key.clone(),
+                Tags {
+                    important: false,
+                    suggested: Some("Receipts".into()),
+                },
+            )]
+            .into(),
+            uid_validity: [(("ada@example.com".into(), INBOX.into()), 1)].into(),
+            autosort: vec![Autosort {
+                key,
+                message_id: "1@example.com".into(),
+                to: "Receipts".into(),
+            }],
+        }
+    }
+
+    fn autosorted_noted(s: &Mail, id: &str) -> Option<AutosortState> {
+        let store = &s.services.as_ref().unwrap().store;
+        let noted = store.autosorted().unwrap();
+        noted
+            .get(&("ada@example.com".into(), id.into()))
+            .map(|a| a.state)
+    }
+
+    /// `synced`'s account, its inbox and Receipts listed, Receipts with `role`, autosorted to.
+    fn autosorting_to_receipts(s: &mut Mail, role: Role) {
+        let account = "ada@example.com";
+        let mailbox = |name: &str, role| Mailbox {
+            name: name.into(),
+            delimiter: None,
+            role,
+        };
+        let listed = [mailbox(INBOX, Role::Inbox), mailbox("Receipts", role)];
+        let store = &mut s.services.as_mut().unwrap().store;
+        store.save_mailbox_list(account, &listed).unwrap();
+        s.statuses.insert(account.into(), Ok(Status::Push));
+        s.set_autosort(account, "Receipts", true);
+        assert!(s.autosorts_to(account, "Receipts"));
+    }
+
+    #[test]
+    fn mail_is_autosorted_only_to_a_mailbox_chosen_and_tried_once() {
+        let (_dir, mut s) = synced("autosort", &[hello(1, false), hello(2, false)]);
+        let account = "ada@example.com";
+        s.sorted(0, sorted_to_receipts());
+        assert_eq!(autosorted_noted(&s, "1@example.com"), None, "not chosen");
+        autosorting_to_receipts(&mut s, Role::Other);
+        // Without a server to send it to, the move fails at once, and why is said.
+        s.sorted(0, sorted_to_receipts());
+        assert_eq!(
+            autosorted_noted(&s, "1@example.com"),
+            Some(AutosortState::Refused)
+        );
+        assert!(
+            s.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("couldn't move")),
+            "{:?}",
+            s.notice
+        );
+        s.notice = None;
+        s.sorted(0, sorted_to_receipts());
+        assert_eq!(s.notice, None, "not tried again");
+        s.set_autosort(account, "Receipts", false);
+        assert!(!s.autosorts_to(account, "Receipts"));
+    }
+
+    #[test]
+    fn mail_waits_to_be_autosorted_until_its_account_is_connected() {
+        let (_dir, mut s) = synced("autosort-offline", &[hello(1, false), hello(2, false)]);
+        autosorting_to_receipts(&mut s, Role::Other);
+        s.statuses.insert(
+            "ada@example.com".into(),
+            Ok(Status::Failed {
+                error: "offline".into(),
+                retry_in: Duration::from_secs(5),
+            }),
+        );
+        s.sorted(0, sorted_to_receipts());
+        assert_eq!(autosorted_noted(&s, "1@example.com"), None, "tried later");
+    }
+
+    #[test]
+    fn mail_moved_to_the_inbox_by_hand_isnt_autosorted() {
+        let mut junk = hello(1, false);
+        junk.message_id = Some("1@example.com".into());
+        let (_dir, mut s) = synced("autosort-not-spam", &[junk, hello(2, false)]);
+        autosorting_to_receipts(&mut s, Role::Other);
+        s.mailboxes.insert(
+            "ada@example.com".into(),
+            vec![Mailbox {
+                name: INBOX.into(),
+                delimiter: None,
+                role: Role::Inbox,
+            }],
+        );
+        // As Not spam does, here from the inbox itself, where the test's mail is.
+        s.move_message("ada@example.com", INBOX, 1, INBOX);
+        assert_eq!(
+            autosorted_noted(&s, "1@example.com"),
+            Some(AutosortState::Kept)
+        );
+    }
+
+    #[test]
+    fn mail_moved_back_to_the_inbox_with_z_isnt_autosorted() {
+        let (_dir, mut s) = synced("autosort-undo", &[hello(1, false), hello(2, false)]);
+        autosorting_to_receipts(&mut s, Role::Other);
+        s.mailboxes.insert(
+            "ada@example.com".into(),
+            vec![Mailbox {
+                name: INBOX.into(),
+                delimiter: None,
+                role: Role::Inbox,
+            }],
+        );
+        // Filed in Receipts by hand, then Z.
+        s.undo = Some(Undo::Moved {
+            from: ("ada@example.com".into(), INBOX.into(), 1),
+            to: "Receipts".into(),
+            message_id: "1@example.com".into(),
+            snoozed: None,
+            done: true,
+        });
+        s.undo();
+        assert_eq!(
+            autosorted_noted(&s, "1@example.com"),
+            Some(AutosortState::Kept)
+        );
+    }
+
+    #[test]
+    fn mail_whose_menu_is_open_isnt_autosorted() {
+        let (_dir, mut s) = synced("autosort-menu", &[hello(1, false), hello(2, false)]);
+        autosorting_to_receipts(&mut s, Role::Other);
+        // Its suggestion first comes while the menu is open: the menu closes, as its items
+        // would move, but the message stays.
+        s.open_message_menu("ada@example.com", INBOX, 1, PointerPress { x: 0.0, y: 0.0 });
+        s.sorted(0, sorted_to_receipts());
+        assert!(s.message_menu.is_none());
+        assert_eq!(autosorted_noted(&s, "1@example.com"), None);
+        // The same suggestion, the menu open again: it stays open, and so does the message.
+        s.open_message_menu("ada@example.com", INBOX, 1, PointerPress { x: 0.0, y: 0.0 });
+        s.sorted(0, sorted_to_receipts());
+        assert!(s.message_menu.is_some(), "left open");
+        assert_eq!(autosorted_noted(&s, "1@example.com"), None);
+    }
+
+    #[test]
+    fn mail_being_marked_read_isnt_autosorted_before() {
+        let (_dir, mut s) = synced("autosort-all-read", &[hello(1, false), hello(2, false)]);
+        autosorting_to_receipts(&mut s, Role::Other);
+        s.marking_seen
+            .insert(("ada@example.com".into(), INBOX.into()));
+        s.sorted(0, sorted_to_receipts());
+        assert_eq!(autosorted_noted(&s, "1@example.com"), None);
+    }
+
+    #[test]
+    fn a_selected_message_autosort_couldnt_move_stays_selected() {
+        let (_dir, mut s) = synced("autosort-cursor", &[hello(1, false), hello(2, false)]);
+        let key: MessageKey = ("ada@example.com".into(), INBOX.into(), 1);
+        autosorting_to_receipts(&mut s, Role::Other);
+        s.cursor = Some(key.clone());
+        // Without a server to send it to, the move fails at once.
+        s.sorted(0, sorted_to_receipts());
+        assert_eq!(s.cursor, Some(key));
+    }
+
+    #[test]
+    fn mail_isnt_autosorted_to_a_mailbox_mail_isnt_filed_in_anymore() {
+        let (_dir, mut s) = synced("autosort-trash", &[hello(1, false), hello(2, false)]);
+        // The server says Receipts is its Trash now.
+        autosorting_to_receipts(&mut s, Role::Trash);
+        s.sorted(0, sorted_to_receipts());
+        assert_eq!(autosorted_noted(&s, "1@example.com"), None);
+    }
+
+    #[test]
+    fn autosort_moves_a_few_messages_at_once() {
+        let (_dir, mut s) = synced("autosort-few", &[hello(1, false), hello(2, false)]);
+        let account = "ada@example.com";
+        autosorting_to_receipts(&mut s, Role::Other);
+        for uid in 10..13 {
+            let key = (account.into(), INBOX.into(), uid);
+            s.autosorting.insert(key, format!("{uid}@example.com"));
+        }
+        s.sorted(0, sorted_to_receipts());
+        assert_eq!(
+            autosorted_noted(&s, "1@example.com"),
+            None,
+            "once one of those is answered"
+        );
+    }
+
+    #[test]
+    fn mail_the_user_is_acting_on_isnt_autosorted() {
+        let (_dir, mut s) = synced("autosort-busy", &[hello(1, false), hello(2, false)]);
+        let account = "ada@example.com";
+        let key: MessageKey = (account.into(), INBOX.into(), 1);
+        autosorting_to_receipts(&mut s, Role::Other);
+        // Snoozed while its read mark is on its way: the snooze waits for it.
+        s.asked(&key, false);
+        let message = s.find_message(&key).cloned().unwrap();
+        s.snooze_message(&message, Timestamp::now() + Duration::from_hours(3));
+        assert!(s.deferred.contains_key(&key));
+        let undo = s.undo.clone();
+        s.sorted(0, sorted_to_receipts());
+        assert!(
+            matches!(s.deferred.get(&key), Some((Deferred::Snooze(..), _))),
+            "the snooze stands"
+        );
+        assert_eq!(s.undo, undo, "and Z still undoes what it did");
+        assert_eq!(autosorted_noted(&s, "1@example.com"), None);
+    }
+
+    #[test]
+    fn mail_snoozed_isnt_autosorted_once_it_wakes() {
+        let mut snoozed = hello(1, false);
+        snoozed.message_id = Some("1@example.com".into());
+        let (_dir, mut s) = synced("autosort-snoozed", &[snoozed, hello(2, false)]);
+        let key: MessageKey = ("ada@example.com".into(), INBOX.into(), 1);
+        autosorting_to_receipts(&mut s, Role::Other);
+        let message = s.find_message(&key).cloned().unwrap();
+        s.snooze_message(&message, Timestamp::now() + Duration::from_hours(3));
+        assert_eq!(
+            autosorted_noted(&s, "1@example.com"),
+            Some(AutosortState::Kept)
+        );
+    }
+
+    #[test]
+    fn what_the_server_answers_an_autosort_is_noted() {
+        let (_dir, mut s) = synced("autosort-answer", &[hello(1, false), hello(2, false)]);
+        let account = "ada@example.com";
+        let attempt = |s: &mut Mail, uid: u32| {
+            let id = format!("{uid}@example.com");
+            let store = &s.services.as_ref().unwrap().store;
+            assert!(store.note_autosorted(account, &id, "Receipts").unwrap());
+            s.autosorting
+                .insert((account.into(), INBOX.into(), uid), id);
+        };
+        attempt(&mut s, 1);
+        s.moved(account, INBOX, 1, "Receipts", Err("no".into()));
+        assert_eq!(
+            autosorted_noted(&s, "1@example.com"),
+            Some(AutosortState::Refused)
+        );
+        attempt(&mut s, 2);
+        s.moved(account, INBOX, 2, "Receipts", Ok(true));
+        assert_eq!(
+            autosorted_noted(&s, "2@example.com"),
+            Some(AutosortState::Moved)
+        );
+        assert_eq!(
+            s.notice.as_deref(),
+            Some("Autosorted a new message to Receipts")
+        );
+        assert_eq!(s.undo, None, "Z undoes what was done by hand");
+    }
+
     #[test]
     fn tags_of_a_mailbox_started_over_since_arent_shown() {
         let (_dir, mut s) = synced("sorted-validity", &[hello(1, false)]);
@@ -6880,6 +7377,7 @@ mod tests {
             )]
             .into(),
             uid_validity: [(("ada@example.com".into(), INBOX.into()), uid_validity)].into(),
+            autosort: Vec::new(),
         };
         s.sorted(0, sorted_under(7));
         assert!(s.tags(&key).is_none(), "its UID named another message then");

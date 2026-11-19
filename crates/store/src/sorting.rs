@@ -1,10 +1,14 @@
 //! What sorting mail learned, kept for each account: the classes of each of its models, their
 //! weights, and what each message was taught as.
 //!
+//! Along with it, where autosort moves inbox mail by itself, and what it moved.
+//!
 //! One thread learns, and writes what it learned with [`Store::save_sorting`]. Anything else that
 //! changes what's kept, as [`Store::forget_sorting`] and [`Store::replace_sorting`] do, moves
 //! the kept learning to a new generation, so what was learned from an older one isn't saved over
 //! it.
+
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Transaction, TransactionBehavior, params};
 
@@ -14,6 +18,54 @@ use crate::{Error, Result, Store};
 const GENERATION: &str = "sorting_generation";
 /// The version of the features what's kept was learned by.
 const FEATURES: &str = "sorting_features";
+
+/// Where autosort moves or moved a message, or tried to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Autosorted {
+    pub mailbox: String,
+    pub state: AutosortState,
+}
+
+/// What became of a message autosort moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutosortState {
+    /// On its way: the server hasn't answered yet.
+    Moving,
+    /// The server moved it.
+    Moved,
+    /// The server refused: it's left where it is, and autosort doesn't try again.
+    Refused,
+    /// The app quit before the server answered: it may or may not have moved, and autosort
+    /// doesn't try again.
+    Unknown,
+    /// Never moved: the user keeps it in the inbox, as snoozed to come back there, so autosort
+    /// leaves it alone.
+    Kept,
+}
+
+impl AutosortState {
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Moving => "moving",
+            Self::Moved => "moved",
+            Self::Refused => "refused",
+            Self::Unknown => "unknown",
+            Self::Kept => "kept",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        [
+            Self::Moving,
+            Self::Moved,
+            Self::Refused,
+            Self::Unknown,
+            Self::Kept,
+        ]
+        .into_iter()
+        .find(|s| s.key() == key)
+    }
+}
 
 /// One class of an account's model, and its weights: all of them as [`Store::sorting`] reads
 /// them, or those changed as [`Store::save_sorting`] writes them.
@@ -115,7 +167,7 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let features = features(&tx)?;
         let mut classes = Vec::new();
-        let mut ids = std::collections::HashMap::new();
+        let mut ids = HashMap::new();
         {
             let mut stmt = tx.prepare(
                 "SELECT id, account, model, name, messages, guessed, correct
@@ -285,6 +337,138 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+
+    /// The mailboxes autosort moves inbox mail to, by account and name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn autosort_mailboxes(&self) -> Result<HashSet<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT account, name FROM autosort_mailboxes")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Has autosort move inbox mail that belongs in `account`'s `mailbox` there, or stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails, as when the account isn't saved.
+    pub fn set_autosort(&self, account: &str, mailbox: &str, on: bool) -> Result<()> {
+        let sql = if on {
+            "INSERT OR IGNORE INTO autosort_mailboxes (account, name) VALUES (?1, ?2)"
+        } else {
+            "DELETE FROM autosort_mailboxes WHERE account = ?1 AND name = ?2"
+        };
+        self.conn.execute(sql, [account, mailbox])?;
+        Ok(())
+    }
+
+    /// Where autosort moves or moved each message, or tried to, by account and Message-ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails or a row is corrupt.
+    pub fn autosorted(&self) -> Result<HashMap<(String, String), Autosorted>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT account, message_id, mailbox, state FROM autosorted")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                (row.get(0)?, row.get(1)?),
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (key, mailbox, state) = row?;
+            let state = AutosortState::from_key(&state)
+                .ok_or_else(|| Error::Corrupt(format!("unknown autosort state {state:?}")))?;
+            Ok((key, Autosorted { mailbox, state }))
+        })
+        .collect()
+    }
+
+    /// Notes that autosort is moving `account`'s message `message_id` to `mailbox`, unless it
+    /// moves, moved or tried to already. Returns whether it's noted now: autosort tries once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub fn note_autosorted(&self, account: &str, message_id: &str, mailbox: &str) -> Result<bool> {
+        let noted = self.conn.execute(
+            "INSERT OR IGNORE INTO autosorted (account, message_id, mailbox) VALUES (?1, ?2, ?3)",
+            [account, message_id, mailbox],
+        )?;
+        Ok(noted > 0)
+    }
+
+    /// Notes that the server moved the message autosort was moving, or, with `moved` false,
+    /// refused to.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub fn autosort_answered(&self, account: &str, message_id: &str, moved: bool) -> Result<()> {
+        let state = if moved {
+            AutosortState::Moved
+        } else {
+            AutosortState::Refused
+        };
+        self.conn.execute(
+            "UPDATE autosorted SET state = ?3
+             WHERE account = ?1 AND message_id = ?2 AND state = 'moving'",
+            [account, message_id, state.key()],
+        )?;
+        Ok(())
+    }
+
+    /// Has autosort leave `account`'s message `message_id` alone, as the user keeps it in the
+    /// inbox, unless autosort moves, moved or tried to already.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub fn keep_from_autosort(&self, account: &str, message_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO autosorted (account, message_id, mailbox, state)
+             VALUES (?1, ?2, '', 'kept')",
+            [account, message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Counts every move autosort was making as unknown, for when the app starts, as the server
+    /// answers none made before; and has autosort leave every snoozed message alone, as one
+    /// snoozed before autosort was is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub fn settle_autosorts(&self) -> Result<()> {
+        self.conn.execute(
+            "UPDATE autosorted SET state = 'unknown' WHERE state = 'moving'",
+            [],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO autosorted (account, message_id, mailbox, state)
+             SELECT account, message_id, '', 'kept' FROM snoozes",
+            [],
+        )?;
+        Ok(())
+    }
+}
+
+/// Forgets where `account` autosorts to, and what it autosorted.
+pub(crate) fn forget_autosort_of(tx: &Transaction<'_>, account: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM autosort_mailboxes WHERE account = ?1",
+        [account],
+    )?;
+    tx.execute("DELETE FROM autosorted WHERE account = ?1", [account])?;
+    Ok(())
 }
 
 /// The version of the features what's kept was learned by, if it was ever said.
@@ -674,5 +858,148 @@ mod tests {
             !store.save_sorting(0, &changes).unwrap(),
             "what was learned before it was removed isn't saved"
         );
+    }
+
+    #[test]
+    fn autosort_mailboxes_are_turned_on_and_off() {
+        let store = store();
+        store
+            .set_autosort("a@example.com", "Receipts", true)
+            .unwrap();
+        store
+            .set_autosort("a@example.com", "Receipts", true)
+            .unwrap();
+        store.set_autosort("b@example.com", "News", true).unwrap();
+        let on = |a: &str, m: &str| (a.to_owned(), m.to_owned());
+        assert_eq!(
+            store.autosort_mailboxes().unwrap(),
+            [on("a@example.com", "Receipts"), on("b@example.com", "News")].into()
+        );
+        store.set_autosort("b@example.com", "News", false).unwrap();
+        assert_eq!(
+            store.autosort_mailboxes().unwrap(),
+            [on("a@example.com", "Receipts")].into()
+        );
+    }
+
+    #[test]
+    fn a_message_is_autosorted_once() {
+        let store = store();
+        assert!(
+            store
+                .note_autosorted("a@example.com", "1@x", "Receipts")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .note_autosorted("a@example.com", "1@x", "Other")
+                .unwrap(),
+            "already moved once"
+        );
+        let noted = |state| {
+            [(
+                ("a@example.com".to_owned(), "1@x".to_owned()),
+                Autosorted {
+                    mailbox: "Receipts".to_owned(),
+                    state,
+                },
+            )]
+            .into()
+        };
+        assert_eq!(store.autosorted().unwrap(), noted(AutosortState::Moving));
+        store
+            .autosort_answered("a@example.com", "1@x", true)
+            .unwrap();
+        assert_eq!(store.autosorted().unwrap(), noted(AutosortState::Moved));
+        store
+            .autosort_answered("a@example.com", "1@x", false)
+            .unwrap();
+        assert_eq!(
+            store.autosorted().unwrap(),
+            noted(AutosortState::Moved),
+            "moved, it stays so"
+        );
+    }
+
+    #[test]
+    fn a_refused_autosort_isnt_tried_again() {
+        let store = store();
+        store
+            .note_autosorted("a@example.com", "1@x", "Receipts")
+            .unwrap();
+        store
+            .autosort_answered("a@example.com", "1@x", false)
+            .unwrap();
+        assert_eq!(
+            store.autosorted().unwrap()[&("a@example.com".to_owned(), "1@x".to_owned())].state,
+            AutosortState::Refused
+        );
+        assert!(
+            !store
+                .note_autosorted("a@example.com", "1@x", "Receipts")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn mail_kept_from_autosort_isnt_autosorted() {
+        let store = store();
+        store.keep_from_autosort("a@example.com", "1@x").unwrap();
+        assert_eq!(
+            store.autosorted().unwrap()[&("a@example.com".to_owned(), "1@x".to_owned())].state,
+            AutosortState::Kept
+        );
+        assert!(
+            !store
+                .note_autosorted("a@example.com", "1@x", "Receipts")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn mail_snoozed_before_autosort_was_is_kept_from_it() {
+        let store = store();
+        store
+            .conn
+            .execute(
+                "INSERT INTO snoozes (account, message_id, mailbox, until)
+                 VALUES ('a@example.com', '1@x', 'Snoozed', 0)",
+                [],
+            )
+            .unwrap();
+        store.settle_autosorts().unwrap();
+        assert_eq!(
+            store.autosorted().unwrap()[&("a@example.com".to_owned(), "1@x".to_owned())].state,
+            AutosortState::Kept
+        );
+    }
+
+    #[test]
+    fn autosorts_unanswered_when_the_app_starts_are_unknown() {
+        let store = store();
+        store
+            .note_autosorted("a@example.com", "1@x", "Receipts")
+            .unwrap();
+        store.settle_autosorts().unwrap();
+        assert_eq!(
+            store.autosorted().unwrap()[&("a@example.com".to_owned(), "1@x".to_owned())].state,
+            AutosortState::Unknown
+        );
+    }
+
+    #[test]
+    fn an_account_moved_to_another_server_forgets_where_it_autosorts() {
+        let store = store();
+        store
+            .set_autosort("a@example.com", "Receipts", true)
+            .unwrap();
+        store
+            .note_autosorted("a@example.com", "1@x", "Receipts")
+            .unwrap();
+        let mut moved = account("a@example.com");
+        moved.imap.host = "imap.elsewhere.example".into();
+        store.save_account(&moved).unwrap();
+        assert!(store.autosort_mailboxes().unwrap().is_empty());
+        assert!(store.autosorted().unwrap().is_empty());
     }
 }
