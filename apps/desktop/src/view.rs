@@ -536,27 +536,45 @@ fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut 
             let autosort = (s.settings.sort_mail
                 && postden_app::is_filed_in(&mailbox.name, mailbox.role))
             .then(|| s.autosorts_to(account, &mailbox.name));
+            // The inbox's newest are downloaded ahead as the setting says; others', when chosen.
+            let prefetch = (s.settings.prefetch > 0 && mailbox.role != Role::Inbox)
+                .then(|| s.prefetches_from(account, &mailbox.name));
             // The inbox, Drafts and the rest the server or the app keeps mail in stay.
             let deletable = s.can_delete_mailbox(account, &mailbox.name);
-            mailbox_menu(menu, marking, autosort, deletable, r, k, layer)
+            let offered = Offered {
+                marking,
+                autosort,
+                prefetch,
+                deletable,
+            };
+            mailbox_menu(menu, offered, r, k, layer)
         }
         _ => r,
     }
 }
 
-/// A mailbox's menu, open at where it was right-clicked: refreshing it or every mailbox,
-/// marking it all read, where `autosort` says whether inbox mail is moved there by itself,
-/// turning that on or off, and deleting it if it's `deletable`.
-/// While it's `marking` read, it can't be marked again.
-fn mailbox_menu(
-    menu: &MailboxMenu,
+/// What a mailbox's menu offers, besides refreshing.
+#[derive(Clone, Copy)]
+struct Offered {
+    /// The mailbox is being marked all read, so it can't be marked again.
     marking: bool,
+    /// Whether inbox mail is moved there by itself, where that can be turned on or off.
     autosort: Option<bool>,
+    /// Whether its newest messages are downloaded ahead, where that can be turned on or off.
+    prefetch: Option<bool>,
     deletable: bool,
-    row: El,
-    k: &Kit,
-    layer: &mut Vec<El>,
-) -> El {
+}
+
+/// A mailbox's menu, open at where it was right-clicked: refreshing it or every mailbox,
+/// marking it all read, turning autosorting there and downloading it ahead on or off, where
+/// they can be, and deleting it if it's deletable.
+fn mailbox_menu(menu: &MailboxMenu, offered: Offered, row: El, k: &Kit, layer: &mut Vec<El>) -> El {
+    let Offered {
+        marking,
+        autosort,
+        prefetch,
+        deletable,
+    } = offered;
     let (account, mailbox) = &menu.mailbox;
     let (a, b) = (account.clone(), mailbox.clone());
     let (refresh_account, refresh_mailbox) = (account.clone(), mailbox.clone());
@@ -599,6 +617,18 @@ fn mailbox_menu(
                 .on_select(move |s: &mut Mail| {
                     s.close_mailbox_menu();
                     s.set_autosort(&account, &mailbox, !on);
+                }),
+        );
+    }
+    if let Some(on) = prefetch {
+        let (account, mailbox) = (account.clone(), mailbox.clone());
+        items = items.item(
+            MenuItem::new("Download ahead here")
+                .description("Its newest open without waiting")
+                .checked(on)
+                .on_select(move |s: &mut Mail| {
+                    s.close_mailbox_menu();
+                    s.set_prefetch_mailbox(&account, &mailbox, !on);
                 }),
         );
     }
@@ -2591,7 +2621,8 @@ fn settings_accounts(s: &Mail, k: &Kit) -> El {
     accounts
 }
 
-/// How many of each inbox's newest messages are downloaded ahead of their opening, whether
+/// How many of the newest messages of each inbox, and each mailbox chosen, are downloaded ahead
+/// of their opening, whether
 /// opened ones stay downloaded, and a button to drop all of them.
 fn prefetch_setting(s: &Mail, k: &Kit) -> El {
     let counts: Vec<String> = PREFETCH_COUNTS
@@ -2610,7 +2641,7 @@ fn prefetch_setting(s: &Mail, k: &Kit) -> El {
             .iter()
             .position(|&n| n == s.settings.prefetch),
     )
-    .label("Newest messages per inbox")
+    .label("Newest messages per mailbox")
     .fit()
     .on_pick(|s: &mut Mail, i, _| {
         if let Some(&count) = PREFETCH_COUNTS.get(i) {
@@ -2633,7 +2664,9 @@ fn prefetch_setting(s: &Mail, k: &Kit) -> El {
         "Downloading ahead",
         Some(
             "Postden can download your newest messages as they arrive, so they open without \
-             waiting for the server. Off, a message is downloaded only once you open it. \
+             waiting for the server: those of each inbox, and of the mailboxes you choose by \
+             right-clicking one and choosing Download ahead here. Off, a message is downloaded \
+             only once you open it. \
              Messages over 5 MB are always downloaded when opened. Kept, a message you opened \
              opens again without waiting, in any mailbox. Clearing drops every downloaded \
              message; the newest are downloaded ahead again.",
@@ -3946,7 +3979,7 @@ struct Rich {
     set_mode: fn(&mut Mail, Mode),
     /// Handles keys the editor doesn't, such as ⌘↩ to send.
     on_key: fn(&mut Mail, &rune::KeyEvent, &mut Tx) -> bool,
-    /// Shown when switching to the visual editor would drop markup.
+    /// Offered when switching to the visual editor would drop markup.
     drops: &'static str,
     /// Asks for an image to put where the caret is, for text that can show images.
     add_image: Option<fn(&mut Mail, &mut Tx)>,

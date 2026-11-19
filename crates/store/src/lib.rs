@@ -275,6 +275,13 @@ CREATE TABLE IF NOT EXISTS autosorted (
     state      TEXT NOT NULL DEFAULT 'moving',
     PRIMARY KEY (account, message_id)
 ) STRICT;
+
+-- The mailboxes, besides the inbox, whose newest messages are downloaded ahead too.
+CREATE TABLE IF NOT EXISTS prefetch_mailboxes (
+    account TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    name    TEXT NOT NULL,
+    PRIMARY KEY (account, name)
+) STRICT;
 ";
 
 /// The schema version [`SCHEMA`] creates, kept in `PRAGMA user_version`.
@@ -333,10 +340,11 @@ fn same_mailboxes(conn: &Connection, account: &Account) -> Result<bool> {
 /// Forgets what's known of account `id`'s mailboxes, as it reads another server's or user's
 /// now: what's cached of the old ones, down to their UIDs and UIDVALIDITY, says nothing about
 /// the new ones. Messages and bodies go with their mailbox; snoozes too, as they're of messages
-/// on the old server; and what sorting learned of where its mail goes, and the mailboxes it
-/// autosorts to.
+/// on the old server; what sorting learned of where its mail goes, and the mailboxes it
+/// autosorts to; and the mailboxes downloaded ahead.
 fn forget_mailboxes_of(tx: &Transaction<'_>, id: &str) -> Result<()> {
     tx.execute("DELETE FROM mailboxes WHERE account = ?1", [id])?;
+    tx.execute("DELETE FROM prefetch_mailboxes WHERE account = ?1", [id])?;
     tx.execute("DELETE FROM listed_mailboxes WHERE account = ?1", [id])?;
     tx.execute("DELETE FROM snoozes WHERE account = ?1", [id])?;
     tx.execute("DELETE FROM put_away WHERE account = ?1", [id])?;
@@ -687,7 +695,8 @@ impl Store {
 
     /// Replaces the account's list of mailboxes with what the server listed. Cached mail from a
     /// mailbox that's no longer listed (deleted or renamed on the server) is dropped, and a
-    /// cached mailbox still listed takes the role it's listed with, as when it's now the Drafts.
+    /// cached mailbox still listed takes the role it's listed with, as when it's now the Drafts. A
+    /// mailbox no longer listed isn't downloaded ahead anymore.
     ///
     /// # Errors
     ///
@@ -710,6 +719,12 @@ impl Store {
             "UPDATE mailboxes SET role = (SELECT l.role FROM listed_mailboxes l
                 WHERE l.account = mailboxes.account AND l.name = mailboxes.name)
              WHERE account = ?1",
+            [account],
+        )?;
+        // Nor is one made again under its name downloaded ahead without being chosen.
+        tx.execute(
+            "DELETE FROM prefetch_mailboxes WHERE account = ?1
+             AND name NOT IN (SELECT name FROM listed_mailboxes WHERE account = ?1)",
             [account],
         )?;
         // Mail put away in a mailbox gone says nothing of one made again under its name.
@@ -1324,12 +1339,43 @@ impl Store {
         body: &Body,
         kept: bool,
     ) -> Result<bool> {
+        self.insert_body((account, mailbox, uid), body, kept, None)
+    }
+
+    /// Caches a message's body downloaded ahead, not kept, as [`Store::save_body`] does: only if
+    /// `mailbox` is `inbox` or one [`Store::prefetch_mailboxes`] holds, checked as it's written,
+    /// so none is cached once [`Store::set_prefetch_mailbox`] stopped downloading it ahead.
+    /// Returns whether it was cached.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails.
+    pub fn save_body_ahead(
+        &self,
+        (account, mailbox, uid): (&str, &str, u32),
+        body: &Body,
+        inbox: &str,
+    ) -> Result<bool> {
+        self.insert_body((account, mailbox, uid), body, false, Some(inbox))
+    }
+
+    /// As [`Store::save_body`], and with an `inbox`, as [`Store::save_body_ahead`].
+    fn insert_body(
+        &self,
+        (account, mailbox, uid): (&str, &str, u32),
+        body: &Body,
+        kept: bool,
+        inbox: Option<&str>,
+    ) -> Result<bool> {
         Ok(self.conn.execute(
             "INSERT INTO bodies
                 (account, mailbox, uid, to_list, cc_list, reply_to, refs, text, html, attachments,
                  kept)
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
              WHERE EXISTS (SELECT 1 FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3)
+             AND (?12 IS NULL OR ?2 = ?12 OR EXISTS (
+                SELECT 1 FROM prefetch_mailboxes WHERE account = ?1 AND name = ?2
+             ))
              ON CONFLICT(account, mailbox, uid) DO UPDATE SET
                 to_list = excluded.to_list, cc_list = excluded.cc_list,
                 reply_to = excluded.reply_to, refs = excluded.refs, text = excluded.text,
@@ -1347,6 +1393,7 @@ impl Store {
                 body.html,
                 body.attachments.join("\u{1e}"),
                 kept,
+                inbox,
             ],
         )? > 0)
     }
@@ -1365,26 +1412,32 @@ impl Store {
     }
 
     /// Stops keeping the bodies of opened messages, of every account: all are dropped but those
-    /// among the `newest` most recent of each account's mailbox `ahead`, whose newest are
-    /// downloaded ahead, which stay as if downloaded ahead. Every body outside `ahead` goes,
-    /// kept or not: only keeping opened messages caches those. Returns how many were dropped.
+    /// among the `newest` most recent of each account's mailbox `inbox` and of the mailboxes
+    /// [`Store::prefetch_mailboxes`] holds, whose newest are downloaded ahead, which stay as if
+    /// downloaded ahead. Every body in another mailbox goes, kept or not: only keeping opened
+    /// messages caches those. Returns how many were dropped.
     ///
     /// # Errors
     ///
     /// Returns an error, having changed nothing, when the write fails.
-    pub fn release_kept_bodies(&mut self, ahead: &str, newest: usize) -> Result<usize> {
+    pub fn release_kept_bodies(&mut self, inbox: &str, newest: usize) -> Result<usize> {
         let newest = i64::try_from(newest).unwrap_or(i64::MAX);
         let tx = self.conn.transaction()?;
         let dropped = tx.execute(
-            "DELETE FROM bodies WHERE mailbox <> ?1 OR (kept = 1 AND (account, uid) NOT IN (
-                SELECT account, uid FROM (
-                    SELECT account, uid, row_number() OVER (
-                        PARTITION BY account ORDER BY date IS NULL, date DESC, uid DESC
-                    ) AS position
-                    FROM messages WHERE mailbox = ?1
-                ) WHERE position <= ?2
-             ))",
-            params![ahead, newest],
+            "WITH ahead (account, name) AS (
+                SELECT id, ?1 FROM accounts UNION SELECT account, name FROM prefetch_mailboxes
+             )
+             DELETE FROM bodies WHERE (account, mailbox) NOT IN (SELECT account, name FROM ahead)
+                OR (kept = 1 AND (account, mailbox, uid) NOT IN (
+                    SELECT account, mailbox, uid FROM (
+                        SELECT account, mailbox, uid, row_number() OVER (
+                            PARTITION BY account, mailbox
+                            ORDER BY date IS NULL, date DESC, uid DESC
+                        ) AS position
+                        FROM messages WHERE (account, mailbox) IN (SELECT account, name FROM ahead)
+                    ) WHERE position <= ?2
+                ))",
+            params![inbox, newest],
         )?;
         tx.execute("UPDATE bodies SET kept = 0 WHERE kept = 1", [])?;
         tx.commit()?;
@@ -1472,6 +1525,48 @@ impl Store {
              )",
             params![account, mailbox, newest],
         )?)
+    }
+
+    /// The mailboxes, besides the inbox, whose newest messages are downloaded ahead too, by
+    /// account and name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn prefetch_mailboxes(&self) -> Result<HashSet<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT account, name FROM prefetch_mailboxes")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Has the newest messages of `account`'s `mailbox` downloaded ahead too, or stops. Stopping
+    /// drops what was downloaded ahead of it, but what's kept once opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error, having changed nothing, when the write fails, as when the account
+    /// isn't saved.
+    pub fn set_prefetch_mailbox(&self, account: &str, mailbox: &str, on: bool) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        if on {
+            tx.execute(
+                "INSERT OR IGNORE INTO prefetch_mailboxes (account, name) VALUES (?1, ?2)",
+                [account, mailbox],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM prefetch_mailboxes WHERE account = ?1 AND name = ?2",
+                [account, mailbox],
+            )?;
+            tx.execute(
+                "DELETE FROM bodies WHERE account = ?1 AND mailbox = ?2 AND kept = 0",
+                [account, mailbox],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// The `limit` most recent messages in every account's mailbox with this role, newest first.
@@ -2776,6 +2871,88 @@ mod tests {
             .unwrap();
         assert_eq!(store.clear_bodies().unwrap(), 2, "and the other account's");
         assert!(!cached(&store, "Archive", 1));
+    }
+
+    #[test]
+    fn mailboxes_downloaded_ahead_keep_their_newest_until_turned_off() {
+        let mut store = Store::open_in_memory().unwrap();
+        let me = "me@example.com";
+        store.save_account(&account(me)).unwrap();
+        let messages: Vec<_> = (1..=3).map(|uid| envelope(uid, i64::from(uid))).collect();
+        store
+            .save_messages(me, "Receipts", Role::Other, 1, &messages)
+            .unwrap();
+        store
+            .save_messages(me, "News", Role::Other, 1, &[envelope(4, 4)])
+            .unwrap();
+        store.set_prefetch_mailbox(me, "Receipts", true).unwrap();
+        store.set_prefetch_mailbox(me, "Receipts", true).unwrap();
+        assert_eq!(
+            store.prefetch_mailboxes().unwrap(),
+            [(me.to_owned(), "Receipts".to_owned())].into()
+        );
+        let cached = |store: &Store, mailbox, uid| store.body(me, mailbox, uid).unwrap().is_some();
+        for uid in 1..=3 {
+            store
+                .save_body(me, "Receipts", uid, &Body::default(), uid == 1)
+                .unwrap();
+        }
+        store
+            .save_body(me, "News", 4, &Body::default(), true)
+            .unwrap();
+
+        assert_eq!(
+            store.release_kept_bodies("INBOX", 2).unwrap(),
+            2,
+            "News, not downloaded ahead, and UID 1, past the newest two"
+        );
+        assert!(!cached(&store, "News", 4) && !cached(&store, "Receipts", 1));
+        assert!(cached(&store, "Receipts", 2) && cached(&store, "Receipts", 3));
+
+        store
+            .save_body(me, "Receipts", 1, &Body::default(), true)
+            .unwrap();
+        store.set_prefetch_mailbox(me, "Receipts", false).unwrap();
+        assert!(store.prefetch_mailboxes().unwrap().is_empty());
+        assert!(cached(&store, "Receipts", 1), "kept once opened, it stays");
+        assert!(!cached(&store, "Receipts", 2) && !cached(&store, "Receipts", 3));
+        assert!(
+            !store
+                .save_body_ahead((me, "Receipts", 2), &Body::default(), "INBOX")
+                .unwrap(),
+            "downloaded ahead after it was turned off, it's not saved"
+        );
+        store
+            .save_messages(me, "INBOX", Role::Inbox, 1, &[envelope(9, 9)])
+            .unwrap();
+        assert!(
+            store
+                .save_body_ahead((me, "INBOX", 9), &Body::default(), "INBOX")
+                .unwrap()
+        );
+
+        // No longer listed, as deleted elsewhere, it's not downloaded ahead once made again.
+        store.set_prefetch_mailbox(me, "Receipts", true).unwrap();
+        store.set_prefetch_mailbox(me, "News", true).unwrap();
+        let listed = |name: &str| Mailbox {
+            name: name.into(),
+            delimiter: None,
+            role: Role::Other,
+        };
+        store
+            .save_mailbox_list(me, &[listed("INBOX"), listed("News")])
+            .unwrap();
+        assert_eq!(
+            store.prefetch_mailboxes().unwrap(),
+            [(me.to_owned(), "News".to_owned())].into()
+        );
+
+        // Saved on another server, its mailboxes aren't downloaded ahead anymore.
+        store.set_prefetch_mailbox(me, "Receipts", true).unwrap();
+        let mut moved = account(me);
+        moved.imap.host = "imap.elsewhere.example".into();
+        store.save_account(&moved).unwrap();
+        assert!(store.prefetch_mailboxes().unwrap().is_empty());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Watching every account's inbox in the background, refreshing its other mailboxes on a timer,
-//! and saving what arrives; downloading the inbox's newest messages ahead of their opening, when
-//! asked to; and opening, exporting, flagging, moving, snoozing and sending messages on the same
+//! and saving what arrives; downloading the newest messages of the inbox, and of the mailboxes
+//! chosen, ahead of their opening, when asked to; and opening, exporting, flagging, moving, snoozing and sending messages on the same
 //! background runtime. Snoozed messages come back to the inbox unread once
 //! [`Mailroom::wake_due`] finds them due.
 
@@ -28,7 +28,8 @@ use tokio::task::AbortHandle;
 
 use crate::{Error, Result, credentials};
 
-/// The inbox's name on every server, the only mailbox whose messages are downloaded ahead.
+/// The inbox's name on every server, whose messages are downloaded ahead, as are those of the
+/// mailboxes [`Store::prefetch_mailboxes`] holds.
 const INBOX: &str = "INBOX";
 /// How many messages one connection downloads ahead. Each batch is saved, and opens without
 /// waiting, before the next is asked for, under the setting and login as they are then.
@@ -515,14 +516,15 @@ enum Job {
     Clear,
     /// Stop keeping opened messages, unless they're kept again by then.
     Release,
-    /// Download the account's newest inbox messages not downloaded yet, as many as asked, and
-    /// drop the others downloaded before.
+    /// Download the newest messages not downloaded yet of the account's inbox and the mailboxes
+    /// chosen, as many as asked, and drop the others downloaded before.
     Prefetch {
         account: String,
     },
     /// Messages asked for by [`Job::Prefetch`] were downloaded, or couldn't be.
     Prefetched {
         account: String,
+        mailbox: String,
         /// The account's watch they were asked for under: see [`Job::Watching`].
         watch: u64,
         uid_validity: u32,
@@ -801,7 +803,7 @@ pub struct Mailroom {
     jobs: UnboundedSender<Job>,
     watchers: HashMap<String, Watched>,
     config: WatchConfig,
-    /// How many of each inbox's newest messages to download ahead.
+    /// How many of the newest messages of each inbox, and each mailbox chosen, to download ahead.
     prefetch: Arc<AtomicUsize>,
     /// Whether messages, once opened, stay downloaded.
     keep_opened: Arc<AtomicBool>,
@@ -900,6 +902,7 @@ impl Mailroom {
             cleared: Arc::clone(&cleared),
             busy: HashSet::new(),
             skipped: HashSet::new(),
+            failed: HashSet::new(),
         };
         std::thread::Builder::new()
             .name("postden-store".into())
@@ -973,7 +976,14 @@ impl Mailroom {
         let _ignored = self.jobs.send(Job::Clear);
     }
 
-    /// Has the store thread download ahead what `account`'s inbox lacks.
+    /// Downloads ahead, in the background, what `account`'s inbox and the mailboxes chosen lack,
+    /// and drops what was downloaded ahead of those no longer chosen: for after
+    /// [`Store::set_prefetch_mailbox`] changed which.
+    pub fn prefetch_mailboxes_changed(&self, account: &str) {
+        self.prefetch_for(account);
+    }
+
+    /// Has the store thread download ahead what `account`'s inbox and mailboxes chosen lack.
     fn prefetch_for(&self, account: &str) {
         let _ignored = self.jobs.send(Job::Prefetch {
             account: account.to_owned(),
@@ -2071,8 +2081,8 @@ impl Drop for Mailroom {
     }
 }
 
-/// Downloads inbox messages ahead of their opening, for the store thread, which alone knows
-/// which are cached.
+/// Downloads the messages of the inbox, and of the mailboxes chosen, ahead of their opening, for
+/// the store thread, which alone knows which are cached.
 struct Prefetcher {
     handle: tokio::runtime::Handle,
     /// Weak, as the store thread it lives on ends only once every sender is dropped.
@@ -2084,19 +2094,24 @@ struct Prefetcher {
     keep_opened: Arc<AtomicBool>,
     /// How many times downloaded messages were cleared: see [`Job::Opened`].
     cleared: Arc<AtomicU64>,
-    /// The accounts with a batch being downloaded ahead: one at a time each, so only one
-    /// connection per account downloads ahead, and nothing is asked for twice.
+    /// The accounts with a batch being downloaded ahead: one at a time each, of any of its
+    /// mailboxes, so only one connection per account downloads ahead, and nothing is asked for
+    /// twice.
     busy: HashSet<String>,
-    /// Messages a download ahead left out, by account, watch, UIDVALIDITY and UID, not to be
+    /// Messages a download ahead left out, by account, watch, mailbox, UIDVALIDITY and UID, not to be
     /// asked for again: those too large, and those no longer on the server, whose envelopes
     /// stay cached as the watcher only fetches newer mail. By watch, as a replaced account's
     /// UIDs name another server's messages: they're checked again once watched anew.
-    skipped: HashSet<(String, u64, u32, u32)>,
+    skipped: HashSet<(String, u64, String, u32, u32)>,
+    /// The mailboxes whose last batch failed, by account and watch, passed over so the others
+    /// are downloaded ahead meanwhile: each is tried again once the account's mail syncs, or
+    /// it's asked to download ahead again.
+    failed: HashSet<(String, u64, String)>,
 }
 
 impl Prefetcher {
     /// Saves what a job brought and says what the UI should show, then downloads ahead what
-    /// the account's inbox lacks if the job may have changed that.
+    /// the account's inbox and mailboxes chosen lack if the job may have changed that.
     #[expect(
         clippy::significant_drop_tightening,
         reason = "a watch's number is held until what it brought is written"
@@ -2123,32 +2138,39 @@ impl Prefetcher {
         let (account, updates) = match job {
             Job::Clear => return self.clear(store),
             Job::Release => return self.release(store),
-            Job::Prefetch { account } => (account, Vec::new()),
+            Job::Prefetch { account } => {
+                self.failed.retain(|(a, ..)| *a != account);
+                (account, Vec::new())
+            }
             Job::Prefetched {
                 account,
+                mailbox,
                 watch,
                 uid_validity,
                 uids,
                 result,
             } => {
                 self.busy.remove(&account);
-                // Failing, it's tried again with the next new mail or at the next start. Asked
-                // of mailboxes the account no longer has, it's for no one.
-                let Ok(prefetched) = result else {
-                    return Vec::new();
-                };
+                // Asked of mailboxes the account no longer has, it's for no one.
                 if current.get(&account) != Some(&watch) {
                     return Vec::new();
                 }
-                let updates =
-                    self.save_prefetched(store, &account, watch, uid_validity, &uids, &prefetched);
+                let updates = self.save_prefetched(
+                    store,
+                    (&account, &mailbox),
+                    (watch, uid_validity),
+                    &uids,
+                    result,
+                );
                 (account, updates)
             }
-            Job::Watched(Event::Messages {
-                ref account,
-                ref mailbox,
-                ..
-            }) if mailbox == INBOX => (account.clone(), save(store, job)),
+            // New mail where it's downloaded ahead, or a sync while something failed: the
+            // server answers again, so what failed is tried again.
+            Job::Watched(ref event) if self.resumes(store, event) => {
+                let account = event_account(event).to_owned();
+                self.failed.retain(|(a, ..)| *a != account);
+                (account, save(store, job))
+            }
             Job::Opened {
                 account,
                 mailbox,
@@ -2158,21 +2180,14 @@ impl Prefetcher {
                 marked,
                 at,
                 cleared,
-            } if self.keeps_opened(&mailbox, keep)
+            } if self.keeps_opened(store, &account, &mailbox, keep)
                 && cleared == self.cleared.load(Ordering::Relaxed) =>
             {
+                // Downloaded, the server answers again.
+                self.failed.retain(|(a, ..)| *a != account);
                 let mut updates = Vec::new();
-                // Kept, or kept like one downloaded ahead, so it opens again without waiting;
-                // unless the mailbox started over meanwhile, as its UID names another message now.
-                let kept = store
-                    .mailbox_state(&account, &mailbox)
-                    .map_err(Error::from)
-                    .and_then(|state| {
-                        if state.is_some_and(|s| s.uid_validity == uid_validity) {
-                            store.save_body(&account, &mailbox, uid, &body, keep)?;
-                        }
-                        Ok(())
-                    });
+                let kept =
+                    keep_opened_body(store, (&account, &mailbox, uid_validity, uid), &body, keep);
                 if let Err(e) = kept {
                     updates.push(Update::SaveFailed {
                         account: account.clone(),
@@ -2204,8 +2219,22 @@ impl Prefetcher {
         updates
     }
 
-    /// Drops every downloaded message, then downloads ahead anew for each account logged in.
+    /// Whether `event` may change what an account downloads ahead: new mail in its inbox or a
+    /// mailbox chosen, or a sync while one of its mailboxes failed.
+    fn resumes(&self, store: &Store, event: &Event) -> bool {
+        match event {
+            Event::Messages {
+                account, mailbox, ..
+            } => prefetches(store, account, mailbox),
+            Event::Synced { account, .. } => self.failed.iter().any(|(a, ..)| a == account),
+            _ => false,
+        }
+    }
+
+    /// Drops every downloaded message, then downloads ahead anew for each account logged in,
+    /// trying again the mailboxes that failed.
     fn clear(&mut self, store: &Store) -> Vec<Update> {
+        self.failed.clear();
         let mut updates = vec![Update::Cleared(
             store.clear_bodies().map_err(|e| e.to_string()),
         )];
@@ -2228,7 +2257,8 @@ impl Prefetcher {
     }
 
     /// Stops keeping opened messages, of every account, logged in or not: all are dropped but
-    /// those among each inbox's newest downloaded ahead. Unless they're kept again by now.
+    /// those among the newest downloaded ahead of each inbox and mailbox chosen. Unless they're
+    /// kept again by now.
     fn release(&self, store: &mut Store) -> Vec<Update> {
         if self.keep_opened.load(Ordering::Relaxed) {
             return Vec::new();
@@ -2240,36 +2270,52 @@ impl Prefetcher {
         }
     }
 
-    /// Whether a message opened in `mailbox` is to stay downloaded: when opened messages are
-    /// `kept`, or, in the inbox, while its newest are downloaded ahead.
-    fn keeps_opened(&self, mailbox: &str, kept: bool) -> bool {
-        kept || (mailbox == INBOX && self.count.load(Ordering::Relaxed) > 0)
+    /// Whether a message opened in `account`'s `mailbox` is to stay downloaded: when opened
+    /// messages are `kept`, or, in the inbox or a mailbox chosen, while their newest are
+    /// downloaded ahead.
+    fn keeps_opened(&self, store: &Store, account: &str, mailbox: &str, kept: bool) -> bool {
+        kept || (self.count.load(Ordering::Relaxed) > 0 && prefetches(store, account, mailbox))
     }
 
     fn save_prefetched(
         &mut self,
         store: &Store,
-        account: &str,
-        watch: u64,
-        uid_validity: u32,
+        (account, mailbox): (&str, &str),
+        (watch, uid_validity): (u64, u32),
         asked: &[u32],
-        prefetched: &Prefetched,
+        result: Result<Prefetched, String>,
     ) -> Vec<Update> {
+        // Failing, it's tried again once the account's mail syncs, or at the next start; the
+        // account's other mailboxes are downloaded meanwhile.
+        let Ok(prefetched) = result else {
+            self.failed
+                .insert((account.to_owned(), watch, mailbox.to_owned()));
+            return Vec::new();
+        };
         let result = (|| -> Result<()> {
             // Started over meanwhile, the UIDs name other messages.
-            let current = is_current(store, account, INBOX, uid_validity)?;
+            let current = is_current(store, account, mailbox, uid_validity)?;
             if !current {
                 return Ok(());
             }
+            // No longer chosen by the time each is written, it's not saved.
             for (uid, body) in &prefetched.bodies {
-                store.save_body(account, INBOX, *uid, body, false)?;
+                store.save_body_ahead((account, mailbox, *uid), body, INBOX)?;
             }
             let downloaded: HashSet<u32> = prefetched.bodies.iter().map(|(uid, _)| *uid).collect();
             self.skipped.extend(
                 asked
                     .iter()
                     .filter(|uid| !downloaded.contains(uid))
-                    .map(|&uid| (account.to_owned(), watch, uid_validity, uid)),
+                    .map(|&uid| {
+                        (
+                            account.to_owned(),
+                            watch,
+                            mailbox.to_owned(),
+                            uid_validity,
+                            uid,
+                        )
+                    }),
             );
             Ok(())
         })();
@@ -2282,18 +2328,26 @@ impl Prefetcher {
         }
     }
 
-    /// Drops what's downloaded ahead of `account`'s inbox but its newest messages, and starts
-    /// downloading those it lacks.
+    /// Drops what's downloaded ahead of `account`'s inbox and mailboxes chosen but their newest
+    /// messages, and starts downloading those they lack: the inbox's first.
     fn prefetch(&mut self, store: &Store, account: &str) -> Result<()> {
         let count = self.count.load(Ordering::Relaxed);
-        store.trim_bodies(account, INBOX, count)?;
+        let mut mailboxes = vec![INBOX.to_owned()];
+        let mut chosen: Vec<String> = store
+            .prefetch_mailboxes()?
+            .into_iter()
+            .filter(|(a, name)| a == account && name != INBOX)
+            .map(|(_, name)| name)
+            .collect();
+        chosen.sort();
+        mailboxes.extend(chosen);
+        for mailbox in &mailboxes {
+            store.trim_bodies(account, mailbox, count)?;
+        }
         // Downloading a batch: the next is asked for once it's back, as things are then.
         if count == 0 || self.busy.contains(account) {
             return Ok(());
         }
-        let Some(state) = store.mailbox_state(account, INBOX)? else {
-            return Ok(());
-        };
         let Some((server, credentials, watch)) = self
             .logins
             .lock()
@@ -2303,47 +2357,93 @@ impl Prefetcher {
         else {
             return Ok(());
         };
-        let uid_validity = state.uid_validity;
-        let uids: Vec<u32> = store
-            .missing_bodies(account, INBOX, count)?
-            .into_iter()
-            .filter(|&uid| {
-                !self
-                    .skipped
-                    .contains(&(account.to_owned(), watch, uid_validity, uid))
-            })
-            .take(PREFETCH_BATCH)
-            .collect();
-        if uids.is_empty() {
+        for mailbox in mailboxes {
+            if self
+                .failed
+                .contains(&(account.to_owned(), watch, mailbox.clone()))
+            {
+                continue;
+            }
+            let Some(state) = store.mailbox_state(account, &mailbox)? else {
+                continue;
+            };
+            let uid_validity = state.uid_validity;
+            let uids: Vec<u32> = store
+                .missing_bodies(account, &mailbox, count)?
+                .into_iter()
+                .filter(|&uid| {
+                    !self.skipped.contains(&(
+                        account.to_owned(),
+                        watch,
+                        mailbox.clone(),
+                        uid_validity,
+                        uid,
+                    ))
+                })
+                .take(PREFETCH_BATCH)
+                .collect();
+            if uids.is_empty() {
+                continue;
+            }
+            // The mailroom is going away: nobody would save what comes back.
+            let Some(jobs) = self.jobs.upgrade() else {
+                return Ok(());
+            };
+            self.busy.insert(account.to_owned());
+            let (server, credentials, account) = (server, credentials, account.to_owned());
+            self.handle.spawn(async move {
+                let result = prefetch_messages(
+                    &server,
+                    &credentials,
+                    &mailbox,
+                    uid_validity,
+                    &uids,
+                    PREFETCH_MAX_SIZE,
+                )
+                .await
+                .map_err(|e| e.to_string());
+                let _ignored = jobs.send(Job::Prefetched {
+                    account,
+                    mailbox,
+                    watch,
+                    uid_validity,
+                    uids,
+                    result,
+                });
+            });
             return Ok(());
         }
-        // The mailroom is going away: nobody would save what comes back.
-        let Some(jobs) = self.jobs.upgrade() else {
-            return Ok(());
-        };
-        self.busy.insert(account.to_owned());
-        let account = account.to_owned();
-        self.handle.spawn(async move {
-            let result = prefetch_messages(
-                &server,
-                &credentials,
-                INBOX,
-                uid_validity,
-                &uids,
-                PREFETCH_MAX_SIZE,
-            )
-            .await
-            .map_err(|e| e.to_string());
-            let _ignored = jobs.send(Job::Prefetched {
-                account,
-                watch,
-                uid_validity,
-                uids,
-                result,
-            });
-        });
         Ok(())
     }
+}
+
+/// Caches the body of a message opened, `kept`, or like one downloaded ahead, so it opens again
+/// without waiting; unless the mailbox started over meanwhile, as its UID names another message
+/// now, or, not kept, it's no longer downloaded ahead by the time it's written.
+fn keep_opened_body(
+    store: &Store,
+    (account, mailbox, uid_validity, uid): (&str, &str, u32, u32),
+    body: &Body,
+    kept: bool,
+) -> Result<()> {
+    let state = store.mailbox_state(account, mailbox)?;
+    if state.is_some_and(|s| s.uid_validity == uid_validity) {
+        if kept {
+            store.save_body(account, mailbox, uid, body, true)?;
+        } else {
+            store.save_body_ahead((account, mailbox, uid), body, INBOX)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `account`'s `mailbox` has its newest messages downloaded ahead: the inbox's always,
+/// and those of the mailboxes chosen. Unreadable, only the inbox's.
+fn prefetches(store: &Store, account: &str, mailbox: &str) -> bool {
+    mailbox == INBOX
+        || store
+            .prefetch_mailboxes()
+            .is_ok_and(|on| on.contains(&(account.to_owned(), mailbox.to_owned())))
 }
 
 /// Saves what a job brought, and says what the UI should show.
@@ -2956,10 +3056,14 @@ mod tests {
     }
 
     fn messages(uid_validity: u32, uids: &[u32]) -> Job {
+        messages_in("INBOX", Role::Inbox, uid_validity, uids)
+    }
+
+    fn messages_in(mailbox: &str, role: Role, uid_validity: u32, uids: &[u32]) -> Job {
         Job::Watched(Event::Messages {
             account: "me@example.com".into(),
-            mailbox: "INBOX".into(),
-            role: Role::Inbox,
+            mailbox: mailbox.into(),
+            role,
             uid_validity,
             messages: uids
                 .iter()
@@ -3269,13 +3373,19 @@ mod tests {
             cleared: Arc::new(AtomicU64::new(0)),
             busy: HashSet::new(),
             skipped: HashSet::new(),
+            failed: HashSet::new(),
         };
         ((runtime, jobs), prefetcher)
     }
 
     fn prefetched(uid_validity: u32, uids: &[u32], too_big: &[u32]) -> Job {
+        prefetched_in("INBOX", uid_validity, uids, too_big)
+    }
+
+    fn prefetched_in(mailbox: &str, uid_validity: u32, uids: &[u32], too_big: &[u32]) -> Job {
         Job::Prefetched {
             account: "me@example.com".into(),
+            mailbox: mailbox.into(),
             watch: 1,
             uid_validity,
             uids: uids.iter().chain(too_big).copied().collect(),
@@ -3364,9 +3474,13 @@ mod tests {
         assert!(body(&store, 1).is_some() && body(&store, 2).is_some());
         assert!(prefetcher.busy.is_empty(), "no longer downloading");
         assert!(
-            prefetcher
-                .skipped
-                .contains(&("me@example.com".to_owned(), 1, 1, 3)),
+            prefetcher.skipped.contains(&(
+                "me@example.com".to_owned(),
+                1,
+                "INBOX".to_owned(),
+                1,
+                3
+            )),
             "too large, not asked for again"
         );
 
@@ -3378,6 +3492,138 @@ mod tests {
             body(&store, 3).is_none(),
             "downloaded under the old UIDVALIDITY"
         );
+    }
+
+    #[test]
+    fn mailboxes_chosen_are_downloaded_ahead_after_the_inbox() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        let (_runtime, mut prefetcher) = prefetcher(10);
+        prefetcher.logins.lock().unwrap().insert(
+            "me@example.com".to_owned(),
+            (
+                account().imap,
+                Credentials::Password(String::from("secret").into()),
+                1,
+            ),
+        );
+        let in_mailbox = |mailbox, uids: &[u32]| messages_in(mailbox, Role::Other, 1, uids);
+        let downloaded = |mailbox, uids: &[u32]| prefetched_in(mailbox, 1, uids, &[]);
+        let body = |store: &Store, mailbox, uid| {
+            store
+                .body("me@example.com", mailbox, uid)
+                .unwrap()
+                .is_some()
+        };
+        store
+            .set_prefetch_mailbox("me@example.com", "Receipts", true)
+            .unwrap();
+        prefetcher.save(&mut store, in_mailbox("News", &[1, 2]));
+        assert!(prefetcher.busy.is_empty(), "not chosen");
+        prefetcher.save(&mut store, messages(1, &[1]));
+        prefetcher.save(&mut store, in_mailbox("Receipts", &[1, 2]));
+        prefetcher.save(&mut store, downloaded("INBOX", &[1]));
+        assert!(
+            prefetcher.busy.contains("me@example.com"),
+            "the inbox done, Receipts started"
+        );
+        prefetcher.save(&mut store, downloaded("Receipts", &[1, 2]));
+        assert!(prefetcher.busy.is_empty(), "nothing more to download");
+        assert!(body(&store, "INBOX", 1));
+        assert!(body(&store, "Receipts", 1) && body(&store, "Receipts", 2));
+
+        // No longer chosen: what's downloaded ahead goes, and what arrives late isn't saved.
+        store
+            .set_prefetch_mailbox("me@example.com", "Receipts", false)
+            .unwrap();
+        assert!(!body(&store, "Receipts", 1));
+        prefetcher.save(&mut store, downloaded("Receipts", &[1, 2]));
+        assert!(!body(&store, "Receipts", 1));
+        assert!(body(&store, "INBOX", 1), "the inbox's stay");
+    }
+
+    #[test]
+    fn a_mailbox_that_fails_is_passed_over_then_tried_again() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        let (_runtime, mut prefetcher) = prefetcher(10);
+        prefetcher.logins.lock().unwrap().insert(
+            "me@example.com".to_owned(),
+            (
+                account().imap,
+                Credentials::Password(String::from("secret").into()),
+                1,
+            ),
+        );
+        let in_mailbox = |mailbox, uids: &[u32]| messages_in(mailbox, Role::Other, 1, uids);
+        let downloaded = |mailbox, uids: &[u32]| prefetched_in(mailbox, 1, uids, &[]);
+        let failed = || Job::Prefetched {
+            account: "me@example.com".into(),
+            mailbox: "Archive".into(),
+            watch: 1,
+            uid_validity: 1,
+            uids: vec![1],
+            result: Err("offline".into()),
+        };
+        let busy = |prefetcher: &Prefetcher| prefetcher.busy.contains("me@example.com");
+        for mailbox in ["Archive", "Receipts"] {
+            store
+                .set_prefetch_mailbox("me@example.com", mailbox, true)
+                .unwrap();
+        }
+        prefetcher.save(&mut store, messages(1, &[1]));
+        prefetcher.save(&mut store, in_mailbox("Archive", &[1]));
+        prefetcher.save(&mut store, in_mailbox("Receipts", &[1]));
+        prefetcher.save(&mut store, downloaded("INBOX", &[1]));
+        assert!(busy(&prefetcher), "the inbox done, Archive started");
+
+        // Failing, it doesn't hold up the next.
+        prefetcher.save(&mut store, failed());
+        assert!(busy(&prefetcher), "Receipts started");
+        prefetcher.save(&mut store, downloaded("Receipts", &[1]));
+        assert!(!busy(&prefetcher), "Archive isn't asked for again");
+
+        // New mail tries it again.
+        prefetcher.save(&mut store, in_mailbox("Receipts", &[2]));
+        assert!(busy(&prefetcher), "asked for again once mail synced");
+        prefetcher.save(&mut store, failed());
+        prefetcher.save(&mut store, downloaded("Receipts", &[2]));
+        assert!(!busy(&prefetcher));
+
+        // So does a sync without new mail.
+        let synced = Job::Watching {
+            watch: 1,
+            event: Event::Synced {
+                account: "me@example.com".into(),
+                mailbox: Some("Archive".into()),
+                asked: 0,
+            },
+        };
+        prefetcher.save(&mut store, synced);
+        assert!(busy(&prefetcher), "asked for again once synced");
+        prefetcher.save(&mut store, failed());
+        assert!(!busy(&prefetcher));
+
+        // And a message opened, downloaded from the server.
+        let opened = Job::Opened {
+            account: "me@example.com".into(),
+            mailbox: "INBOX".into(),
+            uid_validity: 1,
+            uid: 1,
+            body: Ok(Body::default()),
+            marked: false,
+            at: 1,
+            cleared: 0,
+        };
+        prefetcher.save(&mut store, opened);
+        assert!(busy(&prefetcher), "asked for again once a message opened");
+        prefetcher.save(&mut store, failed());
+        assert!(!busy(&prefetcher));
+
+        // And clearing what's downloaded, new mail or not.
+        prefetcher.save(&mut store, Job::Clear);
+        assert!(prefetcher.failed.is_empty());
+        assert!(busy(&prefetcher), "downloading anew");
     }
 
     #[test]
@@ -3428,6 +3674,7 @@ mod tests {
         let job = Job::Prefetched {
             watch: 1,
             account: "me@example.com".into(),
+            mailbox: "INBOX".into(),
             uid_validity: 1,
             uids: vec![1, 2],
             result: Ok(Prefetched {
@@ -3437,23 +3684,32 @@ mod tests {
         };
         prefetcher.save(&mut store, job);
         assert!(
-            prefetcher
-                .skipped
-                .contains(&("me@example.com".to_owned(), 1, 1, 2)),
+            prefetcher.skipped.contains(&(
+                "me@example.com".to_owned(),
+                1,
+                "INBOX".to_owned(),
+                1,
+                2
+            )),
             "skipped, not retried in a loop"
         );
         let failed = Job::Prefetched {
             watch: 1,
             account: "me@example.com".into(),
+            mailbox: "INBOX".into(),
             uid_validity: 1,
             uids: vec![3],
             result: Err("offline".into()),
         };
         prefetcher.save(&mut store, failed);
         assert!(
-            !prefetcher
-                .skipped
-                .contains(&("me@example.com".to_owned(), 1, 1, 3)),
+            !prefetcher.skipped.contains(&(
+                "me@example.com".to_owned(),
+                1,
+                "INBOX".to_owned(),
+                1,
+                3
+            )),
             "a failure is tried again later"
         );
     }

@@ -587,6 +587,9 @@ pub(crate) struct Mail {
     /// The message open, or whose menu is open, that autosort left alone, if it did: it's
     /// sorted again once that's closed.
     autosort_waits_for: Option<MessageKey>,
+    /// The mailboxes, besides the inbox, whose newest messages are downloaded ahead too, by
+    /// account and name.
+    pub(crate) prefetch_from: HashSet<(String, String)>,
     /// A message being moved back by undoing: the list's cursor goes to it once it's listed
     /// there again, unless another mailbox is shown meanwhile.
     restoring: Option<Restoring>,
@@ -682,6 +685,7 @@ impl Mail {
             autosort_to: HashSet::new(),
             autosorting: HashMap::new(),
             autosort_waits_for: None,
+            prefetch_from: HashSet::new(),
             restoring: None,
             returning: Vec::new(),
             undoing: Vec::new(),
@@ -708,6 +712,7 @@ impl Mail {
                 mail.services = Ok(services);
                 mail.settings = settings;
                 mail.load_autosort();
+                mail.load_prefetch_mailboxes();
                 mail.reload();
                 mail.sort_mail();
                 let failed = mail
@@ -1160,6 +1165,8 @@ impl Mail {
     /// on the server is gone.
     fn mailboxes_listed(&mut self, account: &str) {
         self.reload();
+        // One no longer listed isn't downloaded ahead anymore: the store forgot it.
+        self.load_prefetch_mailboxes();
         // Listed by a refresh of every mailbox, or a round before it: either way its round syncs
         // them all next, whether they were listed before or not.
         if let Some(&asked) = self.refreshing_all.get(account) {
@@ -2925,9 +2932,13 @@ impl Mail {
         if result.is_ok() && !replaced {
             self.leave_gone_mailbox(account, name);
         }
-        // Gone, it's no place to autosort to, nor is another made under its name later.
+        // Gone, it's no place to autosort to, nor is another made under its name later; nor
+        // one to download ahead.
         if result.is_ok() && self.autosort_to.contains(&key) {
             self.set_autosort(&key.0, &key.1, false);
+        }
+        if result.is_ok() && self.prefetch_from.contains(&key) {
+            self.set_prefetch_mailbox(&key.0, &key.1, false);
         }
         let open = self.delete_mailbox.mailbox.as_ref() == Some(&key);
         let label = self.label(account).to_owned();
@@ -3545,6 +3556,43 @@ impl Mail {
             self.sort_mail();
         } else {
             self.autosort_to.remove(&key);
+        }
+    }
+
+    /// Reads which mailboxes, besides the inboxes, are downloaded ahead.
+    fn load_prefetch_mailboxes(&mut self) {
+        let Ok(services) = &self.services else { return };
+        match services.store.prefetch_mailboxes() {
+            Ok(from) => self.prefetch_from = from,
+            Err(e) => self.notify(format!(
+                "Couldn't read which mailboxes are downloaded ahead: {e}"
+            )),
+        }
+    }
+
+    /// Whether the newest messages of `account`'s `mailbox`, other than its inbox, are downloaded
+    /// ahead.
+    pub(crate) fn prefetches_from(&self, account: &str, mailbox: &str) -> bool {
+        self.prefetch_from
+            .contains(&(account.to_owned(), mailbox.to_owned()))
+    }
+
+    /// Has the newest messages of `account`'s `mailbox` downloaded ahead too, as many as of the
+    /// inbox, or stops, dropping those downloaded ahead.
+    pub(crate) fn set_prefetch_mailbox(&mut self, account: &str, mailbox: &str, on: bool) {
+        let Ok(services) = &self.services else { return };
+        if let Err(e) = services.store.set_prefetch_mailbox(account, mailbox, on) {
+            self.notify(format!(
+                "Couldn't change which mailboxes are downloaded ahead: {e}"
+            ));
+            return;
+        }
+        services.mailroom.prefetch_mailboxes_changed(account);
+        let key = (account.to_owned(), mailbox.to_owned());
+        if on {
+            self.prefetch_from.insert(key);
+        } else {
+            self.prefetch_from.remove(&key);
         }
     }
 
@@ -4825,8 +4873,10 @@ impl Mail {
             return;
         }
         self.statuses.insert(id, Ok(Status::Connecting));
-        // Saved on another server, it autosorts nowhere anymore.
+        // Saved on another server, it autosorts nowhere anymore, nor downloads ahead but its
+        // inbox.
         self.load_autosort();
+        self.load_prefetch_mailboxes();
         self.notify(format!("Added {label}"));
         self.form_added();
         self.reload();
@@ -5257,8 +5307,10 @@ impl Mail {
         if imported.sorting == Some(Ok(())) {
             self.tags.clear();
         }
-        // An account replaced by one on another server autosorts nowhere anymore.
+        // An account replaced by one on another server autosorts nowhere anymore, nor downloads
+        // ahead but its inbox.
         self.load_autosort();
+        self.load_prefetch_mailboxes();
         self.sort_mail();
         self.notify(imported_notice(&imported));
     }
@@ -5886,8 +5938,9 @@ impl Mail {
         self.refreshing.retain(|key, _| key.0 != id);
         self.refreshing_all.remove(id);
         self.leaving.retain(|r| r.account != id);
-        // The store forgot where it autosorts to as well.
+        // The store forgot where it autosorts to as well, and what it downloads ahead.
         self.autosort_to.retain(|(account, _)| account != id);
+        self.prefetch_from.retain(|(account, _)| account != id);
         self.autosorting.retain(|key, _| key.0 != id);
         let dropped: Vec<MessageKey> = self
             .deferred
