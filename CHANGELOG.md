@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.10.0](https://github.com/mattsverse/postden/compare/v0.9.0...v0.10.0) (2026-11-20)
+
+
+### Features
+
+* autosort inbox mail into the mailboxes you choose ([309ed2d](https://github.com/mattsverse/postden/commit/309ed2d87c5e942e0db3cee45d5a571a794022e4))
+* delete a mailbox from its menu ([bc9f501](https://github.com/mattsverse/postden/commit/bc9f5016c4206e2e1d66fded77e81c7850030507))
+* delete mailboxes you made, never one the app or server keeps mail in ([774c8e3](https://github.com/mattsverse/postden/commit/774c8e3e92da2a026889ffa1f3cbcc2330f28857))
+* download any mailbox ahead, not just the inbox, so its mail opens without waiting ([71d86ba](https://github.com/mattsverse/postden/commit/71d86bafa5ae2c496758ed942433f949b0252092))
+* download other mailboxes ahead, as chosen ([5e71ca7](https://github.com/mattsverse/postden/commit/5e71ca7ec4af348ebe298d82f17c745c4f5e1b5c))
+* file inbox mail into the mailboxes you choose, by itself ([5f09550](https://github.com/mattsverse/postden/commit/5f0955039d2c76957ade19e16331a67c110f6104))
+* group mailboxes with nothing unread in the sidebar ([335f920](https://github.com/mattsverse/postden/commit/335f9200d80e029efa49f1559b6f767b03d1a467))
+* keep mailboxes with nothing unread out of the way, so new mail stands out ([4bc527f](https://github.com/mattsverse/postden/commit/4bc527fc3c51cff5efe2fe41fe74ec0bc1d850c3))
+* learn where mail goes and what matters, and suggest it ([f949c87](https://github.com/mattsverse/postden/commit/f949c87eee85c5f3f4ecc05fc0e679966c0f9113))
+* show an unread count on every mailbox ([07e79ef](https://github.com/mattsverse/postden/commit/07e79ef8c2c96996fa63ba8997d126bb9f6f5635))
+
+
+### Bug Fixes
+
+* **ai:** learn at once from mail filed by hand in this app ([b066eae](https://github.com/mattsverse/postden/commit/b066eae64c9d504d33bb953a1e6d3ddfea9b6c09))
+* **app:** keep debug builds' mail cache apart from the installed app's ([770e44b](https://github.com/mattsverse/postden/commit/770e44bb352b1d45d8af7ff4cb103f0fe878585f))
+* learn from mail you file right away, so a new mailbox gets suggested and autosorted ([e43b8a9](https://github.com/mattsverse/postden/commit/e43b8a9050287341080d2d07c491ddddfb42fab2))
+
 ## [0.9.0](https://github.com/mattsverse/postden/compare/v0.8.0...v0.9.0) (2026-11-18)
 
 
