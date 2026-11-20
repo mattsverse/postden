@@ -48,7 +48,7 @@ export function ContentPage({ page }: { page: Page }) {
     <div className="mx-auto max-w-6xl px-4 sm:px-6">
       <header className="border-b border-ink-900/[0.07] pt-12 pb-8 sm:pt-20 sm:pb-10 dark:border-white/[0.07]">
         <p className="font-mono text-xs font-medium tracking-[0.08em] text-accent-fg uppercase">Legal</p>
-        <h1 className="mt-3 text-4xl font-serif tracking-[-0.01em] sm:text-6xl">{page.title}</h1>
+        <h1 className="mt-3 font-display text-4xl font-medium tracking-[-0.035em] sm:text-5xl">{page.title}</h1>
         <p className="mt-4 max-w-2xl text-lg text-pretty text-ink-600 dark:text-ink-300">{page.description}</p>
         <div className="mt-6 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-ink-500 dark:text-ink-400">
           <span>

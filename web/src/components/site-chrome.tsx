@@ -10,8 +10,8 @@ export function SiteHeader() {
   return (
     <header className="sticky top-0 z-20 w-full border-b border-ink-900/[0.06] bg-paper/80 backdrop-blur-md dark:border-white/[0.06] dark:bg-ink-950/80">
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-6">
-        <Link to="/" className="flex min-h-11 items-center gap-2.5 font-serif text-2xl tracking-tight">
-          <Logo className="size-7" />
+        <Link to="/" className="flex min-h-11 items-center gap-3 font-display text-2xl font-semibold tracking-[-0.03em]">
+          <Logo className="size-9" />
           Postden
         </Link>
         <nav className="flex items-center gap-1 text-sm sm:gap-7">
@@ -39,8 +39,8 @@ export function SiteFooter() {
     <footer className="w-full border-t border-ink-900/[0.06] dark:border-white/[0.06]">
       <div className="mx-auto grid max-w-6xl gap-8 px-4 py-12 text-sm sm:grid-cols-[1fr_auto] sm:px-6">
         <div>
-          <Link to="/" className="inline-flex items-center gap-2 font-serif text-xl tracking-tight">
-            <Logo className="size-6" />
+          <Link to="/" className="inline-flex items-center gap-2.5 font-display text-xl font-semibold tracking-[-0.03em]">
+            <Logo className="size-8" />
             Postden
           </Link>
           <p className="mt-3 max-w-xs text-ink-500 dark:text-ink-400">

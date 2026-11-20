@@ -68,7 +68,7 @@ function Hero() {
 
       <div className="mx-auto max-w-6xl px-4 pt-16 pb-20 sm:px-6 sm:pt-24 sm:pb-28 lg:pt-28">
         <div className="mx-auto max-w-3xl text-center">
-          <h1 className="font-serif text-[3.1rem] leading-[0.98] tracking-[-0.015em] text-balance text-ink-950 sm:text-7xl lg:text-[5.6rem] dark:text-white">
+          <h1 className="font-display text-[2.6rem] leading-[1.02] font-medium tracking-[-0.045em] text-balance text-ink-950 sm:text-6xl lg:text-[4.6rem] dark:text-white">
             {home.headline}
           </h1>
           <p className="mx-auto mt-7 max-w-2xl text-lg leading-relaxed text-pretty text-ink-600 sm:text-xl dark:text-ink-300">{home.intro}</p>
@@ -116,7 +116,7 @@ function SectionHeading({ eyebrow, title, intro, center }: { eyebrow: string; ti
   return (
     <div className={`max-w-2xl ${center ? 'mx-auto text-center' : ''}`}>
       <p className="font-mono text-xs font-medium tracking-[0.12em] text-accent-fg uppercase">{eyebrow}</p>
-      <h2 className="mt-4 font-serif text-[2.6rem] leading-[1.02] tracking-[-0.01em] text-balance sm:text-6xl">{title}</h2>
+      <h2 className="mt-4 font-display text-[2.2rem] leading-[1.05] font-medium tracking-[-0.04em] text-balance sm:text-5xl">{title}</h2>
       {intro ? <p className="mt-5 text-lg leading-relaxed text-pretty text-ink-600 dark:text-ink-300">{intro}</p> : null}
     </div>
   )
@@ -178,7 +178,7 @@ function Privacy() {
               key={group.title}
               className="border-ink-900/10 py-8 md:px-8 md:first:pl-0 md:last:pr-0 [&+&]:border-t md:[&+&]:border-t-0 md:[&+&]:border-l dark:border-white/10"
             >
-              <h3 className="font-serif text-3xl">{group.title}</h3>
+              <h3 className="font-display text-2xl font-medium tracking-[-0.03em]">{group.title}</h3>
               <ul className="mt-6 space-y-6">
                 {group.items.map((item) => (
                   <li key={item.name}>
