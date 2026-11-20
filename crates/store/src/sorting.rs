@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Transaction, TransactionBehavior, params};
 
-use crate::{Error, Result, Store};
+use crate::{Error, Learnable, Result, Store};
 
 /// The setting the generation of what's kept is in.
 const GENERATION: &str = "sorting_generation";
@@ -364,6 +364,28 @@ impl Store {
         };
         self.conn.execute(sql, [account, mailbox])?;
         Ok(())
+    }
+
+    /// Where autosort moves or moved each message, as [`Store::autosorted`] says, and every
+    /// cached message, as [`Store::learning_messages`] gives them: read at once, so a message
+    /// autosort moved meanwhile isn't moved by it in one and moved here by hand in the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a read fails or a row is corrupt.
+    #[expect(
+        clippy::type_complexity,
+        reason = "each is what the read of its own gives"
+    )]
+    pub fn autosorted_and_learning_messages(
+        &self,
+        text_chars: usize,
+    ) -> Result<(HashMap<(String, String), Autosorted>, Vec<Learnable>)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let autosorted = self.autosorted()?;
+        let messages = self.learning_messages(text_chars)?;
+        tx.commit()?;
+        Ok((autosorted, messages))
     }
 
     /// Where autosort moves or moved each message, or tried to, by account and Message-ID.

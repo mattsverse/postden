@@ -59,6 +59,9 @@ pub struct Example<'a> {
     pub text: Option<&'a str>,
     /// Where autosort moves or moved it, if it does or did.
     pub autosorted: Option<Autosorted<'a>>,
+    /// Whether it was moved to `mailbox` in this app lately, by hand or by autosort: put there,
+    /// though just in.
+    pub moved_here: bool,
 }
 
 /// Where autosort moves or moved a message.
@@ -192,7 +195,7 @@ pub fn sort(
     }
 
     let (senders, correspondents) = senders_and_correspondents(examples);
-    let counted = counted(examples);
+    let counted = counted(examples, learning);
     let labeled = gmail(mailboxes);
     let unfiled = put_by_autosort(examples, &labeled);
     let mut features = Vec::with_capacity(examples.len());
@@ -355,9 +358,11 @@ fn is_kept_by_the_app(mailbox: &str) -> bool {
 }
 
 /// Which copy of a message counts, when the server lists it in several mailboxes, as Gmail lists
-/// every message in All Mail too: lower ranks first.
-fn rank(e: &Example<'_>) -> u8 {
-    match e.role {
+/// every message in All Mail too: lower ranks first; and of two alike, the one moved where it is
+/// here, as Gmail keeps a label the message had beside the one it's filed in, else the one it was
+/// taught as in `learning`, so it isn't taught otherwise once that move is forgotten.
+fn rank(e: &Example<'_>, learning: &Learning) -> (u8, bool, bool) {
+    let rank = match e.role {
         Role::Inbox => 0,
         Role::Other if !is_kept_by_the_app(e.mailbox) => 1,
         // Put away or snoozed, a message may still be listed in Gmail's All Mail.
@@ -365,7 +370,15 @@ fn rank(e: &Example<'_>) -> u8 {
         Role::Snoozed => 3,
         Role::Archive => 4,
         Role::Sent | Role::Drafts | Role::Other => 5,
-    }
+    };
+    let taught_here = e.envelope.message_id.as_deref().is_some_and(|id| {
+        learning
+            .accounts
+            .get(e.account)
+            .and_then(|l| l.folders.taught.get(id))
+            .is_some_and(|c| c == e.mailbox)
+    });
+    (rank, !e.moved_here, !taught_here)
 }
 
 /// Whether inbox mail can be suggested to go to a mailbox with `role`, named `mailbox`: the
@@ -427,13 +440,14 @@ fn senders_and_correspondents<'a>(examples: &[Example<'a>]) -> (Addresses<'a>, A
 /// whose mail is in each of its labels if `labeled`, as in Gmail.
 ///
 /// Mail moved back to the inbox stays there, as far as anyone can tell, as does mail taken back
-/// out of where autosort put it; other mail just in may yet be filed. So may mail just in that
-/// an archive lists, or, in Gmail, any label: All Mail and a filter's label list the inbox's
-/// mail too, and may be cached before it.
+/// out of where autosort put it, or moved anywhere in this app; other mail just in may yet be
+/// filed. So may mail just in that an archive lists, or, in Gmail, any label: All Mail and a
+/// filter's label list the inbox's mail too, and may be cached before it.
 fn is_settled(e: &Example<'_>, taught: bool, labeled: bool, now: i64) -> bool {
     let may_be_in_the_inbox = matches!(e.role, Role::Inbox | Role::Archive) || labeled;
     !may_be_in_the_inbox
         || taught
+        || e.moved_here
         || e.autosorted.is_some()
         || e.envelope.date.is_some_and(|d| now - d >= SETTLED_AFTER)
 }
@@ -479,7 +493,7 @@ fn put_by_autosort<'a>(
 
 /// The copies of each message that count, by index into `examples`: one per Message-ID in each
 /// account, and every message without one.
-fn counted(examples: &[Example<'_>]) -> Vec<bool> {
+fn counted(examples: &[Example<'_>], learning: &Learning) -> Vec<bool> {
     let mut best: HashMap<(&str, &str), usize> = HashMap::new();
     for (i, e) in examples.iter().enumerate() {
         let Some(id) = e.envelope.message_id.as_deref() else {
@@ -487,7 +501,10 @@ fn counted(examples: &[Example<'_>]) -> Vec<bool> {
         };
         best.entry((e.account, id))
             .and_modify(|b| {
-                if examples.get(*b).is_none_or(|kept| rank(e) < rank(kept)) {
+                if examples
+                    .get(*b)
+                    .is_none_or(|kept| rank(e, learning) < rank(kept, learning))
+                {
                     *b = i;
                 }
             })
@@ -522,6 +539,8 @@ mod tests {
         envelope: Envelope,
         /// Where autosort moves or moved it, if it does or did.
         autosorted: Option<Autosorted<'static>>,
+        /// Moved to `mailbox` in this app lately.
+        moved_here: bool,
     }
 
     /// Mail that came a week and a half ago.
@@ -530,6 +549,7 @@ mod tests {
             mailbox,
             role,
             autosorted: None,
+            moved_here: false,
             envelope: Envelope {
                 uid,
                 message_id: Some(format!("{mailbox}-{uid}@example")),
@@ -559,6 +579,7 @@ mod tests {
                 envelope: &c.envelope,
                 text: None,
                 autosorted: c.autosorted,
+                moved_here: c.moved_here,
             })
             .collect()
     }
@@ -814,6 +835,129 @@ mod tests {
         let _sorted = sort_into(&mut learning, &cached);
         let taught = &learning.accounts["me"].folders.taught;
         assert!(taught.contains_key("INBOX-200@example"), "{taught:?}");
+    }
+
+    #[test]
+    fn mail_just_in_filed_in_a_new_gmail_label_here_is_learned_at_once() {
+        let mut cached = receipts(8);
+        cached.extend(inbox_chatter(100, 10));
+        let mut listed = listed(&cached);
+        if let Some(names) = listed.get_mut("me") {
+            names.insert("[Gmail]/All Mail".to_owned());
+            names.insert("Bank".to_owned());
+        }
+        // A folder just made, and the bank's mail of the last day filed in it here.
+        cached.extend((0..5).map(|i| {
+            let mut filed = new_order(300 + i);
+            filed.mailbox = "Bank";
+            filed.role = Role::Other;
+            filed.envelope.from.email = Some("alerts@bank.example".into());
+            filed.envelope.subject = Some("Card payment".into());
+            filed.moved_here = true;
+            filed
+        }));
+        let mut learning = Learning::default();
+        let _sorted = sort(&mut learning, &examples(&cached), &listed, NOW);
+        let bank = learning.accounts["me"].folders.class("Bank").cloned();
+        assert_eq!(
+            bank.map(|c| c.messages),
+            Some(5),
+            "filed by hand, not by a filter"
+        );
+        let mut payment = new_order(400);
+        payment.envelope.from.email = Some("alerts@bank.example".into());
+        payment.envelope.subject = Some("Card payment".into());
+        cached.push(payment);
+        let tags = sort(&mut learning, &examples(&cached), &listed, NOW).tags;
+        assert_eq!(tags.last().unwrap().suggested.as_deref(), Some("Bank"));
+    }
+
+    #[test]
+    fn mail_just_in_filed_in_a_gmail_label_here_is_learned_there_whatever_other_label_it_has() {
+        let mut cached = receipts(8);
+        cached.extend(inbox_chatter(100, 10));
+        cached.extend((0..3).map(|i| mail("Bank", Role::Other, i + 1, "a@bank.example", "Hi")));
+        let mut listed = listed(&cached);
+        if let Some(names) = listed.get_mut("me") {
+            names.insert("[Gmail]/All Mail".to_owned());
+        }
+        // Labeled Receipts by a filter, then filed in Bank here: Gmail lists it in both.
+        let mut labeled = new_order(200);
+        labeled.mailbox = "Receipts";
+        labeled.role = Role::Other;
+        let mut filed = labeled.clone();
+        filed.mailbox = "Bank";
+        filed.moved_here = true;
+        for copies in [[labeled.clone(), filed.clone()], [filed, labeled]] {
+            let mut cached = cached.clone();
+            cached.extend(copies);
+            let mut learning = Learning::default();
+            let _sorted = sort(&mut learning, &examples(&cached), &listed, NOW);
+            let taught = &learning.accounts["me"].folders.taught;
+            assert_eq!(
+                taught.get("INBOX-200@example").map(String::as_str),
+                Some("Bank"),
+                "{taught:?}"
+            );
+            // A week on, the move is forgotten: it's still filed in Bank.
+            for c in &mut cached {
+                c.moved_here = false;
+                c.envelope.date = c.envelope.date.map(|d| d - 7 * DAY);
+            }
+            let _sorted = sort(&mut learning, &examples(&cached), &listed, NOW);
+            let taught = &learning.accounts["me"].folders.taught;
+            assert_eq!(
+                taught.get("INBOX-200@example").map(String::as_str),
+                Some("Bank"),
+                "{taught:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mail_just_in_autosort_archived_here_isnt_learned() {
+        let mut cached = receipts(8);
+        cached.extend(inbox_chatter(100, 10));
+        let mut archived = new_order(200);
+        archived.mailbox = "Archive";
+        archived.role = Role::Archive;
+        archived.moved_here = true;
+        archived.autosorted = Some(Autosorted {
+            to: "Archive",
+            moved: true,
+        });
+        cached.push(archived);
+        let mut learning = Learning::default();
+        let _sorted = sort_into(&mut learning, &cached);
+        let taught = &learning.accounts["me"].folders.taught;
+        assert!(!taught.contains_key("INBOX-200@example"), "{taught:?}");
+    }
+
+    #[test]
+    fn mail_just_in_archived_here_is_learned_at_once() {
+        let mut cached = receipts(8);
+        cached.extend(inbox_chatter(100, 10));
+        let mut archived = new_order(200);
+        archived.mailbox = "Archive";
+        archived.role = Role::Archive;
+        cached.push(archived.clone());
+        let mut learning = Learning::default();
+        let _sorted = sort_into(&mut learning, &cached);
+        let taught = &learning.accounts["me"].folders.taught;
+        assert!(
+            !taught.contains_key("INBOX-200@example"),
+            "an archive may list the inbox's mail: {taught:?}"
+        );
+        archived.moved_here = true;
+        cached.pop();
+        cached.push(archived);
+        let _sorted = sort_into(&mut learning, &cached);
+        let taught = &learning.accounts["me"].folders.taught;
+        assert_eq!(
+            taught.get("INBOX-200@example").map(String::as_str),
+            Some("Archive"),
+            "archived here"
+        );
     }
 
     #[test]
@@ -1110,6 +1254,7 @@ mod tests {
                 role: Role::Archive,
                 envelope: c.envelope.clone(),
                 autosorted: None,
+                moved_here: false,
             })
             .collect();
         cached.extend(in_all_mail);
@@ -1134,6 +1279,7 @@ mod tests {
             role: Role::Archive,
             envelope: snoozed.envelope.clone(),
             autosorted: None,
+            moved_here: false,
         };
         cached.extend([snoozed, all_mail]);
         let mut learning = Learning::default();
