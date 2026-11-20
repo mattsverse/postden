@@ -143,11 +143,10 @@ impl Learner {
                 .collect();
             mailboxes.insert(account.id, names);
         }
-        // Read before the mail: a move landing in between leaves the message under way here,
-        // which teaches nothing, rather than moved while still in the inbox, which would teach
-        // that it was moved back.
-        let autosorted = store.autosorted()?;
-        let cached = store.learning_messages(TEXT_CHARS)?;
+        // Read at once: a move landing in between would leave the message moved while still in
+        // the inbox, which would teach that it was moved back, or moved here by hand, which
+        // would teach where autosort put it.
+        let (autosorted, cached) = store.autosorted_and_learning_messages(TEXT_CHARS)?;
         let cached_in: HashSet<(&str, &str, &str)> = cached
             .iter()
             .filter_map(|l| {
@@ -189,6 +188,7 @@ impl Learner {
                     &l.message.account,
                     l.message.envelope.message_id.as_deref(),
                 ),
+                moved_here: l.moved_here,
             })
             .collect();
         let sorting = sort(&mut learning, &examples, &mailboxes, now);

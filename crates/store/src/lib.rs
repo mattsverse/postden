@@ -51,6 +51,10 @@ pub struct Learnable {
     pub role: Role,
     /// The beginning of its body's text, if it was downloaded.
     pub text: Option<String>,
+    /// Whether it was moved to its mailbox here lately, by hand or by autosort, as
+    /// [`Store::put_away`] noted: put there, rather than just in and listed there before the
+    /// inbox's copy is cached.
+    pub moved_here: bool,
 }
 
 /// A snoozed message, waiting in an account's Snoozed mailbox until it's due back in the inbox.
@@ -194,10 +198,11 @@ CREATE TABLE IF NOT EXISTS signature_images (
     PRIMARY KEY (account, cid)
 ) STRICT;
 
--- Messages moved elsewhere than an archive, by Message-ID, with where they went and its role:
--- where an archive still lists one, as Gmail's All Mail does, it wasn't archived but put away
--- there, as the Trash, Junk or a folder, while that's still listed: for a week after it was
--- noted, as by then where it went is cached, and it may have moved since, unseen.
+-- Messages moved here, by Message-ID, with where they went and its role: where an archive still
+-- lists one, as Gmail's All Mail does, it wasn't archived but put away elsewhere, as the Trash,
+-- Junk or a folder, while that's still listed; and where it went, it was moved here. For a
+-- week after it was noted, as by then where it went is cached, and it may have moved since,
+-- unseen.
 CREATE TABLE IF NOT EXISTS put_away (
     account    TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     message_id TEXT NOT NULL,
@@ -1290,10 +1295,10 @@ impl Store {
         id.map_or(Ok(()), |id| self.put_away_message(account, &id, to))
     }
 
-    /// Notes that the message with the Message-ID `message_id` was moved to the mailbox `to`: if
-    /// that isn't an archive, as listed, a copy an archive still lists, as Gmail's All Mail does,
-    /// was put away there rather than archived, while `to` is listed. Moved to an archive, that's
-    /// forgotten. What's noted holds for [`PUT_AWAY_HOLDS`], then goes.
+    /// Notes that the message with the Message-ID `message_id` was moved to the mailbox `to`,
+    /// while `to` is listed: moved there here, by hand or by autosort; and, if that isn't an
+    /// archive, as listed, a copy an archive still lists, as Gmail's All Mail does, was put away
+    /// rather than archived. What's noted holds for [`PUT_AWAY_HOLDS`], then goes.
     ///
     /// # Errors
     ///
@@ -1311,8 +1316,7 @@ impl Store {
                 SELECT role FROM listed_mailboxes WHERE account = ?1 AND name = ?3
                 UNION ALL
                 SELECT role FROM mailboxes WHERE account = ?1 AND name = ?3
-                LIMIT 1)
-             WHERE role != 'archive'",
+                LIMIT 1)",
             [account, message_id, to],
         )?;
         tx.execute(
@@ -1579,8 +1583,8 @@ impl Store {
     }
 
     /// Every cached message, with its mailbox's UIDVALIDITY and role (as [`Learnable::role`]
-    /// says), and the first `text_chars` characters of its body's text, if it
-    /// was downloaded: what sorting mail learns from.
+    /// says), the first `text_chars` characters of its body's text, if it was downloaded, and
+    /// whether it was moved there here lately: what sorting mail learns from.
     ///
     /// # Errors
     ///
@@ -1600,6 +1604,7 @@ impl Store {
                             ELSE 'snoozed' END
                         FROM put_away p
                         WHERE p.account = m.account AND p.message_id = m.message_id
+                            AND p.role != 'archive'
                             AND p.noted >= unixepoch() - {PUT_AWAY_HOLDS}
                             AND (EXISTS (
                                 SELECT 1 FROM listed_mailboxes l
@@ -1609,7 +1614,13 @@ impl Store {
                                 WHERE d.account = p.account AND d.name = p.mailbox
                             ))
                     ), b.role) END,
-                substr(t.text, 1, ?1), b.uid_validity
+                substr(t.text, 1, ?1), b.uid_validity,
+                EXISTS (
+                    SELECT 1 FROM put_away p
+                    WHERE p.account = m.account AND p.message_id = m.message_id
+                        AND p.mailbox = m.mailbox
+                        AND p.noted >= unixepoch() - {PUT_AWAY_HOLDS}
+                )
              FROM messages m
              JOIN mailboxes b ON b.account = m.account AND b.name = m.mailbox
              LEFT JOIN bodies t
@@ -1622,10 +1633,11 @@ impl Store {
                 row.get::<_, String>(11)?,
                 row.get::<_, Option<String>>(12)?,
                 row.get::<_, u32>(13)?,
+                row.get::<_, bool>(14)?,
             ))
         })?;
         rows.map(|row| {
-            let (message, role, text, uid_validity) = row?;
+            let (message, role, text, uid_validity, moved_here) = row?;
             let role = Role::from_name(&role)
                 .ok_or_else(|| Error::Corrupt(format!("unknown mailbox role {role:?}")))?;
             Ok(Learnable {
@@ -1633,6 +1645,7 @@ impl Store {
                 uid_validity,
                 role,
                 text,
+                moved_here,
             })
         })
         .collect()
@@ -2672,6 +2685,51 @@ mod tests {
             .put_away_message(ME, "1@example.com", "[Gmail]/All Mail")
             .unwrap();
         assert_eq!(all_mail(&store, 9), Some(Role::Archive), "archived since");
+    }
+
+    #[test]
+    fn mail_moved_here_says_so_where_it_went_alone() {
+        let mut store = gmail(&gmail_list());
+        store.put_away(ME, "INBOX", 1, "Receipts").unwrap();
+        assert!(store.remove_message(ME, "INBOX", 1).unwrap());
+        let mut filed = envelope(2, 10);
+        filed.message_id = Some("1@example.com".into());
+        store
+            .save_messages(ME, "Receipts", Role::Other, 1, &[filed])
+            .unwrap();
+        let moved_here = |store: &Store, mailbox: &str| {
+            store
+                .learning_messages(0)
+                .unwrap()
+                .into_iter()
+                .find(|l| l.message.mailbox == mailbox)
+                .map(|l| l.moved_here)
+        };
+        assert_eq!(moved_here(&store, "Receipts"), Some(true));
+        assert_eq!(
+            moved_here(&store, "[Gmail]/All Mail"),
+            Some(false),
+            "only listed there"
+        );
+        // Archived since, as by another app, from where it was filed.
+        store
+            .put_away_message(ME, "1@example.com", "[Gmail]/All Mail")
+            .unwrap();
+        assert_eq!(moved_here(&store, "[Gmail]/All Mail"), Some(true));
+        assert_eq!(all_mail(&store, 9), Some(Role::Archive), "and so archived");
+        assert_eq!(moved_here(&store, "Receipts"), Some(false));
+        store
+            .conn
+            .execute(
+                "UPDATE put_away SET noted = noted - ?1 - 1",
+                [PUT_AWAY_HOLDS],
+            )
+            .unwrap();
+        assert_eq!(
+            moved_here(&store, "[Gmail]/All Mail"),
+            Some(false),
+            "noted too long ago"
+        );
     }
 
     #[test]
