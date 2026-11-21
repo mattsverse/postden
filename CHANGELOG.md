@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.0](https://github.com/mattsverse/postden/compare/v0.10.0...v0.11.0) (2026-11-21)
+
+
+### Features
+
+* **desktop:** edit an account's IMAP and SMTP settings ([820967f](https://github.com/mattsverse/postden/commit/820967fe7d472dbbdc37d37ddc1ba9ddc090ffb0))
+
+
+### Bug Fixes
+
+* **desktop:** keep read marks as asked while the server answers ([da67a31](https://github.com/mattsverse/postden/commit/da67a31f89bfa8af04785ccf2339b6bd6714fdcc))
+
 ## [0.10.0](https://github.com/mattsverse/postden/compare/v0.9.0...v0.10.0) (2026-11-20)
 
 
