@@ -1,12 +1,14 @@
-//! An account's settings page: what it's called, the name its mail is sent under, and its
-//! signature, written in the visual editor or as HTML, with images.
+//! An account's settings page: what it's called, the name its mail is sent under, its
+//! signature, written in the visual editor or as HTML, with images, and the servers it reads
+//! and sends mail through.
 
-use postden_app::signature;
-use postden_core::account::{Account, Signature};
+use postden_app::{NewAccount, signature};
+use postden_core::account::{Account, Auth, Security, Server, Signature};
 use postden_core::message::InlineImage;
 use rune::{ImageCache, TextEdit};
 
 use crate::compose::Preview;
+use crate::form::{optional, port};
 use crate::rich::{Mode, RichEditor, readable};
 
 /// The file types a signature's images can be picked from.
@@ -18,6 +20,70 @@ struct Saved {
     label: Option<String>,
     name: Option<String>,
     signature: Option<Signature>,
+    servers: Option<Result<(Server, Server), String>>,
+}
+
+/// An account's IMAP and SMTP servers, and what it logs in to them with, as they're edited.
+/// Blank fields fall back as they do when adding an account: the user names to the address,
+/// the ports to the conventional ones, the SMTP login to the IMAP one; blank passwords keep
+/// those saved.
+#[derive(Default)]
+pub(crate) struct Servers {
+    pub(crate) username: TextEdit,
+    pub(crate) imap_host: TextEdit,
+    pub(crate) imap_port: TextEdit,
+    pub(crate) imap_security: Security,
+    pub(crate) smtp_host: TextEdit,
+    pub(crate) smtp_port: TextEdit,
+    pub(crate) smtp_security: Security,
+    pub(crate) smtp_username: TextEdit,
+    pub(crate) password: TextEdit,
+    pub(crate) smtp_password: TextEdit,
+}
+
+impl Servers {
+    /// The fields for `account`'s servers, user names left blank where they're the defaults.
+    fn of(account: &Account) -> Self {
+        let unless =
+            |value: &str, default: &str| TextEdit::new(if value == default { "" } else { value });
+        Self {
+            username: unless(&account.imap.username, &account.id),
+            imap_host: TextEdit::new(account.imap.host.clone()),
+            imap_port: TextEdit::new(account.imap.port.to_string()),
+            imap_security: account.imap.security,
+            smtp_host: TextEdit::new(account.smtp.host.clone()),
+            smtp_port: TextEdit::new(account.smtp.port.to_string()),
+            smtp_security: account.smtp.security,
+            smtp_username: unless(&account.smtp.username, &account.imap.username),
+            password: TextEdit::new(""),
+            smtp_password: TextEdit::new(""),
+        }
+    }
+
+    /// The IMAP and SMTP servers as typed for the account at `address`, or what's wrong with
+    /// them.
+    fn build(&self, address: &str) -> Result<(Server, Server), String> {
+        let account = NewAccount {
+            email: address.to_owned(),
+            display_name: None,
+            username: optional(&self.username),
+            imap_host: self.imap_host.text.clone(),
+            imap_port: port(&self.imap_port, "IMAP")?,
+            imap_security: self.imap_security,
+            smtp_host: self.smtp_host.text.clone(),
+            smtp_port: port(&self.smtp_port, "SMTP")?,
+            smtp_security: self.smtp_security,
+            smtp_username: optional(&self.smtp_username),
+        }
+        .build()
+        .map_err(|e| e.to_string())?;
+        Ok((account.imap, account.smtp))
+    }
+
+    /// Whether a new password was typed, for either server.
+    pub(crate) const fn has_passwords(&self) -> bool {
+        !self.password.text.is_empty() || !self.smtp_password.text.is_empty()
+    }
 }
 
 /// An account's settings, as they're edited, while `open`.
@@ -39,14 +105,16 @@ pub(crate) struct AccountSettings {
     pub(crate) preview: Preview,
     /// Files are being dragged over the images.
     pub(crate) dropping: bool,
+    /// Its servers and logins, as edited when [`Self::edits_servers`].
+    pub(crate) servers: Servers,
+    /// How it logs in.
+    auth: Auth,
+    /// The check of the edited servers' logins under way, by number, before they're saved.
+    /// A check started from a page since closed has another number, so its answer is dropped.
+    pub(crate) checking: Option<u64>,
     /// Why saving, or adding an image, failed.
     pub(crate) error: Option<String>,
     saved: Saved,
-}
-
-/// Text typed in a field, or `None` when it's blank.
-fn optional(edit: &TextEdit) -> Option<String> {
-    Some(edit.text.trim().to_owned()).filter(|t| !t.is_empty())
 }
 
 impl AccountSettings {
@@ -74,12 +142,20 @@ impl AccountSettings {
             images: signature.map(|s| s.images.clone()).unwrap_or_default(),
             preview: Preview::default(),
             dropping: false,
+            servers: Servers::of(account),
+            auth: account.auth,
+            checking: None,
             error: None,
             saved: Saved::default(),
         };
         page.saved = page.current();
         page.refresh(images);
         page
+    }
+
+    /// Whether its servers can be edited: it logs in with a password. Google's are Google's.
+    pub(crate) fn edits_servers(&self) -> bool {
+        self.auth == Auth::Password
     }
 
     /// The label to save, or `None` to show the name or address.
@@ -126,7 +202,30 @@ impl AccountSettings {
             label: self.label(),
             name: self.name(),
             signature: self.built(),
+            servers: self
+                .edits_servers()
+                .then(|| self.servers.build(&self.account)),
         }
+    }
+
+    /// `account` with the servers as edited, when they, or its passwords, changed: its logins
+    /// are then checked before it's saved. `None` when they're as saved; an error when they
+    /// can't be used.
+    pub(crate) fn edited(&self, account: &Account) -> Result<Option<Account>, String> {
+        if !self.edits_servers() {
+            return Ok(None);
+        }
+        let built = self.servers.build(&self.account)?;
+        if self.saved.servers.as_ref() == Some(&Ok(built.clone())) && !self.servers.has_passwords()
+        {
+            return Ok(None);
+        }
+        let (imap, smtp) = built;
+        Ok(Some(Account {
+            imap,
+            smtp,
+            ..account.clone()
+        }))
     }
 
     /// Whether it's open with something that differs from what's saved.
@@ -149,6 +248,8 @@ impl AccountSettings {
         let current = self.current();
         current.label != self.saved.label
             || current.name != self.saved.name
+            || current.servers != self.saved.servers
+            || (self.edits_servers() && self.servers.has_passwords())
             || match (&current.signature, &self.saved.signature) {
                 (Some(a), Some(b)) if a.source || b.source => a != b,
                 _ => shown(&current.signature) != shown(&self.saved.signature),
@@ -220,8 +321,6 @@ impl AccountSettings {
 
 #[cfg(test)]
 mod tests {
-    use postden_core::account::{Auth, Security, Server};
-
     use super::*;
 
     fn account() -> Account {
@@ -332,6 +431,59 @@ mod tests {
             text.contains("John Doe") && !text.contains("[logo]"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn edited_servers_are_checked_unless_as_saved() {
+        let mut page = AccountSettings::new(&account(), None, None);
+        assert_eq!(
+            page.servers.username.text, "me",
+            "not the address, so shown"
+        );
+        assert_eq!(page.servers.smtp_username.text, "", "the IMAP one");
+        assert_eq!(page.edited(&account()), Ok(None));
+
+        page.servers.imap_port.replace_text("");
+        page.servers.imap_security = Security::Tls;
+        assert!(page.is_changed());
+        let edited = page.edited(&account()).unwrap().unwrap();
+        assert_eq!(edited.imap.port, 993, "the conventional port");
+        assert_eq!(edited.smtp, account().smtp, "untouched");
+        assert_eq!(
+            edited.display_name.as_deref(),
+            Some("Ada"),
+            "the rest is kept"
+        );
+
+        page.servers.imap_security = Security::None;
+        page.servers.imap_port.replace_text("1");
+        assert!(!page.is_changed(), "back as it was");
+        page.servers.password.replace_text("new");
+        assert!(page.is_changed());
+        assert!(
+            page.edited(&account()).unwrap().is_some(),
+            "a new password is checked"
+        );
+
+        page.servers.smtp_host.replace_text(" ");
+        assert!(page.edited(&account()).unwrap_err().contains("SMTP"));
+        page.servers.smtp_host.replace_text("localhost");
+        page.servers.smtp_port.replace_text("lots");
+        assert!(page.edited(&account()).unwrap_err().contains("SMTP port"));
+    }
+
+    #[test]
+    fn a_google_accounts_servers_are_not_edited() {
+        let google = Account {
+            auth: Auth::Google,
+            ..account()
+        };
+        let mut page = AccountSettings::new(&google, None, None);
+        assert!(!page.edits_servers());
+        page.servers.imap_host.replace_text("elsewhere");
+        page.servers.password.replace_text("new");
+        assert!(!page.is_changed());
+        assert_eq!(page.edited(&google), Ok(None));
     }
 
     #[test]

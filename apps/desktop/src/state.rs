@@ -359,6 +359,9 @@ pub(crate) const INBOX: &str = "INBOX";
 /// before an update already queued could act on the close.
 static CLOSES: AtomicU64 = AtomicU64::new(0);
 
+/// Counts the checks of an account's edited servers, for [`AccountSettings::checking`].
+static ACCOUNT_CHECKS: AtomicU64 = AtomicU64::new(0);
+
 /// Counts the add-account form's openings, for [`Imports::session`].
 static FORM_OPENINGS: AtomicU64 = AtomicU64::new(0);
 
@@ -4877,10 +4880,22 @@ impl Mail {
             self.form.error = Some(e);
             return;
         }
-        let Ok(services) = &mut self.services else {
+        if let Err(e) = self.store_login(account, login) {
+            self.form.error = Some(e);
             return;
+        }
+        self.notify(format!("Added {}", account.label()));
+        self.form_added();
+        self.reload();
+    }
+
+    /// Saves `account`, whose logins were checked, with `login`, and watches it again with
+    /// them. Moved to another server or user, what was shown of its old mail goes.
+    fn store_login(&mut self, account: &Account, login: &Login) -> Result<(), String> {
+        let Ok(services) = &mut self.services else {
+            return Err("Postden didn't start".into());
         };
-        let (id, label) = (account.id.clone(), account.label().to_owned());
+        let id = account.id.clone();
         // Added again on another server or user: what was asked of its old mailboxes isn't of these.
         let before = services.store.account(&id).ok().flatten();
         let moved = before
@@ -4898,11 +4913,10 @@ impl Mail {
                     .mailroom
                     .watch(&before, &services.store, services.secrets.as_ref())
             });
-            self.form.error = Some(match rewatched {
+            return Err(match rewatched {
                 Some(Err(again)) => format!("{e}; and it couldn't be checked again: {again}"),
                 _ => e.to_string(),
             });
-            return;
         }
         let watched = services
             .mailroom
@@ -4912,18 +4926,15 @@ impl Mail {
             self.forget_mail_of(&id);
         }
         if let Err(e) = watched {
-            self.form.error = Some(e.to_string());
             self.reload();
-            return;
+            return Err(e.to_string());
         }
         self.statuses.insert(id, Ok(Status::Connecting));
         // Saved on another server, it autosorts nowhere anymore, nor downloads ahead but its
         // inbox.
         self.load_autosort();
         self.load_prefetch_mailboxes();
-        self.notify(format!("Added {label}"));
-        self.form_added();
-        self.reload();
+        Ok(())
     }
 
     /// The form once the account it set up was added: back to what the other app it was picked
@@ -5394,14 +5405,100 @@ impl Mail {
         self.account_settings = AccountSettings::default();
     }
 
-    /// Saves the account's settings, then goes back to the settings page.
+    /// Saves the account's settings, then goes back to the settings page. Servers or passwords
+    /// that changed are first checked in the background, and saved only if they log in.
     pub(crate) fn save_account_settings(&mut self) {
+        let page = &mut self.account_settings;
+        if !page.open || page.checking.is_some() {
+            return;
+        }
+        let Some(account) = self.accounts.iter().find(|a| a.id == page.account) else {
+            return;
+        };
+        match page.edited(account) {
+            Ok(None) => self.save_account_names(),
+            Ok(Some(account)) => self.check_account_servers(account),
+            Err(e) => page.error = Some(e),
+        }
+    }
+
+    /// Checks the logins of `account`, its servers as edited, then saves it and the rest of
+    /// its settings. Passwords left blank are those saved.
+    fn check_account_servers(&mut self, account: Account) {
+        let (Ok(services), Some(handle)) = (&self.services, &self.handle) else {
+            return;
+        };
+        let page = &mut self.account_settings;
+        let servers = &page.servers;
+        let typed = |edit: &TextEdit| {
+            (!services.read_only && !edit.text.is_empty())
+                .then(|| SecretString::from(edit.text.clone()))
+        };
+        let imap = match typed(&servers.password) {
+            Some(password) => password,
+            None => match services.secrets.get(&password_key(&account.id)) {
+                Ok(Some(password)) => password,
+                Ok(None) => {
+                    page.error = Some(format!("no password is saved for {}", account.id));
+                    return;
+                }
+                Err(e) => {
+                    page.error = Some(e.to_string());
+                    return;
+                }
+            },
+        };
+        // A command may fail for a secret it doesn't have; then the IMAP one is used, as when
+        // logging in.
+        let smtp = typed(&servers.smtp_password).or_else(|| {
+            services
+                .secrets
+                .get(&smtp_password_key(&account.id))
+                .ok()
+                .flatten()
+        });
+        let login = Login::from(Passwords { imap, smtp });
+        let check = ACCOUNT_CHECKS.fetch_add(1, Ordering::Relaxed) + 1;
+        page.checking = Some(check);
+        page.error = None;
+        let handle = handle.clone();
+        services.mailroom.handle().spawn(async move {
+            let result = check_logins(&account, &login)
+                .await
+                .map_err(|e| e.to_string());
+            handle.update(move |s: &mut Self, _| {
+                s.account_servers_checked(check, &account, &login, result);
+            });
+        });
+    }
+
+    /// Saves an account whose edited servers' logins were checked, then the rest of its
+    /// settings. Dropped unless it's `check`, the one its page is waiting for: the page was
+    /// closed meanwhile, even if opened again since.
+    fn account_servers_checked(
+        &mut self,
+        check: u64,
+        edited: &Account,
+        login: &Login,
+        result: Result<(), String>,
+    ) {
+        let page = &mut self.account_settings;
+        if !page.open || page.checking != Some(check) || page.account != edited.id {
+            return;
+        }
+        page.checking = None;
+        if let Err(e) = result.and_then(|()| self.store_login(edited, login)) {
+            self.account_settings.error = Some(format!("Couldn't save: {e}"));
+            return;
+        }
+        self.save_account_names();
+    }
+
+    /// Saves the account's names and signature, then goes back to the settings page.
+    fn save_account_names(&mut self) {
         let (Ok(services), page) = (&mut self.services, &mut self.account_settings) else {
             return;
         };
-        if !page.open {
-            return;
-        }
         let id = page.account.clone();
         let saved = services
             .store
@@ -6819,6 +6916,47 @@ mod tests {
         s.close_account_settings();
         assert!(s.settings_open);
         assert_eq!(s.settings_section, SettingsSection::Accounts);
+    }
+
+    #[test]
+    fn a_server_check_from_a_closed_account_page_is_dropped() {
+        use postden_core::account::{Auth, Security, Server};
+        let server = Server {
+            host: "localhost".into(),
+            port: 1,
+            security: Security::None,
+            username: "me".into(),
+        };
+        let account = Account {
+            id: "me@example.com".into(),
+            display_name: None,
+            label: None,
+            imap: server.clone(),
+            smtp: server,
+            auth: Auth::Password,
+        };
+        let login = Login::from(Passwords {
+            imap: SecretString::from("secret"),
+            smtp: None,
+        });
+        let mut s = Mail::not_started();
+        s.accounts.push(account.clone());
+        // Check 1 started, the page closed and opened again, and check 2 started from it.
+        s.open_account_settings(&account.id);
+        s.close_account_settings();
+        s.open_account_settings(&account.id);
+        s.account_settings.checking = Some(2);
+
+        s.account_servers_checked(1, &account, &login, Ok(()));
+        assert_eq!(s.account_settings.checking, Some(2), "still waiting for 2");
+        assert_eq!(s.account_settings.error, None, "1 isn't saved");
+
+        s.account_servers_checked(2, &account, &login, Err("refused".into()));
+        assert_eq!(s.account_settings.checking, None);
+        assert_eq!(
+            s.account_settings.error.as_deref(),
+            Some("Couldn't save: refused")
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ use rune_kit::{
     TextArea, TextInput, Toast, ToastRegion, context_menu, glyphs, root,
 };
 
-use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS};
+use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS, Servers};
 use crate::commands::{Command, Entry, Shortcut};
 use crate::compose::{ComposeForm, Mode, Preview, Recipients};
 use crate::form::{AccountForm, SECURITY, Step, Unreadable, is_set_up, security_index};
@@ -2279,8 +2279,13 @@ fn servers_form(f: &AccountForm, k: &Kit) -> El {
                 &mut s.form.imap_port
             })
             .build(k),
-            f.imap_security,
-            |s, security| s.form.imap_security = security,
+            security_picker(
+                k,
+                "Incoming mail (IMAP) security",
+                f.imap_security,
+                f.checking,
+                |s, security| s.form.imap_security = security,
+            ),
             None,
         ))
         .child(server(
@@ -2294,8 +2299,13 @@ fn servers_form(f: &AccountForm, k: &Kit) -> El {
                 &mut s.form.smtp_port
             })
             .build(k),
-            f.smtp_security,
-            |s, security| s.form.smtp_security = security,
+            security_picker(
+                k,
+                "Outgoing mail (SMTP) security",
+                f.smtp_security,
+                f.checking,
+                |s, security| s.form.smtp_security = security,
+            ),
             Some(smtp_login(f, k)),
         ));
     with_error(fields, f, k).child(form_actions(f, k))
@@ -2351,16 +2361,7 @@ fn form_actions(f: &AccountForm, k: &Kit) -> El {
         .child(back(k, f.checking))
 }
 
-fn server(
-    k: &Kit,
-    title: &str,
-    host: El,
-    port: El,
-    security: Security,
-    set: fn(&mut Mail, Security),
-    login: Option<El>,
-) -> El {
-    let labels: Vec<&str> = SECURITY.iter().map(|(label, _)| *label).collect();
+fn server(k: &Kit, title: &str, host: El, port: El, security: El, login: Option<El>) -> El {
     let mut section = col()
         .gap(8.0)
         .child(
@@ -2374,21 +2375,37 @@ fn server(
                 .child(field(k, "Server", host).grow(3.0))
                 .child(field(k, "Port", port).grow(1.0)),
         )
-        .child(
-            SegmentedControl::new(&labels, Some(security_index(security)))
-                .label(format!("{title} security"))
-                .fit()
-                .on_pick(move |s: &mut Mail, i, _| {
-                    if let Some((_, security)) = SECURITY.get(i) {
-                        set(s, *security);
-                    }
-                })
-                .build(k),
-        );
+        .child(security);
     if let Some(login) = login {
         section = section.child(login);
     }
     section
+}
+
+/// The choice of how a server's connection is secured, which `set` changes.
+fn security_picker(
+    k: &Kit,
+    label: &str,
+    security: Security,
+    disabled: bool,
+    set: fn(&mut Mail, Security),
+) -> El {
+    let labels: Vec<&str> = SECURITY.iter().map(|(label, _)| *label).collect();
+    let mut picker = SegmentedControl::new(&labels, Some(security_index(security)));
+    if disabled {
+        for i in 0..SECURITY.len() {
+            picker = picker.segment_state(i, State::Disabled);
+        }
+    }
+    picker
+        .label(label)
+        .fit()
+        .on_pick(move |s: &mut Mail, i, _| {
+            if let Some((_, security)) = SECURITY.get(i) {
+                set(s, *security);
+            }
+        })
+        .build(k)
 }
 
 /// One of the form's text fields, filling its column. `label` is its accessible name.
@@ -2741,7 +2758,7 @@ fn settings_account(s: &Mail, account: &Account, k: &Kit) -> El {
         actions = actions.child(
             Button::new("Edit")
                 .variant(ButtonVariant::Neutral)
-                .help("Label, name and signature")
+                .help("Label, name, signature and servers")
                 .on_press(move |s: &mut Mail| s.open_account_settings(&edit))
                 .build(k)
                 .key(format!("edit-account-{}", account.id)),
@@ -2835,6 +2852,22 @@ fn account_page(s: &Mail, p: &AccountSettings, k: &Kit, layer: &mut Vec<El>) -> 
             Some(&signature_about),
             signature,
         ));
+    if p.edits_servers() {
+        let read_only = s.services.as_ref().is_ok_and(|s| s.read_only);
+        let about = if read_only {
+            "Where its mail is read from and sent through. Changes are saved once both \
+             servers accept the login. Passwords come from POSTDEN_PASSWORD_COMMAND."
+        } else {
+            "Where its mail is read from and sent through. Changes are saved once both \
+             servers accept the login. Leave a password blank to keep the one saved."
+        };
+        page = page.child(setting_section(
+            k,
+            "Servers",
+            Some(about),
+            account_servers(account, &p.servers, p.checking.is_some(), read_only, k),
+        ));
+    }
     if let Some(error) = &p.error {
         page = page.child(
             text(error.clone())
@@ -2845,14 +2878,19 @@ fn account_page(s: &Mail, p: &AccountSettings, k: &Kit, layer: &mut Vec<El>) -> 
         );
     }
     let changed = p.is_changed();
+    let (save, variant) = if p.checking.is_some() {
+        ("Checking the login…", ButtonVariant::Loading)
+    } else {
+        ("Save", ButtonVariant::Contrast)
+    };
     page = page.child(
         row()
             .gap(8.0)
             .center_y()
             .child(
-                Button::new("Save")
-                    .variant(ButtonVariant::Contrast)
-                    .disabled(!changed)
+                Button::new(save)
+                    .variant(variant)
+                    .disabled(!changed || p.checking.is_some())
                     .on_press(Mail::save_account_settings)
                     .build(k)
                     .key("save-account"),
@@ -2909,6 +2947,149 @@ fn account_names(account: &Account, p: &AccountSettings, k: &Kit) -> El {
                 .build(k)
                 .key("account-name"),
         ))
+}
+
+/// One of the servers section's text fields, filling its column.
+fn server_input(
+    label: &str,
+    placeholder: &str,
+    edit: &TextEdit,
+    checking: bool,
+    get: fn(&mut Mail) -> &mut TextEdit,
+) -> TextInput {
+    TextInput::new(edit)
+        .label(label)
+        .placeholder(placeholder)
+        .width(None)
+        .disabled(checking)
+        .on_edit(get)
+        .on_submit(|s: &mut Mail, _: &mut Tx| s.save_account_settings())
+}
+
+/// Changes the account's servers with `edit`, unless they're being checked: what's saved then
+/// is what was checked.
+fn edit_servers(s: &mut Mail, edit: impl FnOnce(&mut Servers)) {
+    if s.account_settings.checking.is_none() {
+        edit(&mut s.account_settings.servers);
+    }
+}
+
+/// The account's IMAP and SMTP servers, and the user names and passwords for them.
+fn account_servers(account: &Account, p: &Servers, checking: bool, read_only: bool, k: &Kit) -> El {
+    let (login, smtp_login) = account_logins(account, p, checking, read_only, k);
+    let imap_port = p.imap_security.default_imap_port().to_string();
+    let smtp_port = p.smtp_security.default_smtp_port().to_string();
+    col()
+        .key("account-servers")
+        .w_full()
+        .gap(16.0)
+        .child(login)
+        .child(server(
+            k,
+            "Incoming mail (IMAP)",
+            server_input(
+                "IMAP server",
+                "imap.example.com",
+                &p.imap_host,
+                checking,
+                |s| &mut s.account_settings.servers.imap_host,
+            )
+            .build(k)
+            .key("account-imap-host"),
+            server_input("IMAP port", &imap_port, &p.imap_port, checking, |s| {
+                &mut s.account_settings.servers.imap_port
+            })
+            .build(k)
+            .key("account-imap-port"),
+            security_picker(
+                k,
+                "Incoming mail (IMAP) security",
+                p.imap_security,
+                checking,
+                |s, security| edit_servers(s, |p| p.imap_security = security),
+            ),
+            None,
+        ))
+        .child(server(
+            k,
+            "Outgoing mail (SMTP)",
+            server_input(
+                "SMTP server",
+                "smtp.example.com",
+                &p.smtp_host,
+                checking,
+                |s| &mut s.account_settings.servers.smtp_host,
+            )
+            .build(k)
+            .key("account-smtp-host"),
+            server_input("SMTP port", &smtp_port, &p.smtp_port, checking, |s| {
+                &mut s.account_settings.servers.smtp_port
+            })
+            .build(k)
+            .key("account-smtp-port"),
+            security_picker(
+                k,
+                "Outgoing mail (SMTP) security",
+                p.smtp_security,
+                checking,
+                |s, security| edit_servers(s, |p| p.smtp_security = security),
+            ),
+            Some(smtp_login),
+        ))
+}
+
+/// The user name and new password for both servers, then those for SMTP if they differ.
+/// Passwords that come from a command aren't asked for.
+fn account_logins(
+    account: &Account,
+    p: &Servers,
+    checking: bool,
+    read_only: bool,
+    k: &Kit,
+) -> (El, El) {
+    let keep = "Unchanged";
+    let mut login = row().gap(12.0);
+    if !read_only {
+        login = login.child(field(
+            k,
+            "New password",
+            server_input("New password", keep, &p.password, checking, |s| {
+                &mut s.account_settings.servers.password
+            })
+            .secure()
+            .build(k)
+            .key("account-password"),
+        ));
+    }
+    login = login.child(field(
+        k,
+        "User name (if not the email)",
+        server_input("User name", &account.id, &p.username, checking, |s| {
+            &mut s.account_settings.servers.username
+        })
+        .build(k)
+        .key("account-username"),
+    ));
+    let mut smtp_login = row().gap(12.0).child(field(
+        k,
+        "User name (if different)",
+        server_input("SMTP user name", "", &p.smtp_username, checking, |s| {
+            &mut s.account_settings.servers.smtp_username
+        })
+        .build(k),
+    ));
+    if !read_only {
+        smtp_login = smtp_login.child(field(
+            k,
+            "New password (if different)",
+            server_input("New SMTP password", keep, &p.smtp_password, checking, |s| {
+                &mut s.account_settings.servers.smtp_password
+            })
+            .secure()
+            .build(k),
+        ));
+    }
+    (login, smtp_login)
 }
 
 /// The signature's editor, its images, and how it will look.

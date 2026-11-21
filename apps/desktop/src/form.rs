@@ -156,16 +156,6 @@ impl Default for AccountForm {
 impl AccountForm {
     /// The fields as an account to set up, or what's wrong with them.
     pub(crate) fn new_account(&self) -> Result<NewAccount, String> {
-        let optional = |e: &TextEdit| Some(e.text.trim().to_owned()).filter(|s| !s.is_empty());
-        let port = |e: &TextEdit, which: &str| {
-            optional(e)
-                .map(|p| {
-                    p.parse::<u16>().map_err(|_invalid| {
-                        format!("the {which} port must be a number up to 65535")
-                    })
-                })
-                .transpose()
-        };
         Ok(NewAccount {
             email: self.email.text.clone(),
             display_name: optional(&self.name),
@@ -222,6 +212,21 @@ impl AccountForm {
         let domain = self.imap_host.text.trim().strip_prefix("imap.")?;
         domain.contains('.').then(|| format!("smtp.{domain}"))
     }
+}
+
+/// Text typed in a field, or `None` when it's blank.
+pub(crate) fn optional(edit: &TextEdit) -> Option<String> {
+    Some(edit.text.trim().to_owned()).filter(|t| !t.is_empty())
+}
+
+/// The port typed in a field, `None` when it's blank, or why it isn't one.
+pub(crate) fn port(edit: &TextEdit, which: &str) -> Result<Option<u16>, String> {
+    optional(edit)
+        .map(|p| {
+            p.parse::<u16>()
+                .map_err(|_invalid| format!("the {which} port must be a number up to 65535"))
+        })
+        .transpose()
 }
 
 /// Whether `address` is one of `accounts` already, whatever its case: then it isn't set up
