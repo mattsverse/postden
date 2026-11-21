@@ -4,7 +4,7 @@
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use jiff::{Timestamp, Zoned};
+use jiff::{Timestamp, ZonedDateTime};
 use postden_core::message::Role;
 use postden_store::StoredMessage;
 use rune::{Key, KeyEvent, TextEdit, Tx};
@@ -317,7 +317,7 @@ impl Command {
                 s.label(account)
             )),
             Self::SnoozeUntil { until, .. } => {
-                Some(postden_app::format_snooze(*until, &Zoned::now()))
+                Some(postden_app::format_snooze(*until, &ZonedDateTime::now()))
             }
             _ => None,
         }
@@ -359,7 +359,7 @@ impl Command {
                 if let Some(m) = s.focused_message() {
                     let message = (m.account.clone(), m.mailbox.clone(), m.envelope.uid);
                     s.open_palette(if self == Self::PickSnooze {
-                        let times = postden_app::snooze_times(&Zoned::now());
+                        let times = postden_app::snooze_times(&ZonedDateTime::now());
                         PaletteMode::Snooze { message, times }
                     } else {
                         PaletteMode::Move(message)

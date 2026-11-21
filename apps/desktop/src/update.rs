@@ -1,6 +1,6 @@
 //! Where checking for and installing an update has got to, and what each step's result changes.
 
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use postden_update::{Available, Install, Version};
 
 /// The running version: the one CI built it as, such as a nightly's, else the crate's.
@@ -49,7 +49,7 @@ pub(crate) struct Updater {
     /// The settings' update channel list is open.
     pub(crate) channel_open: bool,
     /// When the last check finished, successfully or not.
-    pub(crate) checked_at: Option<Zoned>,
+    pub(crate) checked_at: Option<ZonedDateTime>,
     /// Counts scheduled checks, so only the latest timer starts one.
     pub(crate) timer: u64,
 }
@@ -97,7 +97,7 @@ impl Updater {
         &mut self,
         result: Result<Option<Available>, String>,
         skipped: Option<Version>,
-        now: Zoned,
+        now: ZonedDateTime,
     ) -> bool {
         let manual = matches!(self.phase, Phase::Checking { manual: true });
         self.checked_at = Some(now);
@@ -186,24 +186,24 @@ mod tests {
     fn automatic_checks_announce_each_release_once_unless_skipped() {
         let mut u = checking(false);
         assert!(
-            u.checked(Ok(Some(available("0.2.0"))), None, Zoned::now()),
+            u.checked(Ok(Some(available("0.2.0"))), None, ZonedDateTime::now()),
             "a new release"
         );
         u.phase = Phase::Checking { manual: false };
         assert!(
-            !u.checked(Ok(Some(available("0.2.0"))), None, Zoned::now()),
+            !u.checked(Ok(Some(available("0.2.0"))), None, ZonedDateTime::now()),
             "already announced"
         );
         u.phase = Phase::Checking { manual: false };
         assert!(
-            u.checked(Ok(Some(available("0.3.0"))), None, Zoned::now()),
+            u.checked(Ok(Some(available("0.3.0"))), None, ZonedDateTime::now()),
             "a newer one"
         );
 
         let skipped = Some("0.2.0".parse().unwrap());
         let mut u = checking(false);
         assert!(
-            !u.checked(Ok(Some(available("0.2.0"))), skipped, Zoned::now()),
+            !u.checked(Ok(Some(available("0.2.0"))), skipped, ZonedDateTime::now()),
             "skipped"
         );
         assert_eq!(
@@ -213,7 +213,7 @@ mod tests {
         );
         let mut u = checking(true);
         assert!(
-            u.checked(Ok(Some(available("0.2.0"))), skipped, Zoned::now()),
+            u.checked(Ok(Some(available("0.2.0"))), skipped, ZonedDateTime::now()),
             "asked for"
         );
     }
@@ -222,14 +222,14 @@ mod tests {
     fn a_failed_check_keeps_an_update_found_earlier() {
         let mut u = checking(false);
         assert!(
-            !u.checked(Err("offline".into()), None, Zoned::now()),
+            !u.checked(Err("offline".into()), None, ZonedDateTime::now()),
             "nothing to announce"
         );
         assert_eq!(u.phase, Phase::CheckFailed("offline".into()));
 
         let mut u = checking(false);
         u.available = Some(available("0.2.0"));
-        u.checked(Err("offline".into()), None, Zoned::now());
+        u.checked(Err("offline".into()), None, ZonedDateTime::now());
         assert_eq!(u.phase, Phase::Available);
     }
 

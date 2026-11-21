@@ -333,7 +333,7 @@ fn date(envelope: &Envelope, tz: &TimeZone) -> Option<String> {
         .date
         .and_then(|d| Timestamp::from_second(d).ok())
         .map(|d| {
-            d.to_zoned(tz.clone())
+            d.to_zoned_datetime(tz.clone())
                 .strftime("%a %-d %b %Y %H:%M")
                 .to_string()
         })

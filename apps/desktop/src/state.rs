@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use jiff::{Timestamp, Zoned};
+use jiff::{Timestamp, ZonedDateTime};
 use postden_app::{
     Autosort, Draft, Imported, Login, Mailroom, Passwords, Profile, Settings, Sorted, Sorter, Tags,
     Theme, Update, check_logins, contacts, eml_file_name, finish_google_sign_in, import, is_sealed,
@@ -4068,7 +4068,7 @@ impl Mail {
                 let until = Timestamp::from_second(until).unwrap_or_default();
                 self.notify(format!(
                     "Snoozed until {}{}",
-                    postden_app::format_snooze(until, &Zoned::now()),
+                    postden_app::format_snooze(until, &ZonedDateTime::now()),
                     undo_hint(undoable)
                 ));
             }
@@ -4157,7 +4157,7 @@ impl Mail {
             &label,
             count,
             first_sync,
-            &Zoned::now(),
+            &ZonedDateTime::now(),
         ));
         self.announce(&label, target, &unread);
     }
@@ -5155,7 +5155,7 @@ impl Mail {
             title: "Export accounts and settings".into(),
             file_name: Some(format!(
                 "Postden {}.{}",
-                Zoned::now().strftime("%Y-%m-%d"),
+                ZonedDateTime::now().strftime("%Y-%m-%d"),
                 transfer::EXTENSION
             )),
             ..FileDialogOptions::default()
@@ -5901,9 +5901,9 @@ impl Mail {
             self.check_for_updates(manual);
             return;
         }
-        let announce = self
-            .updater
-            .checked(result, self.settings.skipped_update, Zoned::now());
+        let announce =
+            self.updater
+                .checked(result, self.settings.skipped_update, ZonedDateTime::now());
         if announce {
             // Not over a message being written or an account being added, unless asked for.
             if manual || !(self.compose.open || self.form.open) {

@@ -1,7 +1,7 @@
 //! What the window shows: rune-kit's app shell, with accounts in the sidebar and mail, a message
 //! being written, the add-account form or the settings in the main pane.
 
-use jiff::Zoned;
+use jiff::ZonedDateTime;
 use postden_app::{POLL_INTERVALS, PREFETCH_COUNTS, Theme};
 use postden_core::account::{Account, Security};
 use postden_core::message::{Address, Mailbox, Role};
@@ -1128,7 +1128,7 @@ fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
         return empty_list(s, k);
     }
     let searching = s.search.is_active();
-    let now = Zoned::now();
+    let now = ZonedDateTime::now();
     // Mail from several accounts says whose it is.
     let multiple_accounts = s.listing().account().is_none() && s.accounts.len() > 1;
     let sent = s.showing_sent();
@@ -1424,7 +1424,7 @@ fn message_menu_moves(s: &Mail, m: &StoredMessage, menu: &MessageMenu, mut items
         items = items.separator();
     }
     if snoozable {
-        let times = postden_app::snooze_times(&Zoned::now())
+        let times = postden_app::snooze_times(&ZonedDateTime::now())
             .into_iter()
             .map(|(label, until)| {
                 // The message as listed: one a server search found isn't cached.
@@ -1854,7 +1854,7 @@ fn header_line(k: &Kit, name: &str, addresses: &[Address]) -> El {
 fn long_date(unix: Option<i64>) -> Option<String> {
     let at = jiff::Timestamp::from_second(unix?).ok()?;
     Some(
-        at.to_zoned(jiff::tz::TimeZone::system())
+        at.to_zoned_datetime(jiff::tz::TimeZone::system())
             .strftime("%A %-d %B %Y at %H:%M")
             .to_string(),
     )

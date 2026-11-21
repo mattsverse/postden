@@ -34,7 +34,7 @@ rustls-platform-verifier = "0.7"
 futures = "0.3"
 mail-parser = "1"
 # No `hostname`: the machine's name would leak into EHLO and Message-ID.
-lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls", "rustls-platform-verifier", "ring"] }
+lettre = { version = "0.11.24", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls", "rustls-platform-verifier", "ring"] }
 fastrand = "2"
 # Google OAuth: token requests over HTTPS, with the same ring + platform-verifier TLS as IMAP.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "form"] }
@@ -46,7 +46,7 @@ ring = "0.17"
 age = "0.12"
 # sending a profile straight to another computer: QUIC between two computers dialed by key,
 # through NATs, relayed when they can't reach each other directly
-iroh = "1.4"
+iroh = "1.5"
 
 # html
 scraper = { version = "0.29", default-features = false, features = ["deterministic"] }
@@ -59,13 +59,13 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2-zli
 self-replace = "1.5"
 
 # store
-rusqlite = { version = "0.42", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 # importing accounts: Apple Mail archives its settings as property lists
 plist = "1.10"
 
 # paths and dates
 directories = "6"
-jiff = "0.2"
+jiff = "1"
 
 # secrets: keyring-core plus one native store per OS
 keyring-core = "1"
@@ -76,22 +76,24 @@ zbus-secret-service-keyring-store = "1"
 # ui
 # The tray icon's pixels, decoded from the app icon's PNG.
 png = "0.18"
-# Linux: asking D-Bus whether a tray host shows the tray icon. Rune uses the same version.
-zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
+# Linux: asking D-Bus whether a tray host shows the tray icon. Rune uses the same version and
+# runtime (async-io): enabling `tokio` here would turn it on for Rune's zbus too.
+zbus = { version = "5.19", default-features = false, features = ["async-io"] }
 # Rune is pre-release: pin a rev of `dev` (never rewritten). Bump together with the patches below.
-rune = { git = "https://github.com/anomalyco/rune", rev = "044c5aafae62964c99ddface59cb733f834b61d2" }
-rune-kit = { git = "https://github.com/anomalyco/rune", rev = "044c5aafae62964c99ddface59cb733f834b61d2" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "c6df83fe495224c5bcd091fda837549edf28e564" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "c6df83fe495224c5bcd091fda837549edf28e564" }
 # System notifications on macOS and Windows; Linux's go over D-Bus with `zbus`.
-rune-notify = { git = "https://github.com/anomalyco/rune", rev = "044c5aafae62964c99ddface59cb733f834b61d2" }
+rune-notify = { git = "https://github.com/anomalyco/rune", rev = "c6df83fe495224c5bcd091fda837549edf28e564" }
 
 # Rune ships patched copies of these crates and requires apps that build it to apply them too,
 # since a dependency's [patch] doesn't reach the workspace depending on it. Keep the rev in sync with `rune`.
 [patch.crates-io]
-wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "044c5aafae62964c99ddface59cb733f834b61d2" }
-winit = { git = "https://github.com/anomalyco/rune", rev = "044c5aafae62964c99ddface59cb733f834b61d2" }
-parley_engine = { git = "https://github.com/anomalyco/rune", rev = "044c5aafae62964c99ddface59cb733f834b61d2" }
-accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "044c5aafae62964c99ddface59cb733f834b61d2" }
-accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "044c5aafae62964c99ddface59cb733f834b61d2" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "c6df83fe495224c5bcd091fda837549edf28e564" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "c6df83fe495224c5bcd091fda837549edf28e564" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "c6df83fe495224c5bcd091fda837549edf28e564" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "c6df83fe495224c5bcd091fda837549edf28e564" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "c6df83fe495224c5bcd091fda837549edf28e564" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "c6df83fe495224c5bcd091fda837549edf28e564" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -163,7 +163,7 @@ mod linux {
     use futures::StreamExt;
     use tokio::sync::OnceCell;
     use zbus::Proxy;
-    use zbus::Variant;
+    use zbus::zvariant::Value;
 
     use super::{Alert, Target, clicked};
 
@@ -189,8 +189,8 @@ mod linux {
             return;
         };
         let hints = HashMap::from([
-            ("desktop-entry", Variant::from(crate::APP_ID)),
-            ("category", Variant::from("email.arrived")),
+            ("desktop-entry", Value::from(crate::APP_ID)),
+            ("category", Value::from("email.arrived")),
         ]);
         let text = escape(&alert.body);
         let body = (

@@ -43,7 +43,7 @@ pub use accounts::{
 };
 pub use compose::{Draft, Quote};
 pub use google::{finish_google_sign_in, google_account, start_google_sign_in};
-use jiff::{Timestamp, Zoned};
+use jiff::{Timestamp, ZonedDateTime};
 pub use mailroom::{Mailroom, Update, is_searchable};
 use postden_core::message::Envelope;
 use postden_secrets::Backend;
@@ -124,7 +124,7 @@ pub fn secrets_backend(password_command: Option<String>) -> Backend {
 
 /// What to tell the user when mail was saved for the account named `label`.
 #[must_use]
-pub fn mail_notice(label: &str, count: usize, first_sync: bool, now: &Zoned) -> String {
+pub fn mail_notice(label: &str, count: usize, first_sync: bool, now: &ZonedDateTime) -> String {
     let s = if count == 1 { "" } else { "s" };
     match (first_sync, count) {
         (true, 0) => format!("{label}: the inbox is empty"),
@@ -251,11 +251,11 @@ pub fn recipients(to: &[postden_core::message::Address]) -> String {
 /// A short date for a mail list: the time for today, the day this year, the full date otherwise.
 /// Empty when there's no date.
 #[must_use]
-pub fn format_date(unix: Option<i64>, now: &Zoned) -> String {
+pub fn format_date(unix: Option<i64>, now: &ZonedDateTime) -> String {
     let Some(at) = unix.and_then(|s| Timestamp::from_second(s).ok()) else {
         return String::new();
     };
-    let at = at.to_zoned(now.time_zone().clone());
+    let at = at.to_zoned_datetime(now.time_zone().clone());
     let format = if at.date() == now.date() {
         "%H:%M"
     } else if at.year() == now.year() {
@@ -269,10 +269,10 @@ pub fn format_date(unix: Option<i64>, now: &Zoned) -> String {
 /// When a message can be snoozed until, as of `now`, each with its menu label: in three hours,
 /// tomorrow at 08:00, and next Monday at 08:00 (a week on, from a Monday).
 #[must_use]
-pub fn snooze_times(now: &Zoned) -> Vec<(&'static str, Timestamp)> {
+pub fn snooze_times(now: &ZonedDateTime) -> Vec<(&'static str, Timestamp)> {
     let morning = |date: jiff::civil::Date| {
         date.at(8, 0, 0, 0)
-            .to_zoned(now.time_zone().clone())
+            .to_zoned_datetime(now.time_zone().clone())
             .ok()
             .map(|z| z.timestamp())
     };
@@ -300,9 +300,9 @@ pub fn snooze_times(now: &Zoned) -> Vec<(&'static str, Timestamp)> {
 
 /// When a snoozed message comes back, for a notice: `Tue Nov 17, 08:00`.
 #[must_use]
-pub fn format_snooze(until: Timestamp, now: &Zoned) -> String {
+pub fn format_snooze(until: Timestamp, now: &ZonedDateTime) -> String {
     until
-        .to_zoned(now.time_zone().clone())
+        .to_zoned_datetime(now.time_zone().clone())
         .strftime("%a %b %-d, %H:%M")
         .to_string()
 }
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn snoozes_end_in_three_hours_tomorrow_morning_or_next_monday() {
         // Wednesday 2026-11-18 21:30 in Paris.
-        let now: Zoned = "2026-11-18T21:30[Europe/Paris]".parse().unwrap();
+        let now: ZonedDateTime = "2026-11-18T21:30[Europe/Paris]".parse().unwrap();
         let times: Vec<(&str, String)> = snooze_times(&now)
             .into_iter()
             .map(|(label, at)| (label, format_snooze(at, &now)))
@@ -327,7 +327,7 @@ mod tests {
                 ("Next week", "Mon Nov 23, 08:00".to_owned()),
             ]
         );
-        let monday: Zoned = "2026-11-23T07:00[Europe/Paris]".parse().unwrap();
+        let monday: ZonedDateTime = "2026-11-23T07:00[Europe/Paris]".parse().unwrap();
         assert_eq!(
             format_snooze(snooze_times(&monday)[2].1, &monday),
             "Mon Nov 30, 08:00",
@@ -341,7 +341,7 @@ mod tests {
     fn notices_say_what_arrived() {
         let now = Timestamp::from_second(1_794_475_800)
             .unwrap()
-            .to_zoned(TimeZone::UTC);
+            .to_zoned_datetime(TimeZone::UTC);
         assert_eq!(mail_notice("Me", 0, true, &now), "Me: the inbox is empty");
         assert_eq!(
             mail_notice("Me", 1, true, &now),
@@ -456,7 +456,7 @@ mod tests {
     fn dates_get_shorter_the_closer_they_are() {
         let now = Timestamp::from_second(1_794_475_800)
             .unwrap()
-            .to_zoned(TimeZone::UTC);
+            .to_zoned_datetime(TimeZone::UTC);
         assert_eq!(format_date(Some(1_794_475_800 - 3600), &now), "08:30");
         assert_eq!(
             format_date(Some(1_794_475_800 - 30 * 86_400), &now),
