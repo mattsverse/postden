@@ -294,7 +294,7 @@ fn text_block(block: &Block) -> String {
     }
 }
 
-fn text_inlines(inlines: &[Inline]) -> String {
+pub(crate) fn text_inlines(inlines: &[Inline]) -> String {
     let mut out = String::new();
     for inline in inlines {
         match inline {

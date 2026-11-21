@@ -3,6 +3,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::warning::Warning;
+
 /// A sender or recipient.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Address {
@@ -164,6 +166,8 @@ pub struct Body {
     pub html: Option<String>,
     /// The attachments' file names, or a placeholder for those without one.
     pub attachments: Vec<String>,
+    /// Signs, found in the message itself, that it may be phishing or carry malware.
+    pub warnings: Vec<Warning>,
 }
 
 /// An image sent inside a message rather than fetched: its HTML shows it with `src="cid:…"`.

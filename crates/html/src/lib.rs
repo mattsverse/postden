@@ -26,6 +26,54 @@ pub fn to_markdown_with_cid_images(html: &str) -> String {
     render::markdown(&dom::parse_keeping_cid_images(html))
 }
 
+/// A link in a message: where it goes, and the text it shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub href: String,
+    pub text: String,
+}
+
+/// The links [`to_markdown`] shows of `html`, in order: those with a web, mail or phone address.
+#[must_use]
+pub fn links(html: &str) -> Vec<Link> {
+    fn walk_blocks(blocks: &[dom::Block], out: &mut Vec<Link>) {
+        for block in blocks {
+            match block {
+                dom::Block::Para(inlines) | dom::Block::Heading(_, inlines) => {
+                    walk_inlines(inlines, out);
+                }
+                dom::Block::Quote(blocks) => walk_blocks(blocks, out),
+                dom::Block::List { items, .. } => {
+                    for item in items {
+                        walk_blocks(item, out);
+                    }
+                }
+                dom::Block::Table { head, rows } => {
+                    for cell in head.iter().chain(rows).flatten() {
+                        walk_inlines(cell, out);
+                    }
+                }
+                dom::Block::Code(_) | dom::Block::Rule => {}
+            }
+        }
+    }
+    fn walk_inlines(inlines: &[dom::Inline], out: &mut Vec<Link>) {
+        for inline in inlines {
+            match inline {
+                dom::Inline::Link(href, inner) => out.push(Link {
+                    href: href.clone(),
+                    text: render::text_inlines(inner).trim().to_owned(),
+                }),
+                dom::Inline::Styled(_, inner) => walk_inlines(inner, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk_blocks(&dom::parse(html), &mut out);
+    out
+}
+
 /// `html` as plain text: what's sent alongside it for apps that don't show HTML.
 #[must_use]
 pub fn to_text(html: &str) -> String {
@@ -151,6 +199,26 @@ pub fn is_plain(html: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_are_found_with_their_text_in_lists_and_tables() {
+        let html = "<p>Go to <a href='https://evil.test/x'><b>paypal.com</b></a></p>\
+            <table><tr><td><ul><li><a href='mailto:a@x.test'>Ada</a></li></ul></td></tr></table>\
+            <p><a href='javascript:alert(1)'>bad</a></p>";
+        assert_eq!(
+            links(html),
+            vec![
+                Link {
+                    href: "https://evil.test/x".into(),
+                    text: "paypal.com".into()
+                },
+                Link {
+                    href: "mailto:a@x.test".into(),
+                    text: "Ada".into()
+                },
+            ]
+        );
+    }
 
     #[test]
     fn text_becomes_escaped_paragraphs() {

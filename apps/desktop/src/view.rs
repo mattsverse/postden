@@ -5,6 +5,7 @@ use jiff::Zoned;
 use postden_app::{POLL_INTERVALS, PREFETCH_COUNTS, Theme};
 use postden_core::account::{Account, Security};
 use postden_core::message::{Address, Mailbox, Role};
+use postden_core::warning::Warning;
 use postden_html::compat::{self, Client, Provider};
 use postden_mail::imap::Status;
 use postden_store::StoredMessage;
@@ -91,6 +92,12 @@ static STAR: Icon = Icon {
     name: "postden-star",
     view: 16.0,
     body: r#"<path d="M8 2.25L9.69 5.83L13.5 6.31L10.7 8.97L11.4 12.75L8 10.9L4.6 12.75L5.3 8.97L2.5 6.31L6.31 5.83Z" fill="currentColor" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/>"#,
+};
+/// A message that may be phishing or carry malware: a warning triangle.
+static WARNING: Icon = Icon {
+    name: "postden-warning",
+    view: 16.0,
+    body: r#"<path d="M8 2.25L14 13H2Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/><path d="M8 6.25V9.25" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><circle cx="8" cy="11.1" r="0.75" fill="currentColor"/>"#,
 };
 static PLUS: Icon = Icon {
     name: "postden-plus",
@@ -1567,6 +1574,9 @@ fn message(r: &Reader, k: &Kit) -> El {
             .child(Button::new("Try again").on_press(Mail::retry_open).build(k)),
         Ok(body) => {
             let mut content = col().gap(16.0);
+            if !body.warnings.is_empty() {
+                content = content.child(warnings(&body.warnings, k));
+            }
             if !body.attachments.is_empty() {
                 content = content.child(
                     text(format!("Attachments: {}", body.attachments.join(", ")))
@@ -1599,6 +1609,38 @@ fn message(r: &Reader, k: &Kit) -> El {
         }
     };
     reader_frame(r, header, content, k)
+}
+
+/// What makes the open message look like phishing or malware, each in a sentence.
+fn warnings(warnings: &[Warning], k: &Kit) -> El {
+    let title = row()
+        .gap(8.0)
+        .child(
+            icon(&WARNING, 16.0)
+                .color(k.c.warning.icon)
+                .label("Warning"),
+        )
+        .child(
+            text("Be careful with this message".to_owned())
+                .font(k.ty.ui_medium)
+                .color(k.c.warning.fg),
+        );
+    col()
+        .key("warnings")
+        .w_full()
+        .gap(6.0)
+        .padding(14.0)
+        .radius(8.0)
+        .fill(k.c.warning.bg)
+        .border(1.0, k.c.warning.border)
+        .child(title)
+        .children(warnings.iter().map(|w| {
+            text(format!("\u{2022} {}", w.describe()))
+                .font(k.ty.small)
+                .color(k.c.warning.fg)
+                .wrap()
+                .selectable(true)
+        }))
 }
 
 /// The reader's scrolling column: the headers, a rule, then the content.

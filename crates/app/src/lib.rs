@@ -21,6 +21,7 @@
 //! - [`snooze_times`] and [`format_snooze`]: when a message can be snoozed until, and saying so.
 //! - [`eml_file_name`]: what to call a message exported as an `.eml` file.
 //! - [`mail_notice`] and [`new_mail_alert`]: what to tell the user when mail arrives.
+//! - [`warnings`]: signs a message may be phishing or carry malware, with the contacts' say.
 
 mod accounts;
 mod compose;
@@ -34,6 +35,7 @@ pub mod signature;
 mod sorting;
 #[cfg(test)]
 mod testing;
+pub mod warnings;
 
 use std::path::PathBuf;
 

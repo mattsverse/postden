@@ -9,6 +9,7 @@ pub mod imap;
 pub mod oauth;
 pub mod smtp;
 mod tls;
+mod warnings;
 
 pub use auth::Credentials;
 

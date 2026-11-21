@@ -4,6 +4,7 @@ pub mod account;
 pub mod message;
 pub mod mutf7;
 pub mod secrets;
+pub mod warning;
 
 /// Errors shared across Postden crates.
 #[derive(Debug, thiserror::Error)]

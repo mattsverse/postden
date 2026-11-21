@@ -163,6 +163,27 @@ fn markdown(body: &Body) -> Option<String> {
         .filter(|md| !md.trim().is_empty())
 }
 
+/// `body`, of `message`, with the warnings the contacts add to those it gives of itself, while
+/// the settings keep contacts.
+fn warned(
+    services: &Result<Services, String>,
+    settings: &Settings,
+    message: &StoredMessage,
+    mut body: Body,
+) -> Body {
+    if settings.remember_contacts
+        && let Ok(services) = services
+        && let Ok(warnings) = postden_app::warnings::with_contacts(
+            &services.store,
+            &message.envelope.from,
+            &body.warnings,
+        )
+    {
+        body.warnings = warnings;
+    }
+    body
+}
+
 /// Whose mailboxes an account reads: the same IMAP server and user is the same mailboxes, with
 /// the same UIDs.
 fn imap_owner(account: &Account) -> (String, u16, String) {
@@ -1396,6 +1417,7 @@ impl Mail {
             && reader.is(account, mailbox, uid)
             && reader.uid_validity.is_none_or(|v| v == uid_validity)
         {
+            let body = body.map(|b| warned(&self.services, &self.settings, &reader.message, b));
             reader.markdown = body.as_ref().ok().and_then(markdown);
             let downloaded = body.is_ok();
             if let Some(read) = read {
@@ -2067,6 +2089,7 @@ impl Mail {
                 let key = (account.to_owned(), mailbox.to_owned(), uid);
                 match opened {
                     Ok((Some(body), marking)) => {
+                        let body = warned(&self.services, &self.settings, &reader.message, body);
                         reader.markdown = markdown(&body);
                         reader.body = Some(Ok(body));
                         // Marked read on the server, which answers as for U.

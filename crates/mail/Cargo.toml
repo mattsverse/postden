@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 postden-core.workspace = true
+postden-html.workspace = true
+url.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 async-imap.workspace = true
 tokio-rustls.workspace = true

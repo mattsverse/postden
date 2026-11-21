@@ -586,15 +586,19 @@ fn parse_body(raw: &[u8]) -> Body {
         })
         .unwrap_or_default()
     };
+    let from = addresses(message.from());
+    let reply_to = addresses(message.reply_to());
+    let html = html_body(&message);
+    let warnings = crate::warnings::find(&message, from.first(), &reply_to, html.as_deref());
     Body {
         to: addresses(message.to()),
         cc: addresses(message.cc()),
-        reply_to: addresses(message.reply_to()),
+        reply_to,
         references: message
             .references()
             .map(|ids| ids.iter().map(str::to_owned).collect())
             .unwrap_or_default(),
-        html: html_body(&message),
+        html,
         text: message
             .text_bodies()
             .collect::<Vec<_>>()
@@ -605,6 +609,7 @@ fn parse_body(raw: &[u8]) -> Body {
             .attachments()
             .map(|a| a.attachment_name().unwrap_or("(unnamed)").to_owned())
             .collect(),
+        warnings,
     }
 }
 

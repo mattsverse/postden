@@ -33,6 +33,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls-platform-verifier = "0.7"
 futures = "0.3"
 mail-parser = "1"
+# reading internationalized domains, to spot ones made to look like others
+idna = "1"
+# reading links' addresses, to spot ones that go elsewhere than they say
+url = "2"
 # No `hostname`: the machine's name would leak into EHLO and Message-ID.
 lettre = { version = "0.11.23", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls", "rustls-platform-verifier", "ring"] }
 fastrand = "2"

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use postden_core::account::{Account, Auth, Security, Server, Signature};
 pub use postden_core::message::MailboxState;
 use postden_core::message::{Address, Body, Envelope, InlineImage, Mailbox, Role};
+use postden_core::warning::Warning;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 mod sorting;
@@ -145,7 +146,8 @@ CREATE TABLE IF NOT EXISTS unseen (
 ) STRICT;
 
 -- Messages downloaded ahead of their opening, or kept once opened. Address lists are encoded as
--- in messages.to_list; references and attachment names are separated by U+001E.
+-- in messages.to_list; references and attachment names are separated by U+001E. Warnings are
+-- separated by U+001E too, each its kind and fields separated by U+001F.
 CREATE TABLE IF NOT EXISTS bodies (
     account      TEXT NOT NULL,
     mailbox      TEXT NOT NULL,
@@ -157,6 +159,7 @@ CREATE TABLE IF NOT EXISTS bodies (
     text         TEXT NOT NULL,
     html         TEXT,
     attachments  TEXT NOT NULL,
+    warnings     TEXT NOT NULL DEFAULT '',
     -- 1 when kept because it was opened: only downloading ahead's own are dropped as they age.
     kept         INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account, mailbox, uid),
@@ -290,7 +293,7 @@ CREATE TABLE IF NOT EXISTS prefetch_mailboxes (
 ";
 
 /// The schema version [`SCHEMA`] creates, kept in `PRAGMA user_version`.
-const VERSION: i64 = 7;
+const VERSION: i64 = 8;
 
 /// How long, in seconds, what [`Store::put_away_message`] noted of a message holds: a week. Its
 /// copy where it went is cached by then, and says so itself; and moved since by another mail
@@ -299,7 +302,7 @@ const PUT_AWAY_HOLDS: i64 = 7 * 24 * 60 * 60;
 
 /// Columns added since version 0, for databases created before them. Tables added since are
 /// created by [`SCHEMA`] itself.
-const MIGRATIONS: [(&str, &str, &str); 8] = [
+const MIGRATIONS: [(&str, &str, &str); 9] = [
     ("mailboxes", "role", "TEXT NOT NULL DEFAULT 'inbox'"),
     ("messages", "to_list", "TEXT"),
     // Version 2.
@@ -314,6 +317,8 @@ const MIGRATIONS: [(&str, &str, &str); 8] = [
     ("mailboxes", "floor", "INTEGER"),
     // Version 7.
     ("mailboxes", "counted", "INTEGER NOT NULL DEFAULT 0"),
+    // Version 8.
+    ("bodies", "warnings", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 const MESSAGE_COLUMNS: &str = "m.account, m.mailbox, m.uid, m.message_id, m.from_name, m.from_email, m.subject, m.date, m.seen, m.to_list, m.flagged";
@@ -459,6 +464,11 @@ impl Store {
                     conn.execute_batch(&format!(
                         "ALTER TABLE {table} ADD COLUMN {column} {definition}"
                     ))?;
+                    // Bodies cached before their warnings were read are downloaded again, to read
+                    // them: a phishing message mustn't pass for one without any.
+                    if (table, column) == ("bodies", "warnings") {
+                        conn.execute_batch("DELETE FROM bodies")?;
+                    }
                 }
             }
             conn.execute_batch(&format!("PRAGMA user_version = {VERSION}"))?;
@@ -1374,17 +1384,17 @@ impl Store {
         Ok(self.conn.execute(
             "INSERT INTO bodies
                 (account, mailbox, uid, to_list, cc_list, reply_to, refs, text, html, attachments,
-                 kept)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+                 warnings, kept)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
              WHERE EXISTS (SELECT 1 FROM messages WHERE account = ?1 AND mailbox = ?2 AND uid = ?3)
-             AND (?12 IS NULL OR ?2 = ?12 OR EXISTS (
+             AND (?13 IS NULL OR ?2 = ?13 OR EXISTS (
                 SELECT 1 FROM prefetch_mailboxes WHERE account = ?1 AND name = ?2
              ))
              ON CONFLICT(account, mailbox, uid) DO UPDATE SET
                 to_list = excluded.to_list, cc_list = excluded.cc_list,
                 reply_to = excluded.reply_to, refs = excluded.refs, text = excluded.text,
                 html = excluded.html, attachments = excluded.attachments,
-                kept = max(kept, excluded.kept)",
+                warnings = excluded.warnings, kept = max(kept, excluded.kept)",
             params![
                 account,
                 mailbox,
@@ -1396,6 +1406,7 @@ impl Store {
                 body.text,
                 body.html,
                 body.attachments.join("\u{1e}"),
+                encode_warnings(&body.warnings),
                 kept,
                 inbox,
             ],
@@ -1474,7 +1485,7 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT to_list, cc_list, reply_to, refs, text, html, attachments FROM bodies
+                "SELECT to_list, cc_list, reply_to, refs, text, html, attachments, warnings FROM bodies
                  WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
                 params![account, mailbox, uid],
                 |row| {
@@ -1486,6 +1497,7 @@ impl Store {
                         text: row.get(4)?,
                         html: row.get(5)?,
                         attachments: list(row.get(6)?),
+                        warnings: decode_warnings(&row.get::<_, String>(7)?),
                     })
                 },
             )
@@ -2142,6 +2154,100 @@ fn decode_addresses(column: &str) -> Vec<Address> {
                 name: part(name),
                 email: part(email),
             }
+        })
+        .collect()
+}
+
+/// `warnings` as kept in `bodies.warnings`.
+fn encode_warnings(warnings: &[Warning]) -> String {
+    warnings
+        .iter()
+        .map(|w| {
+            let fields: Vec<&str> = match w {
+                Warning::Unverified { domain } => vec!["unverified", domain],
+                Warning::NameHidesAddress { shown } => vec!["name_hides_address", shown],
+                Warning::LookalikeSender { domain } => vec!["lookalike_sender", domain],
+                Warning::RepliesToFreemail { domain } => vec!["replies_to_freemail", domain],
+                Warning::MisleadingLink { shown, target } => vec!["misleading_link", shown, target],
+                Warning::LinkToIp { target } => vec!["link_to_ip", target],
+                Warning::LinkHidesHost { shown, target } => {
+                    vec!["link_hides_host", shown, target]
+                }
+                Warning::LookalikeLink { target } => vec!["lookalike_link", target],
+                Warning::RiskyAttachment { name } => vec!["risky_attachment", name],
+                Warning::DisguisedAttachment { name } => vec!["disguised_attachment", name],
+                Warning::ImpersonatesContact { name, email } => {
+                    vec!["impersonates_contact", name, email]
+                }
+                Warning::LookalikeContact { domain, contact } => {
+                    vec!["lookalike_contact", domain, contact]
+                }
+                Warning::FirstMessage => vec!["first_message"],
+            };
+            fields
+                .iter()
+                .map(|f| f.replace(['\u{1e}', '\u{1f}'], " "))
+                .collect::<Vec<_>>()
+                .join("\u{1f}")
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1e}")
+}
+
+/// What [`encode_warnings`] kept. A kind this version doesn't know, from a newer one, is skipped.
+fn decode_warnings(column: &str) -> Vec<Warning> {
+    column
+        .split('\u{1e}')
+        .filter_map(|w| {
+            let fields: Vec<String> = w.split('\u{1f}').map(str::to_owned).collect();
+            Some(match fields.as_slice() {
+                [kind, domain] if kind == "unverified" => Warning::Unverified {
+                    domain: domain.clone(),
+                },
+                [kind, shown] if kind == "name_hides_address" => Warning::NameHidesAddress {
+                    shown: shown.clone(),
+                },
+                [kind, domain] if kind == "lookalike_sender" => Warning::LookalikeSender {
+                    domain: domain.clone(),
+                },
+                [kind, domain] if kind == "replies_to_freemail" => Warning::RepliesToFreemail {
+                    domain: domain.clone(),
+                },
+                [kind, shown, target] if kind == "misleading_link" => Warning::MisleadingLink {
+                    shown: shown.clone(),
+                    target: target.clone(),
+                },
+                [kind, target] if kind == "link_to_ip" => Warning::LinkToIp {
+                    target: target.clone(),
+                },
+                [kind, shown, target] if kind == "link_hides_host" => Warning::LinkHidesHost {
+                    shown: shown.clone(),
+                    target: target.clone(),
+                },
+                [kind, target] if kind == "lookalike_link" => Warning::LookalikeLink {
+                    target: target.clone(),
+                },
+                [kind, name] if kind == "risky_attachment" => {
+                    Warning::RiskyAttachment { name: name.clone() }
+                }
+                [kind, name] if kind == "disguised_attachment" => {
+                    Warning::DisguisedAttachment { name: name.clone() }
+                }
+                [kind, name, email] if kind == "impersonates_contact" => {
+                    Warning::ImpersonatesContact {
+                        name: name.clone(),
+                        email: email.clone(),
+                    }
+                }
+                [kind, domain, contact] if kind == "lookalike_contact" => {
+                    Warning::LookalikeContact {
+                        domain: domain.clone(),
+                        contact: contact.clone(),
+                    }
+                }
+                [kind] if kind == "first_message" => Warning::FirstMessage,
+                _ => return None,
+            })
         })
         .collect()
 }
@@ -2817,8 +2923,32 @@ mod tests {
             text: "Hello".into(),
             html: Some("<p>Hello</p>".into()),
             attachments: vec!["report.pdf".into()],
+            warnings: vec![
+                Warning::MisleadingLink {
+                    shown: "paypal.com".into(),
+                    target: "evil.test".into(),
+                },
+                Warning::FirstMessage,
+                Warning::RiskyAttachment {
+                    name: "a\u{1e}b.exe".into(),
+                },
+            ],
         };
         assert_eq!(store.body(me, "INBOX", 1).unwrap(), None);
+        assert!(store.save_body(me, "INBOX", 1, &body, false).unwrap());
+        let mut kept = body.warnings.clone();
+        kept[2] = Warning::RiskyAttachment {
+            name: "a b.exe".into(),
+        };
+        assert_eq!(
+            store.body(me, "INBOX", 1).unwrap().map(|b| b.warnings),
+            Some(kept),
+            "separators in a field can't split it"
+        );
+        let body = Body {
+            warnings: body.warnings[..2].to_vec(),
+            ..body
+        };
         assert!(store.save_body(me, "INBOX", 1, &body, false).unwrap());
         assert_eq!(store.body(me, "INBOX", 1).unwrap(), Some(body.clone()));
         assert!(
@@ -3047,6 +3177,40 @@ mod tests {
         );
         drop(store);
         Store::open(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn bodies_cached_before_warnings_were_read_are_dropped_to_download_again() {
+        let dir = std::env::temp_dir().join(format!("postden-store-v7-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v7.db");
+        let _ignored = std::fs::remove_file(&path);
+        let me = "me@example.com";
+        {
+            let mut store = Store::open(&path).unwrap();
+            store.save_account(&account(me)).unwrap();
+            store
+                .save_messages(me, "INBOX", Role::Inbox, 1, &[envelope(1, 1)])
+                .unwrap();
+            store
+                .save_body(me, "INBOX", 1, &Body::default(), false)
+                .unwrap();
+            // As version 7 left it: bodies without `warnings`.
+            store
+                .conn
+                .execute_batch("ALTER TABLE bodies DROP COLUMN warnings; PRAGMA user_version = 7;")
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.body(me, "INBOX", 1).unwrap(), None);
+        assert!(
+            store
+                .save_body(me, "INBOX", 1, &Body::default(), false)
+                .unwrap(),
+            "its message stays, to download it again"
+        );
+        drop(store);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
