@@ -265,11 +265,12 @@ fn is_message(m: &StoredMessage, account: &str, mailbox: &str, uid: u32) -> bool
     m.account == account && m.mailbox == mailbox && m.envelope.uid == uid
 }
 
-/// Whether the list shows `m`: any message, or, showing only unread mail, an unread one or one it
-/// listed already while a message is open, so one read there doesn't leave it from under J and
-/// K; but not one put away, read as shown.
+/// Whether the list shows `m`, `seen` or not as shown: any message, or, showing only unread mail,
+/// an unread one or one it listed already while a message is open, so one read there doesn't
+/// leave it from under J and K; but not one put away, read as shown.
 fn lists(
     m: &StoredMessage,
+    seen: bool,
     unread_only: bool,
     still_listed: &HashSet<MessageKey>,
     put_away: &HashSet<MessageKey>,
@@ -278,10 +279,10 @@ fn lists(
         return true;
     }
     if still_listed.is_empty() && put_away.is_empty() {
-        return !m.envelope.seen;
+        return !seen;
     }
     let key = message_key(m);
-    !put_away.contains(&key) && (!m.envelope.seen || still_listed.contains(&key))
+    !put_away.contains(&key) && (!seen || still_listed.contains(&key))
 }
 
 /// A part of the settings page, picked with the tabs at its top.
@@ -842,10 +843,13 @@ impl Mail {
     /// all of it or only unread mail.
     fn read_list(&self, store: &Store) -> postden_store::Result<Vec<StoredMessage>> {
         let unread_only = self.settings.unread_only;
-        // Not one being moved either, so it doesn't take the place of one listed.
+        // Read or unread as asked, if that's on its way to the server; not one being moved
+        // either, so it doesn't take the place of one listed.
         let listed = |m: &StoredMessage| {
-            lists(m, unread_only, &self.still_listed, &self.put_away)
-                && (self.moving.is_empty() || !self.moving.contains(&message_key(m)))
+            let key = message_key(m);
+            let seen = self.seen_as_asked(&key).unwrap_or(m.envelope.seen);
+            lists(m, seen, unread_only, &self.still_listed, &self.put_away)
+                && (self.moving.is_empty() || !self.moving.contains(&key))
         };
         let mut found = if let Some(query) = self.search.query() {
             let cached = store.matching_messages(
@@ -867,14 +871,21 @@ impl Mail {
             }
             merged
         } else if unread_only {
-            // As many more as are put away or being moved, which the store still has unread, to
-            // fill the list.
-            let hidden = self.put_away.len() + self.moving.len();
+            // As many more as are put away, being moved or being marked read, which the store
+            // still has unread, to fill the list. One counted twice only reads one more.
+            let marking = (self.unanswered.keys())
+                .filter(|(key, star)| !star && self.seen_as_asked(key) == Some(true))
+                .count();
+            let hidden = self.put_away.len() + self.moving.len() + marking + self.read_later.len();
             let limit = self.list_limit.saturating_add(hidden);
             let mut unread = store.unread_messages(self.showing.scope(), limit)?;
-            // Read ones listed already stay; they're no more than the list showed.
+            // Read ones listed already stay; they're no more than the list showed. Nor does one
+            // being marked unread wait for the server to be listed.
             let known: HashSet<MessageKey> = unread.iter().map(message_key).collect();
-            for key in self.still_listed.difference(&known) {
+            let unreading =
+                (self.unreading.iter()).filter(|key| self.seen_as_asked(key) == Some(false));
+            let more: HashSet<&MessageKey> = self.still_listed.iter().chain(unreading).collect();
+            for key in more.into_iter().filter(|key| !known.contains(*key)) {
                 // Not one from elsewhere, as one open from a search of every inbox.
                 if let Some(m) = store.message(&key.0, &key.1, key.2)?
                     && self.in_listing(&m)
@@ -935,18 +946,12 @@ impl Mail {
         self.stale_marks.retain(|key| {
             unanswered.contains_key(&(key.clone(), false)) || read_later.contains_key(key)
         });
-        // Read now, or gone, or with no read mark left on its way, as once answered, a message
-        // put away no longer is: unread as the store says, it's listed again.
-        let still: HashSet<MessageKey> = self
-            .put_away
-            .iter()
+        // With no read mark left on its way, as once answered, a message put away no longer is:
+        // read, it stays out, and unread as the store says, it's listed again. Until then it stays
+        // put away, even while the store says it's read: a sync that started earlier can still
+        // say it's unread before the mark is answered.
+        let still: HashSet<MessageKey> = (self.put_away.iter())
             .filter(|key| self.marking_read(key))
-            .filter(|(a, b, uid)| {
-                services
-                    .store
-                    .seen(a, b, *uid)
-                    .is_ok_and(|seen| seen == Some(false))
-            })
             .cloned()
             .collect();
         self.put_away = still;
@@ -1046,10 +1051,30 @@ impl Mail {
         }
     }
 
-    /// Shows `m` with a star on its way as asked, until the server answers.
+    /// Shows `m` with a star or read mark on its way as asked, until the server answers: the store
+    /// still says what was before, and rereading the list meanwhile mustn't flip it back.
     fn shown_as_asked(&self, m: &mut StoredMessage) {
-        if let Some(&flagged) = self.starring.get(&message_key(m)) {
+        let key = message_key(m);
+        if let Some(&flagged) = self.starring.get(&key) {
             m.envelope.flagged = flagged;
+        }
+        if let Some(seen) = self.seen_as_asked(&key) {
+            m.envelope.seen = seen;
+        }
+    }
+
+    /// Whether `key`'s message was last asked to be read or unread, while that's on its way to
+    /// the server, or a read mark is to follow; `None` with nothing asked, or only a mark from
+    /// before its mailbox started over, whose UID may name another message now.
+    fn seen_as_asked(&self, key: &MessageKey) -> Option<bool> {
+        if self.stale_marks.contains(key) {
+            None
+        } else if self.read_later.contains_key(key) {
+            Some(true)
+        } else if self.unanswered.contains_key(&(key.clone(), false)) {
+            Some(!self.unreading.contains(key))
+        } else {
+            None
         }
     }
 
@@ -2232,12 +2257,23 @@ impl Mail {
         }
         let uid_validity = self.uid_validity(&key.0, &key.1);
         if self.set_seen(&key.0, &key.1, key.2, seen, uid_validity) {
+            self.marked_from_list(&key, seen);
             self.did(uid_validity.map(|uid_validity| Undo::Seen {
                 message: key,
                 uid_validity,
                 seen: !seen,
                 done: false,
             }));
+        }
+    }
+
+    /// Showing only unread mail, a message marked read from the list leaves it at once, as a move
+    /// does, and comes back only if the server refuses. The one open stays listed until it's left.
+    fn marked_from_list(&mut self, key: &MessageKey, seen: bool) {
+        let open = (self.reader.as_ref()).is_some_and(|r| message_key(&r.message) == *key);
+        if seen && self.settings.unread_only && !open {
+            self.put_away.insert(key.clone());
+            self.reload();
         }
     }
 
@@ -2583,6 +2619,15 @@ impl Mail {
             self.notify(e.to_string());
             return false;
         }
+        self.seen_sent(key, seen);
+        true
+    }
+
+    /// A read mark for `key`'s message is on its way to the server: it shows as asked until it's
+    /// answered.
+    fn seen_sent(&mut self, key: MessageKey, seen: bool) {
+        let (account, mailbox, uid) = (key.0.clone(), key.1.clone(), key.2);
+        let (account, mailbox) = (account.as_str(), mailbox.as_str());
         self.asked(&key, false);
         if seen {
             self.unreading.remove(&key);
@@ -2602,7 +2647,6 @@ impl Mail {
             listed.envelope.seen = seen;
         }
         self.search.set_seen(account, mailbox, uid, seen);
-        true
     }
 
     /// Opens the menu of a message in the list at `point`, where it was right-clicked.
@@ -7468,6 +7512,14 @@ mod tests {
             .unwrap();
     }
 
+    fn unread(s: &Mail, uid: u32) {
+        let services = s.services.as_ref().unwrap();
+        services
+            .store
+            .set_seen("ada@example.com", INBOX, uid, false)
+            .unwrap();
+    }
+
     /// The server was searched for unread mail in Ada's inbox below `below`, and had `unseen`,
     /// of which `fetched` weren't cached.
     fn searched_unread(s: &mut Mail, below: u32, unseen: &[u32], fetched: &[Envelope]) {
@@ -7695,7 +7747,150 @@ mod tests {
         read(&s, 3);
         s.reload();
         assert_eq!(uids(&s), [1]);
+        s.answered(&ada(3), false);
+        s.reload();
+        assert_eq!(uids(&s), [1]);
         assert!(s.put_away.is_empty(), "nothing left to wait for");
+    }
+
+    /// Marks `uid` in Ada's inbox read from the list, as U does once the server is asked.
+    fn marked_from_list(s: &mut Mail, uid: u32) {
+        s.seen_sent(ada(uid), true);
+        s.marked_from_list(&ada(uid), true);
+    }
+
+    #[test]
+    fn a_message_marked_read_stays_shown_read_while_the_server_answers() {
+        let (_dir, mut s) = synced("read-asked", &[hello(1, false), hello(2, false)]);
+        s.seen_sent(ada(2), true);
+        // Another answer, or mail arriving, rereads the list before this one's answered.
+        s.reload();
+        let seen = |s: &Mail, uid| {
+            s.shown()
+                .find(|m| m.envelope.uid == uid)
+                .unwrap()
+                .envelope
+                .seen
+        };
+        assert!(
+            seen(&s, 2),
+            "still read as asked, though the store says unread"
+        );
+        assert!(!seen(&s, 1));
+        // Marked back unread before the first answer, it shows unread.
+        s.seen_sent(ada(2), false);
+        s.reload();
+        assert!(!seen(&s, 2));
+        // Both answered, it shows as the store says.
+        s.answered(&ada(2), false);
+        s.answered(&ada(2), false);
+        read(&s, 2);
+        s.reload();
+        assert!(seen(&s, 2), "as the store says once nothing is on its way");
+    }
+
+    #[test]
+    fn a_message_marked_read_in_a_list_of_unread_mail_leaves_at_once_and_stays_out() {
+        let (_dir, mut s) = synced("unread-asked", &[hello(1, false), hello(2, false)]);
+        s.set_unread_only(true);
+        s.cursor = Some(ada(2));
+        marked_from_list(&mut s, 2);
+        assert_eq!(uids(&s), [1], "it leaves as it's marked");
+        assert_eq!(s.cursor, Some(ada(1)), "the row after it");
+        s.reload();
+        assert_eq!(uids(&s), [1], "not back while the server answers");
+        read(&s, 2);
+        s.answered(&ada(2), false);
+        s.reload();
+        assert_eq!(uids(&s), [1]);
+        assert!(s.put_away.is_empty(), "nothing left to wait for");
+    }
+
+    #[test]
+    fn a_message_put_away_stays_out_though_an_older_sync_says_its_unread_again() {
+        let (_dir, mut s) = synced("unread-resync", &[hello(1, false), hello(2, false)]);
+        s.set_unread_only(true);
+        marked_from_list(&mut s, 2);
+        // The watcher sees it read, then a sync that started before says it's unread: all before
+        // the mark is answered.
+        read(&s, 2);
+        s.reload();
+        unread(&s, 2);
+        s.reload();
+        assert_eq!(uids(&s), [1], "not back while its mark is on its way");
+    }
+
+    #[test]
+    fn messages_marked_read_stay_read_as_each_answer_comes() {
+        let (_dir, mut s) = synced(
+            "read-answers",
+            &[hello(1, false), hello(2, false), hello(3, false)],
+        );
+        // Open the one whose answer comes last.
+        open(&mut s, INBOX, 2, false);
+        for uid in [3, 2, 1] {
+            s.seen_sent(ada(uid), true);
+        }
+        // 3's answer comes first, which rereads the list; 2's and 1's are still on their way.
+        read(&s, 3);
+        s.answered(&ada(3), false);
+        s.reload();
+        let unread: Vec<u32> = (s.shown().filter(|m| !m.envelope.seen))
+            .map(|m| m.envelope.uid)
+            .collect();
+        assert_eq!(unread, Vec::<u32>::new(), "none back to unread");
+        assert!(s.reader.as_ref().unwrap().message.envelope.seen);
+    }
+
+    #[test]
+    fn messages_being_marked_read_dont_shorten_a_page_of_unread_mail() {
+        let (_dir, mut s) = synced(
+            "unread-page-asked",
+            &[
+                hello(1, false),
+                hello(2, false),
+                hello(3, false),
+                hello(4, false),
+            ],
+        );
+        // Marked read from the whole list, then only unread mail is shown before it's answered;
+        // and one to be marked read once its unread mark is.
+        s.seen_sent(ada(4), true);
+        s.read_later.insert(ada(3), Some(1));
+        s.set_unread_only(true);
+        s.list_limit = 2;
+        s.reload();
+        assert_eq!(uids(&s), [2, 1], "a full page");
+        assert!(s.has_older());
+    }
+
+    #[test]
+    fn a_read_message_marked_unread_is_listed_with_unread_mail_before_the_server_answers() {
+        let (_dir, mut s) = synced("unread-unread", &[hello(1, false), hello(2, true)]);
+        s.set_unread_only(true);
+        assert_eq!(uids(&s), [1]);
+        s.seen_sent(ada(2), false);
+        s.reload();
+        assert_eq!(uids(&s), [2, 1], "listed before the server answers");
+        // So does a search of the cache.
+        s.search.query = TextEdit::new("hello");
+        s.reload();
+        assert_eq!(uids(&s), [2, 1]);
+        // Refused, it's read as the store says, and leaves.
+        s.answered(&ada(2), false);
+        s.reload();
+        assert_eq!(uids(&s), [1]);
+    }
+
+    #[test]
+    fn a_message_marked_read_in_a_list_of_unread_mail_comes_back_if_refused() {
+        let (_dir, mut s) = synced("unread-asked-refused", &[hello(1, false), hello(2, false)]);
+        s.set_unread_only(true);
+        marked_from_list(&mut s, 2);
+        assert_eq!(uids(&s), [1]);
+        s.answered(&ada(2), false);
+        s.seen_failed("ada@example.com", INBOX, 2, "refused");
+        assert_eq!(uids(&s), [2, 1]);
     }
 
     #[test]
