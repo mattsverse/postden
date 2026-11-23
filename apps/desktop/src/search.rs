@@ -45,6 +45,8 @@ pub(crate) struct Search {
     pub(crate) query: TextEdit,
     /// Searches every inbox rather than what the list shows.
     pub(crate) everywhere: bool,
+    /// Searches every mailbox of every account, over `everywhere`.
+    pub(crate) all_mail: bool,
     /// Counts searches on the server, so results from one that was replaced are dropped.
     pub(crate) id: u64,
     /// The query the server was asked, while its results still stand.
@@ -81,6 +83,7 @@ impl Default for Search {
         Self {
             query: TextEdit::new(""),
             everywhere: false,
+            all_mail: false,
             id: 0,
             asked: None,
             pending: HashSet::new(),
@@ -392,9 +395,77 @@ fn drop_answered(unconfirmed: &mut HashMap<MessageKey, Unconfirmed>) {
 
 /// Whether every word of `query` is in the message's subject, sender or recipients, ignoring case
 /// and, for words typed without them, accents.
-pub(crate) fn matches(envelope: &Envelope, query: &str) -> bool {
+/// Where each word of `query` is found in `text`, as byte ranges, for highlighting.
+pub(crate) fn found_in(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
     let fold = Fold::default();
-    let fields: Vec<&str> = [
+    let mut found: Vec<_> = query
+        .split_whitespace()
+        .flat_map(|word| fold.find(text, word))
+        .collect();
+    found.sort_by_key(|r| r.start);
+    found
+}
+
+/// A few words of `text` around the first word of `query` found in it, on one line, for a
+/// result that matched in its text: what it says there.
+pub(crate) fn excerpt(text: &str, query: &str) -> Option<String> {
+    const BEFORE: usize = 24;
+    const AFTER: usize = 48;
+    let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let at = found_in(&line, query).first()?.clone();
+    let start = line[..at.start]
+        .char_indices()
+        .rev()
+        .nth(BEFORE)
+        .map_or(0, |(i, _)| i);
+    // On a whole word: past the one cut into, unless that's the match's own.
+    let start = if start == 0 {
+        0
+    } else {
+        line[start..at.start]
+            .find(' ')
+            .map_or(start, |space| start + space + 1)
+    };
+    let end = line[at.end..]
+        .char_indices()
+        .nth(AFTER)
+        .map_or(line.len(), |(i, _)| at.end + i);
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.push_str(line[start..end].trim());
+    if end < line.len() {
+        out.push('…');
+    }
+    Some(out)
+}
+
+pub(crate) fn matches(envelope: &Envelope, query: &str) -> bool {
+    every_word_in(&header_fields(envelope), query)
+}
+
+/// Whether every word of `query` is in the message's headers or in its text `text`, each in
+/// either.
+pub(crate) fn matches_with_text(envelope: &Envelope, text: &str, query: &str) -> bool {
+    let mut fields = header_fields(envelope);
+    fields.push(text);
+    every_word_in(&fields, query)
+}
+
+/// Whether every word of `query` is in one of `fields`.
+fn every_word_in(fields: &[&str], query: &str) -> bool {
+    let fold = Fold::default();
+    query.split_whitespace().all(|word| {
+        fields
+            .iter()
+            .any(|field| !fold.find(field, word).is_empty())
+    })
+}
+
+/// What a search looks through of a message's headers: its subject, and whom it's from and to.
+fn header_fields(envelope: &Envelope) -> Vec<&str> {
+    [
         envelope.subject.as_deref(),
         envelope.from.name.as_deref(),
         envelope.from.email.as_deref(),
@@ -407,12 +478,7 @@ pub(crate) fn matches(envelope: &Envelope, query: &str) -> bool {
             .flat_map(|a| [a.name.as_deref(), a.email.as_deref()]),
     )
     .flatten()
-    .collect();
-    query.split_whitespace().all(|word| {
-        fields
-            .iter()
-            .any(|field| !fold.find(field, word).is_empty())
-    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -446,6 +512,13 @@ mod tests {
             mailbox: "INBOX".into(),
             envelope: envelope(uid, date),
         }
+    }
+
+    #[test]
+    fn words_may_be_split_between_headers_and_text() {
+        let e = envelope(1, None);
+        assert!(matches_with_text(&e, "Your receipt", "adele receipt"));
+        assert!(!matches_with_text(&e, "Your receipt", "adele refund"));
     }
 
     #[test]

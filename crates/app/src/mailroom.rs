@@ -117,6 +117,9 @@ pub enum Update {
     },
     /// Fetched mail couldn't be saved.
     SaveFailed { account: String, error: String },
+    /// Messages asked for with [`Mailroom::peek`] were downloaded, and their text is in the
+    /// store, to show where a search found them.
+    Peeked { account: String, mailbox: String },
     /// A message asked for with [`Mailroom::open`] was downloaded, or couldn't be. Once downloaded
     /// it's read, on the server and in the store, unless the server wouldn't mark it: `marked`.
     Opened {
@@ -521,6 +524,15 @@ enum Job {
     Prefetch {
         account: String,
     },
+    /// Messages asked for by [`Mailroom::peek`] were downloaded, or couldn't be: as
+    /// [`Job::Opened`], `cleared` says whether downloaded messages were cleared since.
+    Peeked {
+        account: String,
+        mailbox: String,
+        uid_validity: u32,
+        cleared: u64,
+        result: Result<Prefetched, String>,
+    },
     /// Messages asked for by [`Job::Prefetch`] were downloaded, or couldn't be.
     Prefetched {
         account: String,
@@ -619,6 +631,20 @@ fn superseded(job: Job) -> Job {
             result: replaced(),
             again,
         }),
+        // Its text is the old server's, which a message the new one numbers alike isn't.
+        Job::Peeked {
+            account,
+            mailbox,
+            uid_validity,
+            cleared,
+            ..
+        } => Job::Peeked {
+            account,
+            mailbox,
+            uid_validity,
+            cleared,
+            result: replaced(),
+        },
         job => job.superseded(),
     }
 }
@@ -638,6 +664,7 @@ impl Job {
             | Self::AllSeen { account, .. }
             | Self::Older { account, .. }
             | Self::Searched { account, .. }
+            | Self::Peeked { account, .. }
             | Self::Unread { account, .. } => Some(account),
             Self::Moved(moving, _) => Some(&moving.account),
             Self::Woke(snooze, _) => Some(&snooze.account),
@@ -1820,6 +1847,42 @@ impl Mailroom {
         Ok(())
     }
 
+    /// Downloads messages `uids` of `account`'s `mailbox` in the background, without marking
+    /// them read, so what they say can be shown, as where a search found them in their text.
+    /// They arrive as [`Update::Peeked`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Mailroom::open`].
+    pub fn peek(&self, store: &Store, account: &str, mailbox: &str, uids: Vec<u32>) -> Result<()> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        let (server, credentials, uid_validity, jobs) = self.target(store, account, mailbox)?;
+        let (account, mailbox) = (account.to_owned(), mailbox.to_owned());
+        let cleared = self.cleared.load(Ordering::Relaxed);
+        self.handle.spawn(async move {
+            let result = prefetch_messages(
+                &server,
+                &credentials,
+                &mailbox,
+                uid_validity,
+                &uids,
+                PREFETCH_MAX_SIZE,
+            )
+            .await
+            .map_err(|e| e.to_string());
+            let _ignored = jobs.send(Job::Peeked {
+                account,
+                mailbox,
+                uid_validity,
+                cleared,
+                result,
+            });
+        });
+        Ok(())
+    }
+
     /// Searches `mailbox` on the server in the background for the newest `count` messages holding
     /// every word of `query`. The result arrives as [`Update::Searched`], carrying `id`.
     ///
@@ -2142,6 +2205,9 @@ impl Prefetcher {
                 self.failed.retain(|(a, ..)| *a != account);
                 (account, Vec::new())
             }
+            job @ Job::Peeked { .. } => {
+                save_peeked(store, job, self.cleared.load(Ordering::Relaxed))
+            }
             Job::Prefetched {
                 account,
                 mailbox,
@@ -2414,6 +2480,59 @@ impl Prefetcher {
             return Ok(());
         }
         Ok(())
+    }
+}
+
+/// Saves what [`Mailroom::peek`] downloaded, unless the mailbox started over meanwhile, as
+/// its UIDs name other messages then; still unread. Nor, downloaded messages cleared since it was asked for (`cleared` times now), is it kept.
+fn save_peeked(store: &Store, job: Job, cleared_now: u64) -> (String, Vec<Update>) {
+    let Job::Peeked {
+        account,
+        mailbox,
+        uid_validity,
+        cleared,
+        result,
+    } = job
+    else {
+        return (String::new(), Vec::new());
+    };
+    if cleared != cleared_now {
+        return (account, Vec::new());
+    }
+    let updates = peeked_updates(store, (&account, &mailbox), uid_validity, result);
+    (account, updates)
+}
+
+/// What saving what [`Mailroom::peek`] downloaded says to the UI.
+fn peeked_updates(
+    store: &Store,
+    (account, mailbox): (&str, &str),
+    uid_validity: u32,
+    result: Result<Prefetched, String>,
+) -> Vec<Update> {
+    let Ok(peeked) = result else {
+        return Vec::new();
+    };
+    let saved = (|| -> Result<()> {
+        if !is_current(store, account, mailbox, uid_validity)? {
+            return Ok(());
+        }
+        // Kept, as one opened is: downloading ahead trims what it didn't download itself, and
+        // the search showing them is still on screen.
+        for (uid, body) in &peeked.bodies {
+            store.save_body(account, mailbox, *uid, body, true)?;
+        }
+        Ok(())
+    })();
+    match saved {
+        Ok(()) => vec![Update::Peeked {
+            account: account.to_owned(),
+            mailbox: mailbox.to_owned(),
+        }],
+        Err(e) => vec![Update::SaveFailed {
+            account: account.to_owned(),
+            error: e.to_string(),
+        }],
     }
 }
 
@@ -3319,6 +3438,22 @@ mod tests {
     }
 
     #[test]
+    fn text_peeked_from_a_replaced_watch_isnt_saved() {
+        let job = Job::Peeked {
+            account: "me@example.com".into(),
+            mailbox: "INBOX".into(),
+            uid_validity: 1,
+            cleared: 0,
+            result: Ok(Prefetched::default()),
+        };
+        assert!(job.account().is_some(), "checked against its watch");
+        assert!(matches!(
+            superseded(job),
+            Job::Peeked { result: Err(_), .. }
+        ));
+    }
+
+    #[test]
     fn search_results_from_before_a_mailbox_restarted_are_refused() {
         let mut store = Store::open_in_memory().unwrap();
         store.save_account(&account()).unwrap();
@@ -3842,6 +3977,26 @@ mod tests {
         prefetcher.keep_opened.store(true, Ordering::Relaxed);
         prefetcher.save(&mut store, opening("Archive", 0));
         prefetcher.save(&mut store, Job::Release);
+        assert!(cached(&store, "Archive"));
+    }
+
+    #[test]
+    fn text_peeked_before_a_clear_isnt_kept() {
+        let (mut store, _runtime, mut prefetcher) = keeping();
+        let peeked = |cleared| Job::Peeked {
+            account: "me@example.com".into(),
+            mailbox: "Archive".into(),
+            uid_validity: 1,
+            cleared,
+            result: Ok(Prefetched {
+                bodies: vec![(1, Body::default())],
+                too_big: Vec::new(),
+            }),
+        };
+        prefetcher.cleared.fetch_add(1, Ordering::Relaxed);
+        prefetcher.save(&mut store, peeked(0));
+        assert!(!cached(&store, "Archive"), "asked for before the clear");
+        prefetcher.save(&mut store, peeked(1));
         assert!(cached(&store, "Archive"));
     }
 

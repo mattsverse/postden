@@ -128,6 +128,8 @@ pub(crate) enum Command {
     Undo,
     ExportMessage,
     CloseReader,
+    /// Ends the search, with the list showing (Escape, as in the search field).
+    ClearSearch,
     /// Moves the list's cursor down, or opens the next message while one is open.
     NextMessage,
     /// Moves the list's cursor up, or opens the previous message while one is open.
@@ -199,7 +201,7 @@ impl Command {
             // Only one of them applies at a time: in Junk, the same keys take a message out.
             Self::Spam | Self::NotSpam => vec![Key('!'), Shortcut::shift_cmd('j')],
             Self::Undo => vec![Key('z')],
-            Self::CloseReader => vec![Escape],
+            Self::CloseReader | Self::ClearSearch => vec![Escape],
             // ↑ and ↓ move the cursor in the list; an open message steps with J and K alone.
             Self::NextMessage if s.reader.is_none() => vec![Key('j'), Down],
             Self::NextMessage => vec![Key('j')],
@@ -272,12 +274,13 @@ impl Command {
             Self::MoveAsSuggested((account, ..), to) => {
                 format!("Move to {}", s.mailbox_label(account, to))
             }
-            Self::Trash => "Delete".into(),
+            Self::Trash => "Move to Trash".into(),
             Self::Spam => "Mark as spam".into(),
             Self::NotSpam => "Not spam".into(),
             Self::Undo => s.undo_title(),
             Self::ExportMessage => "Export as .eml…".into(),
             Self::CloseReader => "Back to the list".into(),
+            Self::ClearSearch => "Clear search".into(),
             Self::NextMessage => "Next message".into(),
             Self::PreviousMessage => "Previous message".into(),
             Self::OpenMessage => "Open message".into(),
@@ -288,6 +291,7 @@ impl Command {
             Self::MoveTo { message, mailbox } => s.mailbox_label(&message.0, mailbox),
             Self::Show(Showing::All(Role::Sent)) => "Go to Sent".into(),
             Self::Show(Showing::All(_)) => "Go to All inboxes".into(),
+            Self::Show(Showing::Everything) => "Go to All mail".into(),
             Self::Show(Showing::Mailbox { account, name }) => {
                 format!("Go to {}", s.mailbox_label(account, name))
             }
@@ -328,7 +332,11 @@ impl Command {
         s.updater.channel_open = false;
         match self {
             Self::Compose => s.compose(),
-            Self::Search => s.focus_search(),
+            Self::Search => {
+                s.focus_search();
+                // The bar takes its searching layout at once, its controls in place.
+                tx.instant();
+            }
             Self::Reply => s.answer_focused(Answer::Reply),
             Self::ReplyAll => s.answer_focused(Answer::ReplyAll),
             Self::Forward => s.answer_focused(Answer::Forward),
@@ -345,16 +353,27 @@ impl Command {
                     Mail::export_message(tx, message);
                 }
             }
+            Self::ClearSearch => {
+                s.clear_search();
+                s.reveal_cursor(tx);
+                // The bar and the list back at once, nothing crossing what replaces it.
+                tx.instant();
+            }
             Self::CloseReader => {
                 s.close_reader();
                 // With the list as it comes back, not a frame after (as its `on_visible` would).
                 s.reveal_cursor(tx);
+                // Whole at once, never fading through near-black.
+                tx.instant();
             }
             // Held down with a message open, it doesn't open (and mark read) every one it passes.
             Self::NextMessage | Self::PreviousMessage if s.reader.is_some() && tx.key_repeat() => {}
             Self::NextMessage => s.move_cursor(1, tx),
             Self::PreviousMessage => s.move_cursor(-1, tx),
-            Self::OpenMessage => s.open_cursor(),
+            Self::OpenMessage => {
+                s.open_cursor();
+                tx.instant();
+            }
             Self::PickSnooze | Self::PickMove => {
                 if let Some(m) = s.focused_message() {
                     let message = (m.account.clone(), m.mailbox.clone(), m.envelope.uid);
@@ -467,6 +486,10 @@ pub(crate) fn available(s: &Mail) -> Vec<Command> {
     }
     add(browsing && s.undo.is_some(), Command::Undo);
     add(browsing && s.reader.is_some(), Command::CloseReader);
+    add(
+        browsing && s.reader.is_none() && s.search.is_active(),
+        Command::ClearSearch,
+    );
     let listed = s.shown().next().is_some();
     add(
         browsing && (s.reader.is_some() || listed),
@@ -1192,10 +1215,10 @@ mod tests {
         assert!(!s.moved_for_undo(&at(3), true));
         assert!(s.moved_for_undo(&at(2), true));
         assert!(matches!(s.undo, Some(Undo::Moved { done: true, .. })));
-        // A move refused leaves nothing to undo.
+        // A move refused leaves nothing to undo of it: Z goes on to the move before.
         s.undo_move(&at(1), "Trash", None);
         assert!(!s.moved_for_undo(&at(1), false));
-        assert_eq!(s.undo, None);
+        assert!(matches!(&s.undo, Some(Undo::Moved { from, done: true, .. }) if *from == at(2)));
     }
 
     #[test]
