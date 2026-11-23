@@ -76,6 +76,8 @@ pub enum Scope<'a> {
     Role(Role),
     /// One of an account's mailboxes.
     Mailbox { account: &'a str, name: &'a str },
+    /// Every mailbox of every account.
+    Every,
 }
 
 const SCHEMA: &str = "
@@ -1669,6 +1671,29 @@ impl Store {
         self.newest(scope, false, limit)
     }
 
+    /// Every cached message in one of the account's mailboxes dated `since` (Unix seconds) or
+    /// later, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn messages_since(
+        &self,
+        account: &str,
+        mailbox: &str,
+        since: i64,
+    ) -> Result<Vec<StoredMessage>> {
+        Ok(self
+            .conn
+            .prepare(&format!(
+                "SELECT {MESSAGE_COLUMNS} FROM messages m
+                 WHERE m.account = ?1 AND m.mailbox = ?2 AND m.date >= ?3
+                 ORDER BY m.date DESC, m.uid DESC"
+            ))?
+            .query_map(params![account, mailbox, since], message_from_row)?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     /// One cached message, or `None` when it isn't cached.
     ///
     /// # Errors
@@ -1732,6 +1757,11 @@ impl Store {
                 ))?,
                 vec![account, name],
             ),
+            Scope::Every => (
+                self.conn
+                    .prepare(&format!("SELECT {MESSAGE_COLUMNS} FROM messages m {ORDER}"))?,
+                vec![],
+            ),
         };
         let mut found = Vec::new();
         // Rows are read one by one, so a search stops as soon as it has enough.
@@ -1778,6 +1808,14 @@ impl Store {
                      WHERE m.account = ?1 AND m.mailbox = ?2 {unread} {order} LIMIT ?3"
                 ))?
                 .query_map(params![account, name, limit], message_from_row)?
+                .collect::<rusqlite::Result<_>>()?,
+            Scope::Every => self
+                .conn
+                .prepare(&format!(
+                    "SELECT {MESSAGE_COLUMNS} FROM messages m
+                     WHERE 1 {unread} {order} LIMIT ?1"
+                ))?
+                .query_map(params![limit], message_from_row)?
                 .collect::<rusqlite::Result<_>>()?,
         };
         Ok(rows)
@@ -3832,6 +3870,11 @@ mod tests {
             .matching_messages(Scope::Role(Role::Inbox), not_2, 10)
             .unwrap();
         assert_eq!(uids(every_inbox), [4, 3, 1], "Sent is left out");
+        assert_eq!(
+            uids(store.matching_messages(Scope::Every, not_2, 10).unwrap()),
+            [5, 4, 3, 1],
+            "every mailbox of every account"
+        );
         let one = Scope::Mailbox {
             account: "a@example.com",
             name: "INBOX",

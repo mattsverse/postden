@@ -67,6 +67,9 @@ pub(crate) struct Reader {
     /// Whether it was read before it opened, shown read since: as it shows again when the server
     /// won't mark it.
     seen_before: bool,
+    /// Whether its text has been downloading long enough to say so: one quick to come shows
+    /// no spinner at all.
+    pub(crate) waited: bool,
 }
 
 impl Reader {
@@ -98,8 +101,9 @@ impl MessageMenu {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct MailboxMenu {
     pub(crate) mailbox: MailboxKey,
-    /// Where it was right-clicked, which the menu opens at.
-    pub(crate) point: PointerPress,
+    /// Where it was right-clicked, which the menu opens at; none when its ⋯ button opened it,
+    /// which it opens under.
+    pub(crate) point: Option<PointerPress>,
 }
 
 impl MailboxMenu {
@@ -173,9 +177,62 @@ fn imap_owner(account: &Account) -> (String, u16, String) {
     )
 }
 
-/// What a notice adds when Z undoes what it tells of.
-const fn undo_hint(undoable: bool) -> &'static str {
-    if undoable { " · Z to undo" } else { "" }
+/// What the window asks to be confirmed before it's done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Asking {
+    /// Turning autosort on for a mailbox, in a dialog saying what that moves, and whether to
+    /// move the inbox mail that already fits now too (unticked at first).
+    Autosort(MailboxKey, bool),
+    /// Forgetting what sorting learned, in the settings.
+    ForgetSorting,
+    /// Picking, in the settings, another mailbox to autosort to.
+    AutosortPick,
+}
+
+/// The messages autosort moved to one mailbox while its notice showed, which that notice
+/// tells of together and can move back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutosortTally {
+    /// The mailbox, by account and name.
+    to: MailboxKey,
+    /// Each message: where it was, where it went, and its Message-ID.
+    moved: Vec<(MessageKey, String, String)>,
+    /// Their subjects, as far as known.
+    subjects: Vec<String>,
+    /// Whether autosort was turned on just before, so the notice still says it's on.
+    just_on: bool,
+    /// The id of the notice telling of them.
+    notice: u64,
+}
+
+/// A message autosort moved, as put up for review: where it went, the move, and its subject.
+type ReviewEntry = (MailboxKey, (MessageKey, String, String), String);
+
+/// A row of the list.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ListRow<'a> {
+    /// A message listed.
+    Message(&'a StoredMessage),
+    /// A message moved back out of the mailbox shown while reviewing what autosort moved
+    /// there, said to be moved, in the place it had.
+    Returned(&'a StoredMessage),
+}
+
+/// What a notice's button does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NoticeAction {
+    /// Undoes what it tells of, as Z does.
+    Undo,
+    /// Moves back what autosort moved: each message, where it was, where it went, and its
+    /// Message-ID.
+    MoveBack(Vec<(MessageKey, String, String)>),
+    /// Lists a mailbox, such as where mail was moved.
+    Show(Showing),
+}
+
+/// A message's subject, as a notice names it.
+pub(crate) fn subject_of(e: &Envelope) -> String {
+    e.subject.clone().unwrap_or_else(|| "(no subject)".into())
 }
 
 /// Every account and setting, to export or send, and what sorting mail learned if
@@ -316,6 +373,8 @@ pub(crate) enum Showing {
     All(Role),
     /// One mailbox of one account.
     Mailbox { account: String, name: String },
+    /// Every mailbox of every account: what a search of all mail looks through.
+    Everything,
 }
 
 impl Showing {
@@ -330,7 +389,7 @@ impl Showing {
     /// The account whose mail is shown, if just one's is.
     pub(crate) fn account(&self) -> Option<&str> {
         match self {
-            Self::All(_) => None,
+            Self::All(_) | Self::Everything => None,
             Self::Mailbox { account, .. } => Some(account),
         }
     }
@@ -344,12 +403,15 @@ impl Showing {
         match self {
             Self::All(role) => Scope::Role(*role),
             Self::Mailbox { account, name } => Scope::Mailbox { account, name },
+            Self::Everything => Scope::Every,
         }
     }
 }
 
 /// What a search of every inbox looks through.
 static ALL_INBOXES: Showing = Showing::All(Role::Inbox);
+/// What a search of all mail looks through.
+static ALL_MAIL: Showing = Showing::Everything;
 
 /// The inbox's name on every server.
 pub(crate) const INBOX: &str = "INBOX";
@@ -423,6 +485,15 @@ pub(crate) enum Undo {
 }
 
 impl Undo {
+    /// The server did what it undoes: it can be undone now.
+    const fn settle(&mut self) {
+        match self {
+            Self::Moved { done, .. } | Self::Seen { done, .. } | Self::Flagged { done, .. } => {
+                *done = true;
+            }
+        }
+    }
+
     /// The account of the message it's about.
     fn account(&self) -> &str {
         match self {
@@ -440,6 +511,19 @@ struct Restoring {
     mailbox: String,
     message_id: String,
 }
+
+/// How long after the view changes a row the pointer is over doesn't show its buttons: as
+/// long as rows take to slide into their new places, under a pointer that stays put.
+const HOVER_QUIET: Duration = Duration::from_millis(700);
+
+/// How long the toolbar tells of a message just arrived.
+const ARRIVAL_SECS: u64 = 12;
+
+/// How many moves back Z can undo, one after another.
+const UNDO_HISTORY: usize = 10;
+
+/// How long a message's text may take to download before the reader shows a spinner for it.
+const READER_SPINNER_MS: u64 = 300;
 
 /// How long a notice shows before it closes on its own.
 const NOTICE_SECS: u64 = 6;
@@ -505,8 +589,57 @@ pub(crate) struct Mail {
     /// The latest thing worth telling the user, such as new mail arriving.
     /// It closes on its own after [`NOTICE_SECS`], or when its close button is pressed.
     pub(crate) notice: Option<String>,
+    /// A second line for the notice, such as the subject of the message it tells of.
+    pub(crate) notice_detail: Option<String>,
+    /// What the notice's button does, if it has one.
+    pub(crate) notice_actions: Vec<NoticeAction>,
+    /// News that waits for a notice with something to press to close first: new mail arriving
+    /// doesn't take the place of an Undo.
+    queued_notice: Option<(String, Option<String>, Vec<NoticeAction>)>,
+    /// The message that just arrived, as the toolbar tells of it: a title, its subject, and the
+    /// message, to open.
+    arrival: Option<(String, String, MessageKey)>,
+    /// Counts arrivals told of, so a timer only clears the one it was started for.
+    arrival_id: u64,
     /// Counts notices, so a timer only closes the one it was started for.
     notice_id: u64,
+    /// The subjects of messages on their way to another mailbox, for the notice once they're
+    /// there.
+    moving_subjects: HashMap<MessageKey, String>,
+    /// How many messages autosort moved to a mailbox while its notice showed, which says them
+    /// all: the mailbox, the count, and the notice's id.
+    autosort_tally: Option<AutosortTally>,
+    /// What autosort moved to each mailbox, by account and name, kept until it's moved back or
+    /// kept there, so where it went says what came and can send it back after its notice is
+    /// gone.
+    batches: HashMap<MailboxKey, AutosortTally>,
+    /// What autosort moved that's on its way back, by account and Message-ID, with what put it
+    /// up for review where it went: the mailbox, the move, and its subject. Back, it's
+    /// forgotten; refused, it's to be reviewed again.
+    returns_reviewed: HashMap<(String, String), ReviewEntry>,
+    /// The mailbox autosort was just turned on for, and the id of the notice saying so, so what it
+    /// moves straight away says so too.
+    autosort_turned_on: Option<(MailboxKey, u64)>,
+    /// The row whose Archive and Delete buttons stay hidden: the one that took the place of the
+    /// row they were just pressed on, under a pointer that hasn't moved, so a second click
+    /// doesn't act on it unseen. Shown again once the pointer reaches another row or the cursor
+    /// moves.
+    pub(crate) row_actions_held: Option<MessageKey>,
+    /// The row under the pointer, which shows its Archive and Delete buttons as the cursor's does.
+    pub(crate) hovered_row: Option<MessageKey>,
+    /// The sidebar mailbox under the pointer, which shows its ⋯ menu button.
+    pub(crate) hovered_mailbox: Option<MailboxKey>,
+    /// Until when the pointer reaching a row doesn't show its buttons: just after the view
+    /// changes, rows drawn under a pointer that didn't move report it over them.
+    pub(crate) hover_quiet_until: Option<Instant>,
+    /// The subject of the message Z undoes a move of, to name it where Undo is offered.
+    pub(crate) undo_subject: Option<String>,
+    /// A batch autosort moved, being moved back: how many are still to come back, how many there
+    /// are, and the mailbox autosort still files to, for the notice once they're all back.
+    batch_back: Option<(usize, usize, String)>,
+    /// Messages moved back to an inbox that were listed there again before the server answered
+    /// the move: told of already, they aren't again once it does.
+    returned: Vec<Restoring>,
     pub(crate) form: AccountForm,
     /// The account whose Remove button was pressed once and awaits a second press.
     pub(crate) confirm_remove: Option<String>,
@@ -532,6 +665,9 @@ pub(crate) struct Mail {
     /// The dialog creating a mailbox.
     pub(crate) new_mailbox: NewMailbox,
     pub(crate) delete_mailbox: DeleteMailbox,
+    /// What the window asks to be confirmed, if anything: turning autosort on, or forgetting
+    /// what sorting learned.
+    pub(crate) asking: Option<Asking>,
     /// Mailboxes asked to be deleted, whose server hasn't answered, whether their dialog is open
     /// or not, each with the number it was asked with.
     deleting_mailboxes: HashMap<MailboxKey, Deleting>,
@@ -575,9 +711,36 @@ pub(crate) struct Mail {
     go_pressed: Option<Instant>,
     /// What Z undoes, if anything.
     pub(crate) undo: Option<Undo>,
+    /// Messages moved back out of the mailbox shown while reviewing what autosort moved there:
+    /// kept in their places, said to be moved, so the rows after them don't shift up under
+    /// the pointer. Gone once the list shows something else, or the review ends.
+    pub(crate) returned_here: Vec<(usize, StoredMessage)>,
+    /// The subjects of the inbox messages turning autosort on, as its dialog asks, would move
+    /// now.
+    autosort_would_move: Vec<String>,
+    /// Moves done before the one Z undoes, newest last, each with the message it names: once
+    /// that's undone, Z undoes the one before, rather than nothing.
+    undo_history: Vec<(Undo, Option<String>)>,
+    /// What the moves being undone named, by account and Message-ID, while each is on its way
+    /// back: refused, Z undoes it again, named as before.
+    undone_subjects: HashMap<(String, String), Option<String>>,
+    /// Messages under review where autosort put them that are being moved elsewhere by hand,
+    /// by where they are, with their Message-IDs: moved, they're no longer to be reviewed.
+    moving_reviewed: HashMap<MessageKey, String>,
+    /// Where sorting said, in its last pass, each inbox message goes, if anywhere: not what's
+    /// still shown from before, so what autosort would move is what it would move now.
+    fresh_suggestions: HashMap<MessageKey, String>,
     /// What sorting last said of each inbox message, by message: where it seems to belong, and
     /// whether it seems important. Empty while mail isn't sorted.
     tags: HashMap<MessageKey, Tags>,
+    /// Where sorting suggested messages put back by Undo went, by account and Message-ID, with
+    /// the key they had: once they're listed under a new one, suggested there as before,
+    /// whatever sorting weighs them anew, it having just seen them moved and moved back.
+    restored_suggestions: HashMap<(String, String), (MessageKey, String)>,
+    /// Messages moved back from where autosort put them, by account and Message-ID, with where
+    /// that was: autosort leaves them be, which their rows say rather than offer to move them
+    /// there.
+    kept_from_autosort: HashMap<(String, String), String>,
     /// The UIDVALIDITY each mailbox with tags was sorted under, by account and mailbox: a
     /// suggested move is made only while it holds, as the tags' UIDs name their messages only
     /// then.
@@ -651,7 +814,30 @@ impl Mail {
             unread: HashMap::new(),
             counted: HashSet::new(),
             notice: None,
+            notice_detail: None,
+            notice_actions: Vec::new(),
+            queued_notice: None,
+            arrival: None,
+            arrival_id: 0,
             notice_id: 0,
+            moving_subjects: HashMap::new(),
+            autosort_tally: None,
+            batches: HashMap::new(),
+            returns_reviewed: HashMap::new(),
+            autosort_turned_on: None,
+            row_actions_held: None,
+            hovered_row: None,
+            hovered_mailbox: None,
+            hover_quiet_until: None,
+            undo_subject: None,
+            undo_history: Vec::new(),
+            returned_here: Vec::new(),
+            autosort_would_move: Vec::new(),
+            undone_subjects: HashMap::new(),
+            moving_reviewed: HashMap::new(),
+            fresh_suggestions: HashMap::new(),
+            batch_back: None,
+            returned: Vec::new(),
             form: AccountForm::default(),
             confirm_remove: None,
             sidebar: PaneState::new(260.0).range(200.0, 420.0),
@@ -663,6 +849,7 @@ impl Mail {
             account_menu: None,
             new_mailbox: NewMailbox::default(),
             delete_mailbox: DeleteMailbox::default(),
+            asking: None,
             deleting_mailboxes: HashMap::new(),
             next_delete: 0,
             pending_reply: None,
@@ -685,6 +872,8 @@ impl Mail {
             go_pressed: None,
             undo: None,
             tags: HashMap::new(),
+            restored_suggestions: HashMap::new(),
+            kept_from_autosort: HashMap::new(),
             tagged_under: HashMap::new(),
             autosort_to: HashSet::new(),
             autosorting: HashMap::new(),
@@ -751,6 +940,8 @@ impl Mail {
     /// one replaced it by then.
     fn notify(&mut self, notice: String) {
         self.notice = Some(notice);
+        self.notice_detail = None;
+        self.notice_actions.clear();
         self.notice_id += 1;
         let Some(handle) = &self.handle else { return };
         let (handle, id) = (handle.clone(), self.notice_id);
@@ -762,15 +953,221 @@ impl Mail {
                 handle.update(move |s: &mut Self, _| {
                     if s.notice_id == id {
                         s.notice = None;
+                        s.show_queued_notice();
                     }
                 });
             },
         ));
     }
 
-    /// Closes the notice now.
+    /// Shows a notice, as [`Mail::notify`] does, with a second line and buttons.
+    fn notify_with(
+        &mut self,
+        notice: String,
+        detail: Option<String>,
+        actions: impl IntoIterator<Item = NoticeAction>,
+    ) {
+        let actions: Vec<NoticeAction> = actions.into_iter().collect();
+        self.notify(notice);
+        self.notice_detail = detail;
+        self.notice_actions = actions;
+    }
+
+    /// Shows news, as [`Mail::notify_with`] does, unless the notice showing still offers
+    /// something to press, such as Undo: then once that one closes.
+    fn notify_news(&mut self, notice: String, detail: Option<String>, actions: Vec<NoticeAction>) {
+        if self.notice.is_some() && !self.notice_actions.is_empty() {
+            self.queued_notice = Some((notice, detail, actions));
+        } else {
+            self.notify_with(notice, detail, actions);
+        }
+    }
+
+    /// Tells of one message just arrived, by who sent it and what it's about, always in the same
+    /// place: the toolbar, as a button that opens it, for [`ARRIVAL_SECS`]. The bar under the
+    /// list is left to what the user did, and its Undo.
+    fn announce_arrival(&mut self, title: String, subject: String, key: MessageKey) {
+        self.arrival_id += 1;
+        self.arrival = Some((title, subject, key));
+        let Some(handle) = &self.handle else { return };
+        let (handle, id) = (handle.clone(), self.arrival_id);
+        drop(rune::task::spawn_after(
+            "arrival-timeout",
+            Duration::from_secs(ARRIVAL_SECS),
+            move || {
+                handle.update(move |s: &mut Self, _| {
+                    if s.arrival_id == id {
+                        s.arrival = None;
+                    }
+                });
+            },
+        ));
+    }
+
+    /// The message just arrived, as the toolbar tells of it: its title and subject.
+    pub(crate) fn arrival(&self) -> Option<(&str, &str)> {
+        self.arrival
+            .as_ref()
+            .map(|(title, subject, _)| (title.as_str(), subject.as_str()))
+    }
+
+    /// Opens the message just arrived, and stops telling of it.
+    pub(crate) fn open_arrival(&mut self) {
+        if let Some((_, _, (account, mailbox, uid))) = self.arrival.take() {
+            self.open_message(&account, &mailbox, uid);
+        }
+    }
+
+    /// Shows the news that waited for the last notice to close, if any.
+    fn show_queued_notice(&mut self) {
+        if let Some((notice, detail, actions)) = self.queued_notice.take() {
+            self.notify_with(notice, detail, actions);
+        }
+    }
+
+    /// Counts the notices shown, so each is drawn afresh rather than morphed from the last.
+    pub(crate) const fn notice_id(&self) -> u64 {
+        self.notice_id
+    }
+
+    /// Closes the notice now, and shows what waited for it.
     pub(crate) fn dismiss_notice(&mut self) {
         self.notice = None;
+        self.show_queued_notice();
+    }
+
+    /// Does what the notice's `i`th button says, and closes it.
+    pub(crate) fn notice_pressed(&mut self, i: usize, tx: &mut Tx) {
+        let Some(action) = self.notice_actions.get(i).cloned() else {
+            return;
+        };
+        let actions = std::mem::take(&mut self.notice_actions);
+        let (title, detail) = (self.notice.take(), self.notice_detail.take());
+        match action {
+            NoticeAction::Undo => self.undo(),
+            NoticeAction::MoveBack(moved) => {
+                // Not what was kept or moved back since the notice said so.
+                let waiting: Vec<_> = moved
+                    .into_iter()
+                    .filter(|(from, to, id)| self.to_review(&from.0, to, id))
+                    .collect();
+                self.move_back_autosorted(&waiting);
+            }
+            NoticeAction::Show(showing) => {
+                // Where they went, the batch's banner says what came and sends it back.
+                let _ = (actions, title, detail);
+                self.show(showing);
+                self.reveal_cursor(tx);
+                // Whole at once, never fading through near-black.
+                tx.instant();
+            }
+        }
+        if self.notice.is_none() {
+            self.show_queued_notice();
+        }
+    }
+
+    /// Moves messages autosort moved back to the inbox they came from, where autosort then
+    /// leaves them, as undoing a move by hand does. What Z undoes stays as it was. How many
+    /// are on their way: one the server can't be asked to move yet stays to be reviewed.
+    fn move_back_autosorted(&mut self, moved: &[(MessageKey, String, String)]) -> usize {
+        // The review banner going moves the rows up under a pointer that stays put.
+        self.hovered_row = None;
+        self.hover_quiet_until = Some(Instant::now() + HOVER_QUIET);
+        let kept = self.undo.take();
+        // Moved back on their own, they don't use up what Z undoes after, nor, refused, become
+        // what it undoes.
+        let history = std::mem::take(&mut self.undo_history);
+        let subject = self.undo_subject.clone();
+        let undoing = self.undoing.len();
+        let mut started = Vec::new();
+        for one @ (from, to, message_id) in moved {
+            self.undo = Some(Undo::Moved {
+                from: from.clone(),
+                to: to.clone(),
+                message_id: message_id.clone(),
+                snoozed: None,
+                done: true,
+            });
+            let leaving = self.leaving.len();
+            self.undo();
+            if self.leaving.len() == leaving {
+                continue;
+            }
+            // Moved back from there, it isn't suggested there again, as it was before.
+            let id = (from.0.clone(), message_id.clone());
+            self.restored_suggestions.remove(&id);
+            self.kept_from_autosort.insert(id.clone(), to.clone());
+            if let Some(entry) = self.reviewed(&from.0, to, message_id) {
+                self.returns_reviewed.insert(id, entry);
+            }
+            started.push(one);
+        }
+        self.undoing.truncate(undoing);
+        self.undo = kept;
+        self.undo_history = history;
+        self.undo_subject = subject;
+        // Several coming back, the cursor stays where the user left it.
+        self.restoring = None;
+        if let [(from, to, _), ..] = started.as_slice() {
+            let back = self.mailbox_label(&from.0, &from.1);
+            let label = self.mailbox_label(&from.0, to);
+            let n = started.len();
+            let what = if n == 1 {
+                "the message".to_owned()
+            } else {
+                format!("{n} messages")
+            };
+            self.notify(format!("Moving {what} back to {back}…"));
+            self.batch_back = Some((n, n, label));
+        }
+        started.len()
+    }
+
+    /// A message autosort moved to `account`'s `mailbox` was looked at, moved back or kept
+    /// there: it isn't to be reviewed any more, nor moved back by a notice of it.
+    /// What it was reviewed as, if it was to be.
+    fn reviewed(&mut self, account: &str, mailbox: &str, message_id: &str) -> Option<ReviewEntry> {
+        let to = (account.to_owned(), mailbox.to_owned());
+        let other = |(_, _, id): &(MessageKey, String, String)| id != message_id;
+        if let Some(tally) = self.autosort_tally.as_mut().filter(|t| t.to == to) {
+            tally.moved.retain(other);
+        }
+        let batch = self.batches.get_mut(&to)?;
+        let at = batch.moved.iter().position(|m| !other(m))?;
+        let one = batch.moved.remove(at);
+        let subject = if at < batch.subjects.len() {
+            batch.subjects.remove(at)
+        } else {
+            String::new()
+        };
+        if batch.moved.is_empty() {
+            self.batches.remove(&to);
+        }
+        Some((to, one, subject))
+    }
+
+    /// A message autosort moved that couldn't be moved back is to be reviewed again where it
+    /// is, listed as it is rather than said to be moved.
+    fn review_again(&mut self, (to, one, subject): ReviewEntry) {
+        let (account, message_id) = (to.0.clone(), one.2.clone());
+        let batch = self
+            .batches
+            .entry(to.clone())
+            .or_insert_with(|| AutosortTally {
+                to,
+                moved: Vec::new(),
+                subjects: Vec::new(),
+                just_on: false,
+                notice: 0,
+            });
+        batch.moved.push(one);
+        batch.subjects.push(subject);
+        self.kept_from_autosort
+            .remove(&(account.clone(), message_id.clone()));
+        self.returned_here.retain(|(_, m)| {
+            !(m.account == account && m.envelope.message_id.as_ref() == Some(&message_id))
+        });
     }
 
     fn try_start(handle: &AppHandle<Self>) -> Result<(Services, Settings), String> {
@@ -839,6 +1236,7 @@ impl Mail {
                 .get(&m.account)
                 .and_then(|list| list.iter().find(|b| b.name == m.mailbox))
                 .is_some_and(|b| b.role == *role),
+            Showing::Everything => true,
         }
     }
 
@@ -857,7 +1255,20 @@ impl Mail {
         let mut found = if let Some(query) = self.search.query() {
             let cached = store.matching_messages(
                 self.listing().scope(),
-                |m| search::matches(&m.envelope, query) && listed(m),
+                // Its headers, or its text where that's downloaded already.
+                // Each word in either: who it's from in one, what it's about in the other.
+                |m| {
+                    listed(m)
+                        && (search::matches(&m.envelope, query) || {
+                            let body = store
+                                .body(&m.account, &m.mailbox, m.envelope.uid)
+                                .ok()
+                                .flatten();
+                            body.is_some_and(|b| {
+                                search::matches_with_text(&m.envelope, &b.text, query)
+                            })
+                        })
+                },
                 self.list_limit,
             )?;
             // Cut to the limit only once what the server found is filtered too, so read matches
@@ -904,6 +1315,9 @@ impl Mail {
                 Showing::Mailbox { account, name } => {
                     store.mailbox_messages(account, name, self.list_limit)?
                 }
+                Showing::Everything => {
+                    store.matching_messages(Scope::Every, |_| true, self.list_limit)?
+                }
             }
         };
         // The message open stays listed, past the end if need be, as when the list starts again
@@ -935,6 +1349,7 @@ impl Mail {
 
     /// Rereads accounts and mail from the store.
     fn reload(&mut self) {
+        self.prune_returned();
         let Ok(services) = &self.services else { return };
         let unread_only = self.settings.unread_only;
         // Read ones stay listed only while a message is open: back in the list, by whatever way,
@@ -990,7 +1405,26 @@ impl Mail {
                 for m in &mut messages {
                     self.shown_as_asked(m);
                 }
+                // What autosort just moved here comes first while it's to be reviewed, together.
+                if !self.batches.is_empty() {
+                    let (batch, rest): (Vec<_>, Vec<_>) =
+                        messages.into_iter().partition(|m| self.in_last_batch(m));
+                    messages = batch;
+                    messages.extend(rest);
+                }
+                // Rows moved under a pointer that didn't move don't offer their buttons.
+                let moved = self.messages.len() != messages.len()
+                    || self
+                        .messages
+                        .iter()
+                        .zip(&messages)
+                        .any(|(a, b)| message_key(a) != message_key(b));
+                if moved && self.hovered_row.is_some() {
+                    self.hovered_row = None;
+                    self.hover_quiet_until = Some(Instant::now() + HOVER_QUIET);
+                }
                 self.messages = messages;
+                self.suggest_as_before_undo();
                 if unread_only {
                     // Kept while hidden too, as while being moved, or past the list's end.
                     self.still_listed
@@ -1121,7 +1555,8 @@ impl Mail {
             }
             update @ Update::Opened { .. } => self.opened_update(update, tx),
             // Sent mail is shown as it's listed, without a notice.
-            Update::Mail { .. } => self.reload(),
+            // New mail, or the text of what a search found in it, can be shown now.
+            Update::Mail { .. } | Update::Peeked { .. } => self.reload(),
             update @ Update::Unread { .. } => self.unread_found(&update),
             Update::Mailboxes { account } => self.mailboxes_listed(&account),
             Update::Older {
@@ -1316,8 +1751,20 @@ impl Mail {
     ) {
         let key = (account.to_owned(), mailbox.to_owned(), uid);
         self.moving.remove(&key);
+        let subject = self.moving_subjects.remove(&key);
+        if let Some(id) = self.moving_reviewed.remove(&key)
+            && result.is_ok()
+        {
+            self.reviewed(account, mailbox, &id);
+        }
         let undoable = self.moved_for_undo(&key, result.is_ok());
+        let autosorted_id = self.autosorting.get(&key).cloned();
         let autosorted = self.autosort_answered(&key, result.is_ok());
+        let destination = Showing::Mailbox {
+            account: account.to_owned(),
+            name: to.to_owned(),
+        };
+        let tally_key = (account.to_owned(), to.to_owned());
         let to = self.mailbox_label(account, to);
         match result {
             Ok(current) => {
@@ -1327,9 +1774,67 @@ impl Mail {
                     self.search.forget_message(account, mailbox, uid);
                 }
                 if autosorted {
-                    self.notify(format!("Autosorted a new message to {to}"));
+                    // Moved a few at a time, they're told of together while the notice shows.
+                    // Straight after turning it on, the notice still says it's on.
+                    let turned_on = matches!(&self.autosort_turned_on,
+                        Some((at, id)) if *at == tally_key && *id == self.notice_id);
+                    let (mut moved, mut subjects, just_on) = match self.autosort_tally.take() {
+                        Some(t) if t.to == tally_key && t.notice == self.notice_id => {
+                            (t.moved, t.subjects, t.just_on || turned_on)
+                        }
+                        _ => (Vec::new(), Vec::new(), turned_on),
+                    };
+                    if let Some(id) = autosorted_id {
+                        let one = (key.clone(), tally_key.1.clone(), id);
+                        // To be reviewed there, with what came before and wasn't yet.
+                        let batch = self.batches.entry(tally_key.clone()).or_insert_with(|| {
+                            AutosortTally {
+                                to: tally_key.clone(),
+                                moved: Vec::new(),
+                                subjects: Vec::new(),
+                                just_on: false,
+                                notice: 0,
+                            }
+                        });
+                        batch.moved.push(one.clone());
+                        batch.subjects.push(subject.clone().unwrap_or_default());
+                        moved.push(one);
+                    }
+                    subjects.extend(subject);
+                    let count = moved.len().max(1);
+                    let what = if count == 1 {
+                        "1 message".to_owned()
+                    } else {
+                        format!("{count} messages")
+                    };
+                    let title = if just_on {
+                        format!("Autosort is on for {to}: moved {what} there")
+                    } else {
+                        format!("Autosorted {what} to {to}")
+                    };
+                    // Which ones, by subject.
+                    // Which one, by subject; several are listed where they went, by its banner.
+                    let detail = match subjects.as_slice() {
+                        [one] if count == 1 => Some(one.clone()),
+                        _ => None,
+                    };
+                    let back = NoticeAction::MoveBack(moved.clone());
+                    // Reviewing them first; moving them all back is a step further.
+                    self.notify_with(title, detail, [NoticeAction::Show(destination), back]);
+                    let tally = AutosortTally {
+                        to: tally_key,
+                        moved,
+                        subjects,
+                        just_on,
+                        notice: self.notice_id,
+                    };
+                    self.autosort_tally = Some(tally);
                 } else {
-                    self.notify(format!("Moved to {to}{}", undo_hint(undoable)));
+                    let action = undoable.then_some(NoticeAction::Undo);
+                    if undoable {
+                        self.undo_subject.clone_from(&subject);
+                    }
+                    self.notify_with(format!("Moved to {to}"), subject, action);
                 }
             }
             Err(error) => {
@@ -1344,6 +1849,8 @@ impl Mail {
 
     /// [`Update::Opened`], as [`Mail::opened`].
     fn opened_update(&mut self, update: Update, tx: &mut Tx) {
+        // The message shows whole at once, its toolbar in place, never fading in from blank.
+        tx.instant();
         if let Update::Opened {
             account,
             mailbox,
@@ -1441,7 +1948,10 @@ impl Mail {
             return;
         }
         match result {
-            Ok(_) => self.reload(),
+            Ok(_) => {
+                self.reload();
+                self.peek_text_matches(account, mailbox);
+            }
             Err(error) => {
                 let label = self.label(account).to_owned();
                 self.notify(format!("{label}: couldn't search {mailbox}: {error}"));
@@ -1449,9 +1959,13 @@ impl Mail {
         }
     }
 
-    /// What the list shows: what's selected, or, searching everywhere, every inbox.
+    /// What the list shows: what's selected, or, searching all mail or every inbox, that.
     pub(crate) fn listing(&self) -> &Showing {
-        if self.search.everywhere && self.search.is_active() {
+        if !self.search.is_active() {
+            &self.showing
+        } else if self.search.all_mail {
+            &ALL_MAIL
+        } else if self.search.everywhere {
             &ALL_INBOXES
         } else {
             &self.showing
@@ -1469,10 +1983,78 @@ impl Mail {
         self.reload();
     }
 
+    /// Return in the search field: looks through all mail on this computer, or, once it does,
+    /// goes to the first result. The server is only searched when asked for by its button.
+    pub(crate) fn search_submitted(&mut self, tx: &mut Tx) {
+        if !self.search.all_mail {
+            self.search_within(false, true);
+        } else if self.cursor_to_first(tx) {
+            tx.blur();
+        }
+    }
+
+    /// Downloads, without marking them read, the messages the server found in `account`'s
+    /// `mailbox` by their text alone whose text isn't on this computer, so each result can show
+    /// where it matched. Only a few: what's listed first; and only messages this computer has
+    /// the rest of, as their text is kept with them. Older ones show without it.
+    fn peek_text_matches(&self, account: &str, mailbox: &str) {
+        const AT_MOST: usize = 12;
+        let (Ok(services), Some(query)) = (&self.services, self.search.query()) else {
+            return;
+        };
+        let uids: Vec<u32> = self
+            .messages
+            .iter()
+            .filter(|m| m.account == account && m.mailbox == mailbox)
+            .filter(|m| !search::matches(&m.envelope, query))
+            .filter(|m| {
+                let (store, uid) = (&services.store, m.envelope.uid);
+                store.body(account, mailbox, uid).is_ok_and(|b| b.is_none())
+                    && store
+                        .message(account, mailbox, uid)
+                        .is_ok_and(|c| c.is_some())
+            })
+            .map(|m| m.envelope.uid)
+            .take(AT_MOST)
+            .collect();
+        let _ignored = services
+            .mailroom
+            .peek(&services.store, account, mailbox, uids);
+    }
+
+    /// What a message says around the first word of `query` in its text, if its body is on this
+    /// computer.
+    pub(crate) fn excerpt(&self, m: &StoredMessage, query: &str) -> Option<String> {
+        let Ok(services) = &self.services else {
+            return None;
+        };
+        let body = services
+            .store
+            .body(&m.account, &m.mailbox, m.envelope.uid)
+            .ok()??;
+        search::excerpt(&body.text, query)
+    }
+
+    /// Leaves out what the server found, listing what's on this computer again, the query kept.
+    pub(crate) fn search_local_only(&mut self) {
+        self.search.forget_server();
+        self.list_limit = LIST_LIMIT;
+        self.clear_listed();
+        self.reload();
+    }
+
     /// Searches every inbox, or just what's selected.
+    #[cfg(test)]
     pub(crate) fn search_everywhere(&mut self, everywhere: bool) {
-        if self.search.everywhere != everywhere {
+        self.search_within(everywhere, false);
+    }
+
+    /// Searches every mailbox of every account, or, as [`Mail::search_everywhere`] says, every
+    /// inbox or just what's selected. The query stays.
+    pub(crate) fn search_within(&mut self, everywhere: bool, all_mail: bool) {
+        if self.search.everywhere != everywhere || self.search.all_mail != all_mail {
             self.search.everywhere = everywhere;
+            self.search.all_mail = all_mail;
             self.search.forget_server();
             self.list_limit = LIST_LIMIT;
             self.clear_listed();
@@ -1487,6 +2069,9 @@ impl Mail {
         }
         self.search.query.clear();
         self.search_changed();
+        // The list redrawn under a pointer that didn't move doesn't offer that row's buttons.
+        self.hovered_row = None;
+        self.hover_quiet_until = Some(Instant::now() + HOVER_QUIET);
         true
     }
 
@@ -1648,6 +2233,10 @@ impl Mail {
     /// Moves the list's cursor `by` rows, stopping at the ends; with nothing under it, it starts
     /// at the top. While a message is open, the next or previous one opens instead.
     pub(crate) fn move_cursor(&mut self, by: isize, tx: &mut Tx) {
+        self.row_actions_held = None;
+        // The keys lead now: the row the pointer was over stops showing its buttons until the
+        // pointer moves to a row again.
+        self.hovered_row = None;
         let keys: Vec<MessageKey> = self.shown().map(message_key).collect();
         let Some(last) = keys.len().checked_sub(1) else {
             return;
@@ -1699,6 +2288,9 @@ impl Mail {
     /// A message was moved, or snoozed, and leaves the list at once. A cursor on it (or on it
     /// open) moves to the row after it, else the one before, and an open one closes.
     pub(crate) fn left_list(&mut self, key: MessageKey) {
+        // The rows close up under the pointer: the one sliding beneath it isn't hovered.
+        self.hovered_row = None;
+        self.hover_quiet_until = Some(Instant::now() + HOVER_QUIET);
         let open = self.reader.as_ref().map(|r| message_key(&r.message));
         if self.cursor.as_ref() == Some(&key) || open.as_ref() == Some(&key) {
             let keys: Vec<MessageKey> = self.shown().map(message_key).collect();
@@ -2053,6 +2645,7 @@ impl Mail {
             body: None,
             markdown: None,
             uid_validity,
+            waited: false,
         };
         let mut started = true;
         if let Ok(services) = &self.services {
@@ -2106,7 +2699,31 @@ impl Mail {
         {
             self.sort_mail();
         }
+        if reader.body.is_none() {
+            self.spinner_after_a_while(message_key(&reader.message));
+        }
         self.reader = Some(reader);
+    }
+
+    /// Lets the reader show a spinner for the message `key`'s text, if it's still downloading
+    /// once [`READER_SPINNER_MS`] have gone.
+    fn spinner_after_a_while(&self, key: MessageKey) {
+        let Some(handle) = &self.handle else { return };
+        let handle = handle.clone();
+        drop(rune::task::spawn_after(
+            "reader-waited",
+            Duration::from_millis(READER_SPINNER_MS),
+            move || {
+                handle.update(move |s: &mut Self, _| {
+                    if let Some(r) = &mut s.reader
+                        && r.body.is_none()
+                        && message_key(&r.message) == key
+                    {
+                        r.waited = true;
+                    }
+                });
+            },
+        ));
     }
 
     /// Opens a link from a message in the browser.
@@ -2117,6 +2734,10 @@ impl Mail {
     }
 
     pub(crate) fn close_reader(&mut self) {
+        // What the pointer was over isn't under it in what shows next, and the rows drawn
+        // under a pointer that didn't move aren't hovered either.
+        self.hovered_row = None;
+        self.hover_quiet_until = Some(Instant::now() + HOVER_QUIET);
         self.leave_reader();
         self.pending_reply = None;
         self.forget_read();
@@ -2261,12 +2882,14 @@ impl Mail {
         let uid_validity = self.uid_validity(&key.0, &key.1);
         if self.set_seen(&key.0, &key.1, key.2, seen, uid_validity) {
             self.marked_from_list(&key, seen);
+            let subject = self.undo_name(&key);
             self.did(uid_validity.map(|uid_validity| Undo::Seen {
                 message: key,
                 uid_validity,
                 seen: !seen,
                 done: false,
             }));
+            self.undo_subject = subject;
         }
     }
 
@@ -2287,12 +2910,14 @@ impl Mail {
         }
         let uid_validity = self.uid_validity(&key.0, &key.1);
         if self.set_flagged(&key.0, &key.1, key.2, flagged, uid_validity) {
+            let subject = self.undo_name(&key);
             self.did(uid_validity.map(|uid_validity| Undo::Flagged {
                 message: key,
                 uid_validity,
                 flagged: !flagged,
                 done: false,
             }));
+            self.undo_subject = subject;
         }
     }
 
@@ -2307,11 +2932,29 @@ impl Mail {
         waiting || self.moving_back(key)
     }
 
+    /// Z goes on to the move done before the one just undone, if there was one.
+    fn undo_the_one_before(&mut self) {
+        if let Some((earlier, subject)) = self.undo_history.pop() {
+            self.undo = Some(earlier);
+            self.undo_subject = subject;
+        }
+    }
+
     /// Something was done from the window, which Z undoes with `undo`, or can't: what was done
     /// before, and moves back that fail, aren't undone any more.
     fn did(&mut self, undo: Option<Undo>) {
+        // A move stays undoable after what follows, in turn; one still on its way once the
+        // server moved it.
+        if let Some(earlier @ Undo::Moved { .. }) = self.undo.take() {
+            self.undo_history.push((earlier, self.undo_subject.clone()));
+            if self.undo_history.len() > UNDO_HISTORY {
+                self.undo_history.remove(0);
+            }
+        }
         self.undo = undo;
         self.undoing.clear();
+        // A notice's Undo undid what's now replaced: it goes, not undoing this instead.
+        self.notice_actions.retain(|a| *a != NoticeAction::Undo);
         // Nor does the cursor go to a message being moved back; it isn't new mail all the same.
         self.restoring = None;
     }
@@ -2357,6 +3000,7 @@ impl Mail {
         let undone_refused = answer.is_err_and(|asked| asked != *was);
         if undone_refused {
             self.undo = None;
+            self.undo_the_one_before();
         } else if waiting == 0 {
             *done = true;
         }
@@ -2696,7 +3340,12 @@ impl Mail {
     }
 
     /// Opens the menu of a mailbox in the sidebar at `point`, where it was right-clicked.
-    pub(crate) fn open_mailbox_menu(&mut self, account: &str, mailbox: &str, point: PointerPress) {
+    pub(crate) fn open_mailbox_menu(
+        &mut self,
+        account: &str,
+        mailbox: &str,
+        point: Option<PointerPress>,
+    ) {
         self.forget_go();
         let grouped = self.in_open_group(account, mailbox);
         self.mailbox_menu = Some(MailboxMenu {
@@ -3230,6 +3879,7 @@ impl Mail {
                     Some((account.id.clone(), name.to_owned()))
                 })
                 .collect(),
+            Showing::Everything => self.mailboxes_of(&ALL_MAIL),
         }
     }
 
@@ -3336,6 +3986,21 @@ impl Mail {
         let key = (account.to_owned(), mailbox.to_owned(), uid);
         if self.moving_back(&key) {
             return false;
+        }
+        // By who sent it and what it's about, to tell it apart in notices and Undo.
+        if let Some(subject) = self
+            .find_message(&key)
+            .map(|m| format!("{} · {}", m.envelope.from.label(), subject_of(&m.envelope)))
+        {
+            self.moving_subjects.insert(key.clone(), subject);
+        }
+        // Under review where autosort put it, moved elsewhere it's been looked at.
+        if let Some(id) = self
+            .find_message(&key)
+            .filter(|m| self.in_last_batch(m))
+            .and_then(|m| m.envelope.message_id.clone())
+        {
+            self.moving_reviewed.insert(key.clone(), id);
         }
         if let Some(why) = self.deleting_destination(account, to) {
             // Autosort, which isn't undone, leaves it in the inbox without a word.
@@ -3445,9 +4110,102 @@ impl Mail {
         {
             self.close_message_menu();
         }
+        self.fresh_suggestions = tags
+            .iter()
+            .filter_map(|(key, t)| Some((key.clone(), t.suggested.clone()?)))
+            .collect();
+        // A suggestion shown on a message stays while it's where it was: one going as sorting
+        // weighs other mail anew would leave rows the user didn't touch changing under them.
+        for (key, old) in &self.tags {
+            // By its key, whether listed now or not (a search may hide it for a while): moved,
+            // it has another key, and nothing is kept for it.
+            if let Some(to) = &old.suggested
+                && tags.get(key).is_none_or(|t| t.suggested.is_none())
+            {
+                tags.entry(key.clone()).or_default().suggested = Some(to.clone());
+            }
+        }
         self.tags = tags;
+        self.suggest_as_before_undo();
+        self.refresh_autosort_preview();
         self.tagged_under = sorted.uid_validity;
         self.autosort(sorted.autosort, menu.as_ref());
+    }
+
+    /// Whether what autosort moved to `account`'s `mailbox` still has messages to review.
+    pub(crate) fn batch_pending(&self, account: &str, mailbox: &str) -> bool {
+        self.batches
+            .keys()
+            .any(|(a, b)| a == account && b == mailbox)
+    }
+
+    /// Whether autosort moved `account`'s message `message_id` to `mailbox`, and it's still to
+    /// be reviewed there.
+    fn to_review(&self, account: &str, mailbox: &str, message_id: &str) -> bool {
+        self.batches.values().any(|b| {
+            b.to.0 == account
+                && b.to.1 == mailbox
+                && b.moved.iter().any(|(_, _, id)| id == message_id)
+        })
+    }
+
+    /// Whether the message `m` is still on its way out of its mailbox: moved, or moved back.
+    pub(crate) fn is_moving(&self, m: &StoredMessage) -> bool {
+        self.moving.contains(&message_key(m))
+            || m.envelope.message_id.as_ref().is_some_and(|id| {
+                self.leaving.iter().any(|r| {
+                    r.account == m.account && r.mailbox == m.mailbox && r.message_id == *id
+                }) || self
+                    .returning
+                    .iter()
+                    .any(|r| r.account == m.account && r.message_id == *id)
+            })
+    }
+
+    /// Where autosort put a message before it was moved back, which autosort now leaves it out of.
+    pub(crate) fn kept_from_autosort(&self, account: &str, e: &Envelope) -> Option<&str> {
+        let id = (account.to_owned(), e.message_id.clone()?);
+        self.kept_from_autosort.get(&id).map(String::as_str)
+    }
+
+    /// Forgets what sorting said of every message, as what it learned is gone or replaced: what
+    /// Undo would say again of messages it put back too.
+    fn forget_tags(&mut self) {
+        self.tags.clear();
+        self.restored_suggestions.clear();
+        self.fresh_suggestions.clear();
+    }
+
+    /// Puts back, on messages Undo returned once they're listed again, the suggestion they had:
+    /// undoing a move undoes it whole, not leaving the row without what it said before.
+    fn suggest_as_before_undo(&mut self) {
+        if self.restored_suggestions.is_empty() {
+            return;
+        }
+        for m in &self.messages {
+            let Some(id) = m.envelope.message_id.as_deref() else {
+                continue;
+            };
+            let Some((was, to)) = self
+                .restored_suggestions
+                .get(&(m.account.clone(), id.to_owned()))
+            else {
+                continue;
+            };
+            let key = message_key(m);
+            // Still listed as before the server answered, what it had there is still there; and
+            // only where it was put back does it say so again.
+            let (_, put_back_to, _) = was;
+            if key == *was || m.mailbox != *put_back_to {
+                continue;
+            }
+            if *to != m.mailbox {
+                let tags = self.tags.entry(key).or_default();
+                if tags.suggested.as_ref().is_none_or(|now| *now == m.mailbox) {
+                    tags.suggested = Some(to.clone());
+                }
+            }
+        }
     }
 
     /// What sorting says of a message: where it seems to belong, and whether it seems important.
@@ -3606,6 +4364,329 @@ impl Mail {
         }
     }
 
+    /// Asks to turn autosort on for `account`'s `mailbox`, in a dialog saying what it moves; or
+    /// turns it off, which moves nothing, at once.
+    pub(crate) fn toggle_autosort(&mut self, account: &str, mailbox: &str) {
+        let label = self.mailbox_label(account, mailbox);
+        if self.autosorts_to(account, mailbox) {
+            self.set_autosort(account, mailbox, false);
+            self.notify(format!("Autosort is off for {label}"));
+        } else {
+            let key = (account.to_owned(), mailbox.to_owned());
+            self.asking = Some(Asking::Autosort(key, false));
+            self.refresh_autosort_preview();
+        }
+    }
+
+    /// The subjects of the inbox messages on this computer that turning autosort on for
+    /// `account`'s `mailbox` would move now, as its dialog asked: sorting says they go there,
+    /// and they're recent enough to still be waiting to be filed.
+    pub(crate) fn autosort_preview(&self) -> &[String] {
+        &self.autosort_would_move
+    }
+
+    /// Reads again what turning autosort on, as its dialog asks, would move now.
+    fn refresh_autosort_preview(&mut self) {
+        let Some(Asking::Autosort((account, mailbox), _)) = &self.asking else {
+            self.autosort_would_move.clear();
+            return;
+        };
+        // Not what autosort leaves alone, kept or tried before, as it won't move it.
+        let noted = self.services.as_ref().map_or_else(
+            |_| HashMap::new(),
+            |services| services.store.autosorted().unwrap_or_default(),
+        );
+        let left_alone = |m: &StoredMessage| {
+            m.envelope
+                .message_id
+                .as_ref()
+                .is_none_or(|id| noted.contains_key(&(m.account.clone(), id.clone())))
+        };
+        self.autosort_would_move = self
+            .recent_inbox(account)
+            .iter()
+            .filter(|m| self.fresh_suggestions.get(&message_key(m)) == Some(mailbox))
+            .filter(|m| !left_alone(m))
+            .map(|m| subject_of(&m.envelope))
+            .collect();
+    }
+
+    /// The messages in `account`'s inbox on this computer recent enough to be autosorted, if
+    /// sorting says where they go: all of them, whatever the list shows.
+    fn recent_inbox(&self, account: &str) -> Vec<StoredMessage> {
+        let (Ok(services), Some(inbox)) =
+            (&self.services, self.mailbox_with_role(account, Role::Inbox))
+        else {
+            return Vec::new();
+        };
+        let since = Timestamp::now().as_second() - postden_ai::SETTLED_AFTER;
+        services
+            .store
+            .messages_since(account, &inbox.name, since)
+            .unwrap_or_default()
+    }
+
+    /// Turns autosort on for the mailbox its dialog asked about, for new mail only: what's in
+    /// the inbox already stays there, tagged. Closes the dialog.
+    pub(crate) fn confirm_autosort_new_only(&mut self) {
+        let Some(Asking::Autosort((account, _), _)) = &self.asking else {
+            return;
+        };
+        // Every one, not only what sorting suggests moving there now: it may yet.
+        let ids: Vec<String> = self
+            .recent_inbox(account)
+            .into_iter()
+            .filter_map(|m| m.envelope.message_id)
+            .collect();
+        if let Ok(services) = &self.services {
+            for id in &ids {
+                if let Err(e) = services.store.keep_from_autosort(account, id) {
+                    self.notify(format!("Couldn't keep the inbox as it is: {e}"));
+                    return;
+                }
+            }
+        }
+        self.confirm_autosort();
+    }
+
+    /// Turns autosort on for the mailbox its dialog asked about, and closes the dialog.
+    pub(crate) fn confirm_autosort(&mut self) {
+        let Some(Asking::Autosort((account, mailbox), _)) = self.asking.take() else {
+            return;
+        };
+        self.hover_quiet_until = Some(Instant::now() + HOVER_QUIET);
+        self.hovered_row = None;
+        let label = self.mailbox_label(&account, &mailbox);
+        self.set_autosort(&account, &mailbox, true);
+        self.notify_with(
+            format!("Autosort is on for {label}"),
+            Some("Inbox mail that belongs there moves by itself".into()),
+            None,
+        );
+        // What it moves straight away says autosort was turned on, as this notice does.
+        self.autosort_turned_on = Some(((account, mailbox), self.notice_id));
+    }
+
+    /// Ticks or unticks, in the autosort dialog, moving the inbox mail that already fits too.
+    pub(crate) const fn toggle_autosort_move_now(&mut self) {
+        if let Some(Asking::Autosort(_, now)) = &mut self.asking {
+            *now = !*now;
+        }
+    }
+
+    /// Turns autosort on as its dialog says: for new mail only, or moving what fits now too.
+    pub(crate) fn submit_autosort(&mut self) {
+        match self.asking.clone() {
+            Some(Asking::Autosort((account, mailbox), true)) => {
+                let n = self.autosort_preview().len();
+                self.confirm_autosort();
+                // One notice, saying what's on its way, that the moves turn into what's done.
+                if n > 0 {
+                    let label = self.mailbox_label(&account, &mailbox);
+                    let what = if n == 1 {
+                        "1 message".to_owned()
+                    } else {
+                        format!("{n} messages")
+                    };
+                    self.notify(format!("Autosort is on for {label}: moving {what} there…"));
+                    self.autosort_turned_on = Some(((account, mailbox), self.notice_id));
+                }
+            }
+            Some(Asking::Autosort(_, false)) => self.confirm_autosort_new_only(),
+            _ => {}
+        }
+    }
+
+    /// The mailboxes inbox mail is autosorted to, by account and name, in order.
+    pub(crate) fn autosorted_mailboxes(&self) -> Vec<MailboxKey> {
+        let mut all: Vec<MailboxKey> = self.autosort_to.iter().cloned().collect();
+        all.sort();
+        all
+    }
+
+    /// The last batch autosort moved to `account`'s `mailbox`, if it's still to be looked at:
+    /// each message's subject, and what moves it back.
+    pub(crate) fn batch_in(
+        &self,
+        account: &str,
+        mailbox: &str,
+    ) -> Option<(&[String], NoticeAction)> {
+        let b = self
+            .batches
+            .values()
+            .find(|b| b.to.0 == account && b.to.1 == mailbox)?;
+        Some((
+            b.subjects.as_slice(),
+            NoticeAction::MoveBack(b.moved.clone()),
+        ))
+    }
+
+    /// Whether the message `m` came in the last batch autosort moved, to where it is now.
+    pub(crate) fn in_last_batch(&self, m: &StoredMessage) -> bool {
+        m.envelope
+            .message_id
+            .as_ref()
+            .is_some_and(|id| self.to_review(&m.account, &m.mailbox, id))
+    }
+
+    /// Moves one message of what autosort moved back where it came from, the rest staying
+    /// where they went.
+    pub(crate) fn move_back_one(&mut self, m: &StoredMessage) {
+        let Some(id) = m.envelope.message_id.clone() else {
+            return;
+        };
+        let Some(one) = self
+            .batches
+            .values()
+            .filter(|b| b.to.0 == m.account && b.to.1 == m.mailbox)
+            .flat_map(|b| &b.moved)
+            .find(|(_, _, moved)| *moved == id)
+            .cloned()
+        else {
+            return;
+        };
+        // Where its row is, which it keeps while it goes and once it's gone.
+        let key = message_key(m);
+        let slot = self
+            .list_rows()
+            .iter()
+            .position(|r| matches!(r, ListRow::Message(l) if message_key(l) == key))
+            .unwrap_or(0);
+        if self.move_back_autosorted(std::slice::from_ref(&one)) == 0 {
+            return;
+        }
+        self.returned_here.push((slot, m.clone()));
+        // Moved back by hand, Z puts it where autosort had once it's back, as any move by hand
+        // is undone.
+        let (from, _, message_id) = one;
+        self.did(Some(Undo::Moved {
+            from: key,
+            to: from.1,
+            message_id,
+            snoozed: None,
+            done: false,
+        }));
+        self.undo_subject = Some(subject_of(&m.envelope));
+    }
+
+    /// Moves what autosort moved to the mailbox shown back, from where it went.
+    pub(crate) fn move_back_last_batch(&mut self) {
+        let Showing::Mailbox { account, name } = &self.showing else {
+            return;
+        };
+        let Some(b) = self.batches.get(&(account.clone(), name.clone())).cloned() else {
+            return;
+        };
+        self.move_back_autosorted(&b.moved);
+    }
+
+    /// Keeps what autosort moved to the mailbox shown where it went, and stops saying so: its
+    /// notice, still showing, doesn't move it back either.
+    pub(crate) fn keep_last_batch(&mut self) {
+        if let Showing::Mailbox { account, name } = &self.showing {
+            let to = (account.clone(), name.clone());
+            self.batches.remove(&to);
+            if self.autosort_tally.as_ref().is_some_and(|t| t.to == to) {
+                self.autosort_tally = None;
+            }
+        }
+        self.returned_here.clear();
+    }
+
+    /// Forgets the messages moved back out of a mailbox once its review is over: nothing left
+    /// to review there, nor on its way back.
+    fn prune_returned(&mut self) {
+        let over: Vec<bool> = self
+            .returned_here
+            .iter()
+            .map(|(_, m)| {
+                !self.batch_pending(&m.account, &m.mailbox)
+                    && !self.returned_here.iter().any(|(_, o)| {
+                        o.account == m.account && o.mailbox == m.mailbox && self.is_moving(o)
+                    })
+            })
+            .collect();
+        let mut over = over.into_iter();
+        self.returned_here.retain(|_| !over.next().unwrap_or(false));
+    }
+
+    /// The rows the list shows, in turn: each message listed, and, reviewing what autosort
+    /// moved to the mailbox shown, each moved back out meanwhile, in the place its row had, so
+    /// the rows after it stay where the pointer last found them.
+    pub(crate) fn list_rows(&self) -> Vec<ListRow<'_>> {
+        let here = match &self.showing {
+            Showing::Mailbox { account, name } if !self.search.is_active() => {
+                Some((account.as_str(), name.as_str()))
+            }
+            _ => None,
+        };
+        // Kept while there's still something to review, or a return on its way; then cleared,
+        // the review over.
+        let held = here.is_some_and(|(a, b)| self.batch_pending(a, b))
+            || self.returned_here.iter().any(|(_, m)| self.is_moving(m));
+        let mut returned: Vec<&(usize, StoredMessage)> = self
+            .returned_here
+            .iter()
+            .filter(|(_, m)| held && here == Some((m.account.as_str(), m.mailbox.as_str())))
+            .collect();
+        returned.sort_by_key(|(slot, _)| *slot);
+        let is_returned = |m: &StoredMessage| {
+            returned.iter().any(|(_, r)| {
+                r.account == m.account
+                    && r.mailbox == m.mailbox
+                    && r.envelope.message_id.is_some()
+                    && r.envelope.message_id == m.envelope.message_id
+            })
+        };
+        let mut rows = Vec::with_capacity(self.messages.len() + returned.len());
+        let mut next = returned.iter().peekable();
+        for m in self.messages.iter().filter(|m| !is_returned(m)) {
+            while let Some((_, r)) = next.next_if(|(slot, _)| *slot <= rows.len()) {
+                rows.push(ListRow::Returned(r));
+            }
+            rows.push(ListRow::Message(m));
+        }
+        rows.extend(next.map(|(_, r)| ListRow::Returned(r)));
+        rows
+    }
+
+    /// Closes what asks to be confirmed, leaving things as they were.
+    pub(crate) fn close_asking(&mut self) {
+        self.asking = None;
+        // Rows under a pointer that didn't move, once the dialog is gone, aren't hovered.
+        self.hover_quiet_until = Some(Instant::now() + HOVER_QUIET);
+        self.hovered_row = None;
+    }
+
+    /// Opens or closes the settings' menu of mailboxes to autosort to.
+    pub(crate) fn toggle_autosort_pick(&mut self) {
+        self.asking = if self.asking == Some(Asking::AutosortPick) {
+            None
+        } else {
+            Some(Asking::AutosortPick)
+        };
+    }
+
+    /// The mailboxes mail could be autosorted to but isn't, by account, name and label.
+    pub(crate) fn autosort_candidates(&self) -> Vec<(String, String, String)> {
+        let mut all = Vec::new();
+        for account in &self.accounts {
+            for m in self.mailboxes.get(&account.id).into_iter().flatten() {
+                if postden_app::is_filed_in(&m.name, m.role)
+                    && !self.autosorts_to(&account.id, &m.name)
+                {
+                    all.push((account.id.clone(), m.name.clone(), m.label()));
+                }
+            }
+        }
+        all
+    }
+
+    /// Asks, in the settings, whether to forget what sorting learned.
+    pub(crate) fn ask_forget_sorting(&mut self) {
+        self.asking = Some(Asking::ForgetSorting);
+    }
+
     /// Reads which mailboxes, besides the inboxes, are downloaded ahead.
     fn load_prefetch_mailboxes(&mut self) {
         let Ok(services) = &self.services else { return };
@@ -3651,6 +4732,9 @@ impl Mail {
             .find_message(from)
             .and_then(|m| m.envelope.message_id.clone())
             .filter(|id| postden_app::is_searchable(id));
+        // Named from the start: still on its way when something else is done, it goes back in
+        // turn under its own name.
+        let subject = self.undo_name(from);
         self.did(message_id.map(|message_id| Undo::Moved {
             from: from.clone(),
             to: to.to_owned(),
@@ -3658,23 +4742,54 @@ impl Mail {
             snoozed,
             done: false,
         }));
+        self.undo_subject = subject;
+    }
+
+    /// How Undo names what was done to the message `key` names: by who sent it and what it's
+    /// about.
+    fn undo_name(&self, key: &MessageKey) -> Option<String> {
+        let m = self.find_message(key)?;
+        Some(format!(
+            "{} · {}",
+            m.envelope.from.label(),
+            subject_of(&m.envelope)
+        ))
     }
 
     /// The server answered the move of the message `key` named: moved, Z can move it back; not,
     /// there's nothing to undo. Returns whether Z undoes it.
     pub(crate) fn moved_for_undo(&mut self, key: &MessageKey, moved: bool) -> bool {
-        let Some(Undo::Moved { from, done, .. }) = &mut self.undo else {
-            return false;
-        };
-        if from != key {
-            return false;
+        let current = self.settle_pending(
+            |u| matches!(u, Undo::Moved { from, .. } if from == key),
+            moved,
+        );
+        current && moved
+    }
+
+    /// The server answered what the undo `is_it` finds undoes, whether Z undoes it next or after
+    /// others: done (`ok`), it can be undone; refused, there's nothing to undo, and Z goes on to
+    /// what was done before. Whether it's the one Z undoes next.
+    fn settle_pending(&mut self, is_it: impl Fn(&Undo) -> bool, ok: bool) -> bool {
+        if let Some(undo) = self.undo.as_mut().filter(|u| is_it(u)) {
+            if ok {
+                undo.settle();
+            } else {
+                self.undo = None;
+                self.undo_the_one_before();
+            }
+            return true;
         }
-        if moved {
-            *done = true;
-        } else {
-            self.undo = None;
+        let pending = |u: &Undo| matches!(u, Undo::Moved { done: false, .. }) && is_it(u);
+        if let Some(at) = self.undo_history.iter().position(|(u, _)| pending(u)) {
+            if ok {
+                if let Some((undo, _)) = self.undo_history.get_mut(at) {
+                    undo.settle();
+                }
+            } else {
+                self.undo_history.remove(at);
+            }
         }
-        moved
+        false
     }
 
     /// Whether a message moved from `account`'s mailbox `mailbox` to `to` can't be moved back yet,
@@ -3692,6 +4807,19 @@ impl Mail {
             return true;
         }
         false
+    }
+
+    /// Whether `account`'s message `message_id` is still on its way back from an undo, said in a
+    /// notice: undoing what was done to it before waits until it's there.
+    fn still_returning(&mut self, account: &str, message_id: &str) -> bool {
+        let returning = self
+            .leaving
+            .iter()
+            .any(|r| r.account == account && r.message_id == message_id);
+        if returning {
+            self.notify("Still moving the message back; undo once it's back".into());
+        }
+        returning
     }
 
     /// Undoes the last thing done to a message, as Z does: moves it back, marks it read or unread
@@ -3715,8 +4843,14 @@ impl Mail {
                 done: true,
             } => {
                 let (account, mailbox, _) = &from;
-                if self.restore_waits(account, mailbox, &to) {
+                if self.restore_waits(account, mailbox, &to)
+                    || self.still_returning(account, &message_id)
+                {
                     return;
+                }
+                if let Some(was) = self.tags.get(&from).and_then(|t| t.suggested.clone()) {
+                    self.restored_suggestions
+                        .insert((account.clone(), message_id.clone()), (from.clone(), was));
                 }
                 // Back in the inbox by hand, it's there to be seen, not autosorted away again.
                 let to_inbox = self
@@ -3742,6 +4876,10 @@ impl Mail {
                     return;
                 }
                 self.undoing.extend(self.undo.take());
+                let subject = self.undo_subject.take();
+                self.undone_subjects
+                    .insert((account.clone(), message_id.clone()), subject);
+                self.undo_the_one_before();
                 self.leaving.push(Restoring {
                     account: account.clone(),
                     mailbox: to,
@@ -3768,30 +4906,30 @@ impl Mail {
                 uid_validity,
                 seen,
                 ..
-            } => {
-                if self.still_saving(&message, false) {
-                    return;
-                }
-                self.undo = None;
-                if self.still_there(&message, uid_validity) {
-                    let (account, mailbox, uid) = (&message.0, &message.1, message.2);
-                    self.set_seen(account, mailbox, uid, seen, Some(uid_validity));
-                }
-            }
+            } => self.undo_mark(&message, uid_validity, false, seen),
             Undo::Flagged {
                 message,
                 uid_validity,
                 flagged,
                 ..
-            } => {
-                if self.still_saving(&message, true) {
-                    return;
-                }
-                self.undo = None;
-                if self.still_there(&message, uid_validity) {
-                    let (account, mailbox, uid) = (&message.0, &message.1, message.2);
-                    self.set_flagged(account, mailbox, uid, flagged, Some(uid_validity));
-                }
+            } => self.undo_mark(&message, uid_validity, true, flagged),
+        }
+    }
+
+    /// Marks `message` read or unread again, or with `star` stars it or takes its star away, as
+    /// `was`, undoing that; then Z goes on to the move done before, if there was one.
+    fn undo_mark(&mut self, message: &MessageKey, uid_validity: u32, star: bool, was: bool) {
+        if self.still_saving(message, star) {
+            return;
+        }
+        self.undo = None;
+        self.undo_the_one_before();
+        if self.still_there(message, uid_validity) {
+            let (account, mailbox, uid) = (&message.0, &message.1, message.2);
+            if star {
+                self.set_flagged(account, mailbox, uid, was, Some(uid_validity));
+            } else {
+                self.set_seen(account, mailbox, uid, was, Some(uid_validity));
             }
         }
     }
@@ -3932,9 +5070,41 @@ impl Mail {
                         && *message_id == back.message_id)
             })
             .next();
+        // Moved back by hand from where autosort put it, Z puts it there again once it's back.
+        self.settle_pending(
+            |u| {
+                matches!(u, Undo::Moved { from, to, message_id, done: false, .. }
+                    if from.0 == back.account && from.1 == mailbox && *to == back.mailbox
+                        && *message_id == back.message_id)
+            },
+            matches!(result, Ok(true)),
+        );
+        let id = (back.account.clone(), back.message_id.clone());
+        let review = self.returns_reviewed.remove(&id);
+        let undone_subject = self.undone_subjects.remove(&id).flatten();
+        // Of several autosort moved coming back, one that won't isn't waited for, nor counted.
+        if review.is_some() && !matches!(result, Ok(true)) {
+            self.batch_back = self
+                .batch_back
+                .take()
+                .and_then(|(left, n, label)| (left > 1).then(|| (left - 1, n - 1, label)));
+        }
+        if result.is_ok() {
+            // Put back where autosort had it, by undoing its return, it's listed as it is.
+            self.returned_here.retain(|(_, m)| {
+                !(m.account == back.account
+                    && m.mailbox == back.mailbox
+                    && m.envelope.message_id.as_ref() == Some(&back.message_id))
+            });
+        }
         let to = self.mailbox_label(account, &back.mailbox);
         let from = self.mailbox_label(account, mailbox);
+        // Back in an inbox, it's said once it's listed there again (`inbox_mail`), not before;
+        // and listed already, it was said then.
+        let listed_already = self.returned.extract_if(.., |r| r == back).next().is_some();
+        let listed_later = listed_already || self.returning.contains(back);
         match result {
+            Ok(true) if listed_later => {}
             Ok(true) => self.notify(format!("Moved back to {to}")),
             Ok(false) => {
                 self.forget_restoring(back);
@@ -3942,9 +5112,18 @@ impl Mail {
             }
             Err(error) => {
                 self.forget_restoring(back);
-                // Z tries again, unless something else was done since.
-                if self.undo.is_none() {
-                    self.undo = undone;
+                // Z tries again, unless something else was done since: before what it went on
+                // to, which it undoes after.
+                if let Some(undone) = undone {
+                    if let Some(next) = self.undo.take() {
+                        let subject = self.undo_subject.take();
+                        self.undo_history.push((next, subject));
+                    }
+                    self.undo = Some(undone);
+                    self.undo_subject = undone_subject;
+                }
+                if let Some(entry) = review {
+                    self.review_again(entry);
                 }
                 let label = self.label(account).to_owned();
                 self.notify(format!(
@@ -3953,6 +5132,22 @@ impl Mail {
             }
         }
         self.reload();
+    }
+
+    /// What a message moved back, now listed, is about, and with `sender` who sent it, to say
+    /// which it was.
+    fn listed_subject(&self, back: &Restoring, sender: bool) -> Option<String> {
+        let m = self.messages.iter().find(|m| {
+            m.account == back.account
+                && m.mailbox == back.mailbox
+                && m.envelope.message_id.as_ref() == Some(&back.message_id)
+        })?;
+        let subject = subject_of(&m.envelope);
+        Some(if sender {
+            format!("{} · {subject}", m.envelope.from.label())
+        } else {
+            subject
+        })
     }
 
     /// Forgets a message being moved back, which won't arrive.
@@ -3992,6 +5187,12 @@ impl Mail {
         let key = message_key(message);
         if self.moving_back(&key) {
             return;
+        }
+        // Under review where autosort put it, snoozed it's been looked at.
+        if let Some(id) = message.envelope.message_id.as_ref()
+            && self.in_last_batch(message)
+        {
+            self.moving_reviewed.insert(key.clone(), id.clone());
         }
         let to = self
             .mailbox_with_role(account, Role::Snoozed)
@@ -4059,6 +5260,12 @@ impl Mail {
         let (account, mailbox) = (account.as_str(), mailbox.as_str());
         let key = (account.to_owned(), mailbox.to_owned(), uid);
         self.moving.remove(&key);
+        let subject = self.moving_subjects.remove(&key);
+        if let Some(id) = self.moving_reviewed.remove(&key)
+            && result.is_ok()
+        {
+            self.reviewed(account, mailbox, &id);
+        }
         let undoable = self.moved_for_undo(&key, result.is_ok());
         match result {
             Ok(current) => {
@@ -4066,11 +5273,14 @@ impl Mail {
                     self.search.forget_message(account, mailbox, uid);
                 }
                 let until = Timestamp::from_second(until).unwrap_or_default();
-                self.notify(format!(
-                    "Snoozed until {}{}",
-                    postden_app::format_snooze(until, &ZonedDateTime::now()),
-                    undo_hint(undoable)
-                ));
+                self.notify_with(
+                    format!(
+                        "Snoozed until {}",
+                        postden_app::format_snooze(until, &ZonedDateTime::now()),
+                    ),
+                    subject,
+                    undoable.then_some(NoticeAction::Undo),
+                );
             }
             Err(error) => {
                 let label = self.label(account).to_owned();
@@ -4119,6 +5329,54 @@ impl Mail {
                 .get(account)
                 .and_then(|list| list.iter().find(|m| m.name == *name))
                 .is_some_and(|m| m.role == Role::Sent),
+            Showing::Everything => false,
+        }
+    }
+
+    /// Says what came back to `target`'s inbox, `back`, by undoing or from where autosort put
+    /// it: `settled`, the batch it was the last of, if any.
+    fn notify_back(
+        &mut self,
+        settled: Option<(usize, usize, String)>,
+        back: &[Restoring],
+        target: &Target,
+    ) {
+        let to = self.mailbox_label(&target.account, &target.mailbox);
+        match settled {
+            // One alone is named; several are counted.
+            Some((_, 1, autosorted_to)) => {
+                // The rule's state in the title, which isn't cut short; the message after it.
+                // That autosort leaves it be, as moved back by hand, with which one it is.
+                // That it stays first, where it's never cut short; which one, and the rule,
+                // after.
+                // Z, or its button, puts it back where autosort had: kept named for the menu.
+                let first = back.first();
+                let which = first.and_then(|r| self.listed_subject(r, false));
+                // Only while Z still undoes this return, not something done after.
+                let undo = matches!((&self.undo, first), (Some(Undo::Moved { from, to, message_id, .. }), Some(r))
+                    if from.0 == r.account && *to == target.mailbox && *message_id == r.message_id)
+                .then_some(NoticeAction::Undo);
+                // Which message first; what that means for autosort after it.
+                let rule = format!("{autosorted_to} autosort skips it, still on");
+                let detail =
+                    which.map_or_else(|| rule.clone(), |subject| format!("{subject} · {rule}"));
+                self.notify_with(format!("Back in {to}"), Some(detail), undo);
+            }
+            Some((_, n, autosorted_to)) => {
+                self.notify_with(
+                    format!("Moved {n} messages back to {to}"),
+                    Some(format!(
+                        "They stay there. Autosort is still on for new mail to {autosorted_to}"
+                    )),
+                    None,
+                );
+            }
+            // Which one, as the move it undoes said.
+            None => {
+                // An Undo here would read as undoing this, not the move before it Z undoes.
+                let detail = back.first().and_then(|r| self.listed_subject(r, true));
+                self.notify_with(format!("Moved back to {to}"), detail, None);
+            }
         }
     }
 
@@ -4148,17 +5406,35 @@ impl Mail {
                 .any(|r| e.message_id.as_ref() == Some(&r.message_id))
         });
         let count = count.saturating_sub(back.len());
+        self.returned.extend(back.iter().cloned());
         self.reload();
-        if !back.is_empty() && count == 0 && !first_sync {
-            return;
+        if !back.is_empty() && !first_sync {
+            // What came back is counted off its batch, said or not: with new mail, that's said.
+            match self.batch_back.take() {
+                // Some of the batch are still on their way: the notice waits for them.
+                Some((left, n, autosorted_to)) if left > back.len() => {
+                    self.batch_back = Some((left - back.len(), n, autosorted_to));
+                }
+                settled if count == 0 => self.notify_back(settled, &back, &target),
+                _ => {}
+            }
+            if count == 0 {
+                return;
+            }
         }
         let label = self.label(&target.account).to_owned();
-        self.notify(postden_app::mail_notice(
-            &label,
-            count,
-            first_sync,
-            &ZonedDateTime::now(),
-        ));
+        // One message, it's told of by who sent it and what it's about, and opens from there.
+        if let ([only], 1, false) = (unread.as_slice(), count, first_sync) {
+            let key = (target.account.clone(), target.mailbox.clone(), only.uid);
+            self.announce_arrival(
+                format!("New from {}", only.from.label()),
+                subject_of(only),
+                key,
+            );
+        } else {
+            let notice = postden_app::mail_notice(&label, count, first_sync, &ZonedDateTime::now());
+            self.notify_news(notice, None, Vec::new());
+        }
         self.announce(&label, target, &unread);
     }
 
@@ -4358,6 +5634,10 @@ impl Mail {
     /// Lists `showing`. A mailbox other than an inbox is also refreshed from the server, as those
     /// are otherwise only synced every few minutes.
     pub(crate) fn show(&mut self, showing: Showing) {
+        // What the pointer was over isn't under it in what shows next, and the rows drawn
+        // under a pointer that didn't move aren't hovered either.
+        self.hovered_row = None;
+        self.hover_quiet_until = Some(Instant::now() + HOVER_QUIET);
         self.form.open = false;
         self.settings_open = false;
         self.leave_reader();
@@ -4381,8 +5661,9 @@ impl Mail {
     fn switch_list(&mut self, showing: Showing) {
         // A message being moved back no longer takes the cursor once it's listed.
         self.restoring = None;
-        // A search goes on in the mailbox now shown, unless it looks through every inbox.
-        if !self.search.everywhere {
+        // A search goes on in the mailbox now shown, unless it looks through every inbox or all
+        // mail.
+        if !self.search.everywhere && !self.search.all_mail {
             self.search.forget_server();
         }
         let grouped = match &showing {
@@ -4391,9 +5672,10 @@ impl Mail {
                 name.clone(),
                 self.in_open_group(account, name),
             )),
-            Showing::All(_) => None,
+            Showing::All(_) | Showing::Everything => None,
         };
         self.showing = showing;
+        self.returned_here.clear();
         if let Some((account, name, grouped)) = grouped {
             self.hold(&account, &name, grouped);
         }
@@ -4466,6 +5748,8 @@ impl Mail {
                     .mailbox_for_role(&a.id, *role)
                     .is_ok_and(|found| found.is_some_and(|(name, _)| searched(&a.id, &name)))
             }),
+            // Only searched, never listed whole.
+            Showing::Everything => true,
         }
     }
 
@@ -4487,6 +5771,15 @@ impl Mail {
                 .filter_map(|a| {
                     let found = services.store.mailbox_for_role(&a.id, *role).ok()??;
                     Some((a.id.clone(), found.0))
+                })
+                .collect(),
+            // Every mailbox synced, as the cache holds mail of no other.
+            Showing::Everything => self
+                .accounts
+                .iter()
+                .flat_map(|a| {
+                    let synced = services.store.mailboxes(&a.id).unwrap_or_default();
+                    synced.into_iter().map(|m| (a.id.clone(), m.name))
                 })
                 .collect(),
         }
@@ -4977,6 +6270,10 @@ impl Mail {
     }
 
     pub(crate) fn close_settings(&mut self) {
+        // What the pointer was over isn't under it in what shows next, and the rows drawn
+        // under a pointer that didn't move aren't hovered either.
+        self.hovered_row = None;
+        self.hover_quiet_until = Some(Instant::now() + HOVER_QUIET);
         self.settings_open = false;
         self.confirm_remove = None;
         self.cancel_transfer();
@@ -5360,7 +6657,7 @@ impl Mail {
         }
         // What sorting learned may have been replaced, and the accounts it learns of changed.
         if imported.sorting == Some(Ok(())) {
-            self.tags.clear();
+            self.forget_tags();
         }
         // An account replaced by one on another server autosorts nowhere anymore, nor downloads
         // ahead but its inbox.
@@ -5749,10 +7046,10 @@ impl Mail {
         }
         self.settings.sort_mail = on;
         self.save_settings();
+        self.forget_tags();
         let (Ok(services), Some(handle)) = (&mut self.services, &self.handle) else {
             return;
         };
-        self.tags.clear();
         // What a pass under way learns once it's off isn't saved.
         if !on && let Err(e) = services.store.renew_sorting() {
             self.notify(format!("couldn't stop sorting mail: {e}"));
@@ -5771,12 +7068,13 @@ impl Mail {
     /// Forgets everything sorting learned, and takes the tags away: it learns again from the
     /// mail cached.
     pub(crate) fn forget_sorting(&mut self) {
+        self.asking = None;
         let Ok(services) = &mut self.services else {
             return;
         };
         match services.store.forget_sorting() {
             Ok(()) => {
-                self.tags.clear();
+                self.forget_tags();
                 self.sort_mail();
                 self.notify("Forgot what sorting learned".to_owned());
             }
@@ -6071,6 +7369,7 @@ impl Mail {
         if self.undo.as_ref().is_some_and(|u| u.account() == id) {
             self.undo = None;
         }
+        self.undo_history.retain(|(u, _)| u.account() != id);
         self.undoing.retain(|u| u.account() != id);
         self.unanswered.retain(|(key, _), _| key.0 != id);
         self.read_later.retain(|key, _| key.0 != id);
@@ -6093,6 +7392,28 @@ impl Mail {
             self.moving.remove(&key);
         }
         self.returning.retain(|r| r.account != id);
+        // Nor is anything autosort moved there to be reviewed or moved back any more.
+        self.batches.retain(|(account, _), _| account != id);
+        self.returns_reviewed
+            .retain(|(account, _), _| account != id);
+        self.returned_here.retain(|(_, m)| m.account != id);
+        self.moving_reviewed.retain(|key, _| key.0 != id);
+        self.undone_subjects.retain(|(account, _), _| account != id);
+        self.kept_from_autosort
+            .retain(|(account, _), _| account != id);
+        self.restored_suggestions
+            .retain(|(account, _), _| account != id);
+        self.fresh_suggestions.retain(|key, _| key.0 != id);
+        if self.autosort_tally.as_ref().is_some_and(|t| t.to.0 == id) {
+            self.autosort_tally = None;
+        }
+        for action in &mut self.notice_actions {
+            if let NoticeAction::MoveBack(moved) = action {
+                moved.retain(|(from, _, _)| from.0 != id);
+            }
+        }
+        self.notice_actions
+            .retain(|a| !matches!(a, NoticeAction::MoveBack(moved) if moved.is_empty()));
         if self.restoring.as_ref().is_some_and(|r| r.account == id) {
             self.restoring = None;
         }
@@ -6359,7 +7680,7 @@ mod tests {
         s.unread.remove(&(me.into(), "Lists".into()));
         assert_eq!(listed(&s).0, ["INBOX", "Lists"]);
         // Its menu open, it stays too; left, it goes to the group.
-        s.open_mailbox_menu(me, "Lists", PointerPress { x: 0.0, y: 0.0 });
+        s.open_mailbox_menu(me, "Lists", Some(PointerPress { x: 0.0, y: 0.0 }));
         show(&mut s, "Archive");
         assert_eq!(listed(&s).0, ["INBOX", "Lists"], "menu still open");
         s.close_mailbox_menu();
@@ -7228,6 +8549,7 @@ mod tests {
             markdown: None,
             uid_validity: Some(1),
             seen_before: true,
+            waited: false,
         });
         s.leaving = vec![Restoring {
             account: "ada@example.com".into(),
@@ -7334,6 +8656,7 @@ mod tests {
             markdown: None,
             uid_validity: Some(1),
             seen_before: seen,
+            waited: false,
         });
     }
 
@@ -7531,12 +8854,12 @@ mod tests {
         assert_eq!(s.undo, Some(moved(1, "a@example.com")));
         // Something else done meanwhile is what Z undoes then.
         s.undoing = vec![moved(1, "a@example.com")];
-        s.undo = Some(Undo::Seen {
+        s.did(Some(Undo::Seen {
             message: ada(2),
             uid_validity: 1,
             seen: true,
             done: true,
-        });
+        }));
         s.restored(
             &back("a@example.com"),
             "Archive",
@@ -8457,6 +9780,136 @@ mod tests {
     }
 
     #[test]
+    fn a_search_of_all_mail_finds_mail_filed_out_of_the_inbox() {
+        let (_dir, mut s) = synced("search-all-mail", &[hello(1, false)]);
+        if let Ok(services) = &mut s.services {
+            services
+                .store
+                .save_messages(
+                    "ada@example.com",
+                    "Receipts",
+                    Role::Other,
+                    1,
+                    &[hello(5, true)],
+                )
+                .unwrap();
+        }
+        s.search.query = TextEdit::new("hello");
+        s.search_changed();
+        assert_eq!(uids(&s), [1], "the inboxes alone");
+        s.search_within(false, true);
+        assert_eq!(uids(&s), [5, 1], "every mailbox");
+        assert_eq!(s.search.query.text, "hello", "the query stays");
+        s.clear_search();
+        assert_eq!(uids(&s), [1], "the list shows the inboxes again");
+    }
+
+    #[test]
+    fn a_search_finds_downloaded_text_on_this_computer() {
+        let (_dir, mut s) = synced("search-text", &[hello(1, false), hello(2, false)]);
+        if let Ok(services) = &s.services {
+            let body = Body {
+                text: "Keep this receipt for your records.".into(),
+                ..Default::default()
+            };
+            services
+                .store
+                .save_body("ada@example.com", INBOX, 2, &body, true)
+                .unwrap();
+        }
+        s.search.query = TextEdit::new("receipt");
+        s.search_changed();
+        assert_eq!(uids(&s), [2], "found by its text, without the server");
+        assert!(!s.search.asked_server());
+        assert!(
+            s.excerpt(&s.messages[0], "receipt")
+                .is_some_and(|e| e.contains("receipt")),
+            "and says where"
+        );
+    }
+
+    #[test]
+    fn return_in_search_stays_on_this_computer() {
+        let (_dir, mut s) = synced("search-return", &[hello(1, false)]);
+        s.search.query = TextEdit::new("hello");
+        s.search_changed();
+        s.search_submitted(&mut Tx::default());
+        assert!(s.search.all_mail, "all mail on this computer first");
+        s.search_submitted(&mut Tx::default());
+        assert!(!s.search.asked_server(), "the server only by its button");
+        assert_eq!(
+            s.cursor,
+            Some(("ada@example.com".into(), INBOX.into(), 1)),
+            "then the first result"
+        );
+    }
+
+    #[test]
+    fn messages_autosorted_together_are_told_of_together() {
+        let inbox = [hello(1, false), hello(2, false), hello(3, false)];
+        let (_dir, mut s) = synced("autosort-tally", &inbox);
+        let account = "ada@example.com";
+        for uid in 1..=3 {
+            let id = format!("{uid}@example.com");
+            let store = &s.services.as_ref().unwrap().store;
+            assert!(store.note_autosorted(account, &id, "Receipts").unwrap());
+            s.autosorting
+                .insert((account.into(), INBOX.into(), uid), id);
+        }
+        s.moved(account, INBOX, 1, "Receipts", Ok(true));
+        assert_eq!(
+            s.notice.as_deref(),
+            Some("Autosorted 1 message to Receipts")
+        );
+        s.moved(account, INBOX, 2, "Receipts", Ok(true));
+        s.moved(account, INBOX, 3, "Receipts", Ok(true));
+        assert_eq!(
+            s.notice.as_deref(),
+            Some("Autosorted 3 messages to Receipts")
+        );
+        // Once its notice is gone, the next is counted afresh.
+        s.notify("something else".into());
+        s.autosorting
+            .insert((account.into(), INBOX.into(), 9), "9@example.com".into());
+        s.moved(account, INBOX, 9, "Receipts", Ok(true));
+        assert_eq!(
+            s.notice.as_deref(),
+            Some("Autosorted 1 message to Receipts")
+        );
+    }
+
+    #[test]
+    fn an_arrival_is_told_of_in_the_toolbar_whatever_the_bar_shows() {
+        let mut s = Mail::not_started();
+        s.notify_with("Moved to Trash".into(), None, [NoticeAction::Undo]);
+        s.announce_arrival(
+            "New from Hana".into(),
+            "Signed contract".into(),
+            ("ada@example.com".into(), INBOX.into(), 7),
+        );
+        assert_eq!(s.notice.as_deref(), Some("Moved to Trash"), "Undo stays");
+        assert_eq!(s.arrival(), Some(("New from Hana", "Signed contract")));
+    }
+
+    #[test]
+    fn a_move_by_hand_names_the_message_and_offers_undo() {
+        let (_dir, mut s) = synced("move-notice", &[hello(1, false)]);
+        s.moving_subjects
+            .insert(("ada@example.com".into(), INBOX.into(), 1), "Hello".into());
+        s.undo = Some(Undo::Moved {
+            from: ("ada@example.com".into(), INBOX.into(), 1),
+            to: "Archive".into(),
+            message_id: "1@example.com".into(),
+            snoozed: None,
+            done: false,
+        });
+        s.moved("ada@example.com", INBOX, 1, "Archive", Ok(true));
+        assert_eq!(s.notice.as_deref(), Some("Moved to Archive"));
+        assert_eq!(s.notice_detail.as_deref(), Some("Hello"));
+        assert_eq!(s.notice_actions, [NoticeAction::Undo]);
+    }
+
+    #[test]
     fn an_older_read_mark_refused_doesnt_bring_back_one_marked_anew() {
         let (_dir, mut s) = synced("unread-old-refused", &[hello(1, false), hello(3, false)]);
         s.set_unread_only(true);
@@ -8561,6 +10014,107 @@ mod tests {
     }
 
     #[test]
+    fn autosort_for_new_mail_only_keeps_the_whole_inbox_whatever_is_shown() {
+        let now = Timestamp::now().as_second();
+        let mut inbox = [hello(1, false), hello(2, false)];
+        for e in &mut inbox {
+            e.date = Some(now - 60);
+            e.message_id = Some(format!("{}@example.com", e.uid));
+        }
+        let (_dir, mut s) = synced("autosort-new-only", &inbox);
+        let account = "ada@example.com";
+        autosorting_to_receipts(&mut s, Role::Other);
+        s.set_autosort(account, "Receipts", false);
+        s.reload();
+        // Sorting's last pass suggests one of them goes there.
+        s.fresh_suggestions
+            .insert((account.into(), INBOX.into(), 1), "Receipts".into());
+        // Looking at Receipts, the inbox isn't listed.
+        s.showing = Showing::Mailbox {
+            account: account.into(),
+            name: "Receipts".into(),
+        };
+        s.reload();
+        s.toggle_autosort(account, "Receipts");
+        assert_eq!(s.autosort_preview(), ["hello".to_owned()]);
+        s.confirm_autosort_new_only();
+        for id in ["1@example.com", "2@example.com"] {
+            assert_eq!(autosorted_noted(&s, id), Some(AutosortState::Kept), "{id}");
+        }
+    }
+
+    #[test]
+    fn turning_sorting_off_forgets_suggestions_undo_would_put_back() {
+        let (_dir, mut s) = synced("restored-off", &[hello(1, false)]);
+        let from: MessageKey = ("ada@example.com".into(), INBOX.into(), 1);
+        s.restored_suggestions.insert(
+            ("ada@example.com".into(), "1@example.com".into()),
+            (from, "Receipts".into()),
+        );
+        s.set_sort_mail(false);
+        assert!(s.restored_suggestions.is_empty());
+    }
+
+    #[test]
+    fn a_row_moved_back_keeps_its_place_until_the_review_ends() {
+        let receipts: Vec<Envelope> = (1..=3)
+            .map(|uid| {
+                let mut e = hello(uid, false);
+                e.message_id = Some(format!("{uid}@example.com"));
+                e
+            })
+            .collect();
+        let (_dir, mut s) = synced("returned-in-place", &[]);
+        let account = "ada@example.com";
+        let store = &mut s.services.as_mut().unwrap().store;
+        store
+            .save_messages(account, "Receipts", Role::Other, 1, &receipts)
+            .unwrap();
+        s.showing = Showing::Mailbox {
+            account: account.into(),
+            name: "Receipts".into(),
+        };
+        s.reload();
+        let to: MailboxKey = (account.into(), "Receipts".into());
+        let moved = (1..=3)
+            .map(|uid| {
+                let from = (account.into(), INBOX.into(), uid);
+                (from, "Receipts".into(), format!("{uid}@example.com"))
+            })
+            .collect();
+        s.batches.insert(
+            to.clone(),
+            AutosortTally {
+                to,
+                moved,
+                subjects: Vec::new(),
+                just_on: false,
+                notice: 0,
+            },
+        );
+        let uids = |s: &Mail| -> Vec<(bool, u32)> {
+            s.list_rows()
+                .iter()
+                .map(|r| match r {
+                    ListRow::Message(m) => (false, m.envelope.uid),
+                    ListRow::Returned(m) => (true, m.envelope.uid),
+                })
+                .collect()
+        };
+        let before = uids(&s);
+        let middle = s.messages[1].clone();
+        s.reviewed(account, "Receipts", "2@example.com");
+        s.returned_here.push((1, middle.clone()));
+        // Still listed while it's on its way, its row is said to be moving, where it was.
+        let mut expected = before;
+        expected[1].0 = true;
+        assert_eq!(uids(&s), expected);
+        // Gone from here, its place stays.
+        s.messages.retain(|m| m.envelope.uid != middle.envelope.uid);
+        assert_eq!(uids(&s), expected);
+    }
+
+    #[test]
     fn mail_is_autosorted_only_to_a_mailbox_chosen_and_tried_once() {
         let (_dir, mut s) = synced("autosort", &[hello(1, false), hello(2, false)]);
         let account = "ada@example.com";
@@ -8648,6 +10202,451 @@ mod tests {
         assert_eq!(
             autosorted_noted(&s, "1@example.com"),
             Some(AutosortState::Kept)
+        );
+    }
+
+    #[test]
+    fn mail_moved_back_from_autosort_is_kept_there_only_for_its_own_account() {
+        let (_dir, mut s) = synced("autosort-kept", &[hello(1, false), hello(2, false)]);
+        s.kept_from_autosort.insert(
+            ("ada@example.com".into(), "1@example.com".into()),
+            "Receipts".into(),
+        );
+        let mut e = hello(7, false);
+        e.message_id = Some("1@example.com".into());
+        assert_eq!(
+            s.kept_from_autosort("ada@example.com", &e),
+            Some("Receipts")
+        );
+        // The same message delivered to another account isn't kept there.
+        assert_eq!(s.kept_from_autosort("bob@example.com", &e), None);
+    }
+
+    /// What autosort moved to Receipts, of `ada@example.com`'s inbox message 1, and the copy of
+    /// it there, as UID 9.
+    fn autosorted_to_receipts(s: &mut Mail) -> StoredMessage {
+        let to: MailboxKey = ("ada@example.com".into(), "Receipts".into());
+        s.batches.insert(
+            to.clone(),
+            AutosortTally {
+                to,
+                moved: vec![(
+                    ("ada@example.com".into(), INBOX.into(), 1),
+                    "Receipts".into(),
+                    "1@example.com".into(),
+                )],
+                subjects: vec!["Hello".into()],
+                just_on: false,
+                notice: 0,
+            },
+        );
+        let mut m = s.messages[0].clone();
+        m.mailbox = "Receipts".into();
+        m.envelope.uid = 9;
+        m.envelope.message_id = Some("1@example.com".into());
+        m
+    }
+
+    #[test]
+    fn a_return_the_server_cant_be_asked_for_stays_to_be_reviewed() {
+        let (_dir, mut s) = synced(
+            "autosort-return-refused",
+            &[hello(1, false), hello(2, false)],
+        );
+        let m = autosorted_to_receipts(&mut s);
+        // Not watched here, the account's server can't be asked to move it.
+        s.move_back_one(&m);
+        assert!(s.in_last_batch(&m), "still to be reviewed");
+        assert!(s.returned_here.is_empty(), "nor said to be moving");
+        assert_eq!(s.undo, None, "nor undoable");
+        assert_eq!(s.kept_from_autosort("ada@example.com", &m.envelope), None);
+    }
+
+    #[test]
+    fn a_return_is_undoable_once_its_back() {
+        let (_dir, mut s) = synced("autosort-return-undo", &[hello(1, false), hello(2, false)]);
+        let back = |done| Undo::Moved {
+            from: ("ada@example.com".into(), "Receipts".into(), 9),
+            to: INBOX.into(),
+            message_id: "1@example.com".into(),
+            snoozed: None,
+            done,
+        };
+        let returning = Restoring {
+            account: "ada@example.com".into(),
+            mailbox: INBOX.into(),
+            message_id: "1@example.com".into(),
+        };
+        s.did(Some(back(false)));
+        s.undo();
+        assert_eq!(s.undo, Some(back(false)), "Z waits until it's back");
+        s.restored(&returning, "Receipts", &[9], Ok(true));
+        assert_eq!(
+            s.undo,
+            Some(back(true)),
+            "Z puts it back where autosort had"
+        );
+        // Refused, there's nothing to undo of it.
+        s.did(Some(back(false)));
+        s.restored(&returning, "Receipts", &[9], Err("no".into()));
+        assert_ne!(s.undo, Some(back(false)));
+    }
+
+    #[test]
+    fn moving_a_message_under_review_elsewhere_ends_its_review_once_moved() {
+        let (_dir, mut s) = synced("review-archived", &[hello(1, false)]);
+        let m = autosorted_to_receipts(&mut s);
+        let key = message_key(&m);
+        s.moving_reviewed
+            .insert(key.clone(), "1@example.com".into());
+        s.moved(
+            "ada@example.com",
+            "Receipts",
+            9,
+            "Archive",
+            Err("no".into()),
+        );
+        assert!(s.in_last_batch(&m), "refused, still to review");
+        s.moving_reviewed.insert(key, "1@example.com".into());
+        s.moved("ada@example.com", "Receipts", 9, "Archive", Ok(true));
+        assert!(!s.in_last_batch(&m));
+    }
+
+    #[test]
+    fn a_move_on_its_way_keeps_its_own_name_for_undo() {
+        let (_dir, mut s) = synced("undo-names", &[hello(1, false), hello(2, false)]);
+        s.messages[1].envelope.subject = Some("Second".into());
+        s.messages[1].envelope.message_id = Some("2@example.com".into());
+        s.undo_subject = Some("First".into());
+        s.undo = Some(Undo::Moved {
+            from: ("ada@example.com".into(), INBOX.into(), 9),
+            to: "Archive".into(),
+            message_id: "9@example.com".into(),
+            snoozed: None,
+            done: true,
+        });
+        let key = message_key(&s.messages[1]);
+        s.undo_move(&key, "Archive", None);
+        assert!(
+            s.undo_subject
+                .as_deref()
+                .is_some_and(|n| n.ends_with("Second"))
+        );
+        assert_eq!(
+            s.undo_history.last().and_then(|(_, n)| n.as_deref()),
+            Some("First")
+        );
+    }
+
+    #[test]
+    fn a_return_that_failed_isnt_waited_for_by_its_batch() {
+        let (_dir, mut s) = synced("batch-back-failed", &[hello(1, false)]);
+        let m = autosorted_to_receipts(&mut s);
+        let id = ("ada@example.com".to_owned(), "1@example.com".to_owned());
+        let entry = s
+            .reviewed("ada@example.com", "Receipts", "1@example.com")
+            .unwrap();
+        s.returns_reviewed.insert(id, entry);
+        s.batch_back = Some((2, 2, "Receipts".into()));
+        let back = Restoring {
+            account: "ada@example.com".into(),
+            mailbox: INBOX.into(),
+            message_id: "1@example.com".into(),
+        };
+        s.restored(&back, "Receipts", &[], Err("refused".into()));
+        assert_eq!(s.batch_back, Some((1, 1, "Receipts".into())));
+        assert!(s.in_last_batch(&m));
+    }
+
+    #[test]
+    fn a_failed_undo_leaves_an_earlier_move_of_the_same_message_be() {
+        let (_dir, mut s) = synced("undo-same-message", &[hello(1, false)]);
+        // Inbox to Archive, then back to the inbox by hand.
+        let first = Undo::Moved {
+            from: ("ada@example.com".into(), INBOX.into(), 1),
+            to: "Archive".into(),
+            message_id: "1@example.com".into(),
+            snoozed: None,
+            done: true,
+        };
+        let second = Undo::Moved {
+            from: ("ada@example.com".into(), "Archive".into(), 4),
+            to: INBOX.into(),
+            message_id: "1@example.com".into(),
+            snoozed: None,
+            done: true,
+        };
+        s.undo_history.push((first.clone(), None));
+        s.undoing = vec![second.clone()];
+        let back = Restoring {
+            account: "ada@example.com".into(),
+            mailbox: "Archive".into(),
+            message_id: "1@example.com".into(),
+        };
+        s.restored(&back, INBOX, &[], Err("offline".into()));
+        assert_eq!(s.undo, Some(second));
+        assert_eq!(s.undo_history, vec![(first, None)]);
+    }
+
+    #[test]
+    fn rows_moved_back_are_forgotten_once_the_review_is_over() {
+        let (_dir, mut s) = synced("returned-pruned", &[hello(1, false)]);
+        let m = autosorted_to_receipts(&mut s);
+        s.returned_here.push((0, m));
+        s.reload();
+        assert!(!s.returned_here.is_empty(), "still reviewing");
+        s.batches.clear();
+        s.reload();
+        assert!(s.returned_here.is_empty(), "the next review starts afresh");
+    }
+
+    #[test]
+    fn a_failed_undo_comes_back_before_the_move_z_went_on_to() {
+        let (_dir, mut s) = synced("undo-retry", &[hello(1, false), hello(2, false)]);
+        let moved = |uid: u32| Undo::Moved {
+            from: ("ada@example.com".into(), INBOX.into(), uid),
+            to: "Archive".into(),
+            message_id: format!("{uid}@example.com"),
+            snoozed: None,
+            done: true,
+        };
+        // B being moved back, Z went on to A.
+        s.undoing = vec![moved(2)];
+        s.undo = Some(moved(1));
+        let back = Restoring {
+            account: "ada@example.com".into(),
+            mailbox: INBOX.into(),
+            message_id: "2@example.com".into(),
+        };
+        s.restored(&back, "Archive", &[], Err("offline".into()));
+        assert_eq!(s.undo, Some(moved(2)), "B again");
+        s.undo_the_one_before();
+        assert_eq!(s.undo, Some(moved(1)), "then A");
+    }
+
+    #[test]
+    fn undoing_waits_while_the_message_is_still_on_its_way_back() {
+        let (_dir, mut s) = synced("undo-chain", &[hello(1, false)]);
+        s.leaving.push(Restoring {
+            account: "ada@example.com".into(),
+            mailbox: "Trash".into(),
+            message_id: "1@example.com".into(),
+        });
+        let earlier = Undo::Moved {
+            from: ("ada@example.com".into(), INBOX.into(), 1),
+            to: "Archive".into(),
+            message_id: "1@example.com".into(),
+            snoozed: None,
+            done: true,
+        };
+        s.undo = Some(earlier.clone());
+        s.undo();
+        assert_eq!(s.undo, Some(earlier), "still to undo");
+        assert!(
+            s.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("Still moving"))
+        );
+    }
+
+    #[test]
+    fn a_notice_doesnt_undo_what_was_done_after_it() {
+        let (_dir, mut s) = synced("notice-undo", &[hello(1, false), hello(2, false)]);
+        s.notify_with("Moved to Archive".into(), None, [NoticeAction::Undo]);
+        s.did(Some(Undo::Flagged {
+            message: ("ada@example.com".into(), INBOX.into(), 2),
+            uid_validity: 1,
+            flagged: false,
+            done: false,
+        }));
+        assert!(!s.notice_actions.contains(&NoticeAction::Undo));
+    }
+
+    #[test]
+    fn a_return_the_server_refuses_is_to_be_reviewed_again() {
+        let (_dir, mut s) = synced(
+            "autosort-return-failed",
+            &[hello(1, false), hello(2, false)],
+        );
+        let m = autosorted_to_receipts(&mut s);
+        let id = ("ada@example.com".to_owned(), "1@example.com".to_owned());
+        let entry = s
+            .reviewed("ada@example.com", "Receipts", "1@example.com")
+            .unwrap();
+        s.returns_reviewed.insert(id.clone(), entry);
+        s.kept_from_autosort.insert(id, "Receipts".into());
+        s.returned_here.push((0, m.clone()));
+        assert!(!s.in_last_batch(&m));
+        let back = Restoring {
+            account: "ada@example.com".into(),
+            mailbox: INBOX.into(),
+            message_id: "1@example.com".into(),
+        };
+        s.restored(&back, "Receipts", &[], Err("refused".into()));
+        assert!(s.in_last_batch(&m), "to review again");
+        assert!(s.returned_here.is_empty(), "listed as it is");
+        assert_eq!(s.kept_from_autosort("ada@example.com", &m.envelope), None);
+    }
+
+    #[test]
+    fn undoing_a_return_lists_the_message_as_it_is_again() {
+        let (_dir, mut s) = synced("autosort-return-undone", &[hello(1, false)]);
+        let m = autosorted_to_receipts(&mut s);
+        s.returned_here.push((0, m));
+        // Put back in Receipts from the inbox.
+        let back = Restoring {
+            account: "ada@example.com".into(),
+            mailbox: "Receipts".into(),
+            message_id: "1@example.com".into(),
+        };
+        s.restored(&back, INBOX, &[3], Ok(true));
+        assert!(s.returned_here.is_empty(), "no placeholder");
+    }
+
+    #[test]
+    fn a_move_still_on_its_way_stays_undoable_after_the_next() {
+        let (_dir, mut s) = synced("undo-pending", &[hello(1, false), hello(2, false)]);
+        let first: MessageKey = ("ada@example.com".into(), INBOX.into(), 1);
+        let second: MessageKey = ("ada@example.com".into(), INBOX.into(), 2);
+        let moved = |from: &MessageKey, done| Undo::Moved {
+            from: from.clone(),
+            to: "Archive".into(),
+            message_id: format!("{}@example.com", from.2),
+            snoozed: None,
+            done,
+        };
+        s.did(Some(moved(&first, false)));
+        s.did(Some(moved(&second, false)));
+        // The first answered after the second was asked for, it's undone after the second.
+        assert!(!s.moved_for_undo(&first, true));
+        assert!(s.moved_for_undo(&second, true));
+        assert_eq!(s.undo, Some(moved(&second, true)));
+        s.undo_the_one_before();
+        assert_eq!(s.undo, Some(moved(&first, true)));
+    }
+
+    #[test]
+    fn undoing_a_star_goes_on_to_the_move_before() {
+        let (_dir, mut s) = synced("undo-after-star", &[hello(1, false), hello(2, false)]);
+        let moved = Undo::Moved {
+            from: ("ada@example.com".into(), INBOX.into(), 1),
+            to: "Archive".into(),
+            message_id: "1@example.com".into(),
+            snoozed: None,
+            done: true,
+        };
+        s.did(Some(moved.clone()));
+        s.did(Some(Undo::Flagged {
+            message: ("ada@example.com".into(), INBOX.into(), 2),
+            uid_validity: 1,
+            flagged: false,
+            done: true,
+        }));
+        s.undo();
+        assert_eq!(s.undo, Some(moved));
+    }
+
+    #[test]
+    fn keeping_what_autosort_moved_leaves_its_notice_nothing_to_move_back() {
+        let (_dir, mut s) = synced("autosort-keep", &[hello(1, false), hello(2, false)]);
+        let m = autosorted_to_receipts(&mut s);
+        s.showing = Showing::Mailbox {
+            account: "ada@example.com".into(),
+            name: "Receipts".into(),
+        };
+        s.keep_last_batch();
+        assert!(!s.in_last_batch(&m));
+        assert!(!s.to_review("ada@example.com", "Receipts", "1@example.com"));
+    }
+
+    #[test]
+    fn a_later_batch_leaves_what_came_before_to_review() {
+        let inbox = [hello(1, false), hello(2, false), hello(3, false)];
+        let (_dir, mut s) = synced("autosort-two", &inbox);
+        let account = "ada@example.com";
+        for (uid, to) in [(1, "Receipts"), (2, "Travel"), (3, "Receipts")] {
+            let id = format!("{uid}@example.com");
+            let store = &s.services.as_ref().unwrap().store;
+            assert!(store.note_autosorted(account, &id, to).unwrap());
+            s.autosorting
+                .insert((account.into(), INBOX.into(), uid), id);
+        }
+        s.moved(account, INBOX, 1, "Receipts", Ok(true));
+        // Elsewhere, then there again under another notice.
+        s.moved(account, INBOX, 2, "Travel", Ok(true));
+        s.notify("something else".into());
+        s.moved(account, INBOX, 3, "Receipts", Ok(true));
+        assert!(s.to_review(account, "Receipts", "1@example.com"));
+        assert!(s.to_review(account, "Travel", "2@example.com"));
+        assert!(s.to_review(account, "Receipts", "3@example.com"));
+    }
+
+    #[test]
+    fn a_second_move_leaves_the_first_undoable_once_the_second_is_undone() {
+        let (_dir, mut s) = synced("undo-history", &[hello(1, false), hello(2, false)]);
+        let first = Undo::Moved {
+            from: ("ada@example.com".into(), INBOX.into(), 1),
+            to: "Receipts".into(),
+            message_id: "1@example.com".into(),
+            snoozed: None,
+            done: true,
+        };
+        s.undo = Some(first.clone());
+        s.undo_subject = Some("Lumen".into());
+        s.did(Some(Undo::Moved {
+            from: ("ada@example.com".into(), INBOX.into(), 2),
+            to: "Archive".into(),
+            message_id: "2@example.com".into(),
+            snoozed: None,
+            done: true,
+        }));
+        assert_eq!(s.undo_history.len(), 1);
+        // Once the second is moved back, as `undo` does, Z goes on to the first.
+        s.undo = None;
+        s.undo_the_one_before();
+        assert_eq!(s.undo, Some(first));
+        assert_eq!(s.undo_subject.as_deref(), Some("Lumen"));
+    }
+
+    #[test]
+    fn a_move_undone_brings_back_the_suggestion_the_message_had() {
+        let (_dir, mut s) = synced("undo-suggestion", &[hello(1, false), hello(2, false)]);
+        s.tags.insert(
+            ("ada@example.com".into(), INBOX.into(), 1),
+            Tags {
+                suggested: Some("Archive".into()),
+                ..Tags::default()
+            },
+        );
+        s.undo = Some(Undo::Moved {
+            from: ("ada@example.com".into(), INBOX.into(), 1),
+            to: "Trash".into(),
+            message_id: "1@example.com".into(),
+            snoozed: None,
+            done: true,
+        });
+        s.undo();
+        // Back under another UID, it's suggested where it was before.
+        let back = s.messages.iter_mut().find(|m| m.envelope.uid == 1).unwrap();
+        back.envelope.uid = 7;
+        back.envelope.message_id = Some("1@example.com".into());
+        s.suggest_as_before_undo();
+        assert_eq!(
+            s.suggested(&("ada@example.com".into(), INBOX.into(), 7)),
+            Some("Archive")
+        );
+        // Sorting weighing it anew as staying where it is doesn't take that away.
+        s.tags.insert(
+            ("ada@example.com".into(), INBOX.into(), 7),
+            Tags {
+                suggested: Some(INBOX.into()),
+                ..Tags::default()
+            },
+        );
+        s.suggest_as_before_undo();
+        assert_eq!(
+            s.suggested(&("ada@example.com".into(), INBOX.into(), 7)),
+            Some("Archive")
         );
     }
 
@@ -8776,7 +10775,15 @@ mod tests {
         );
         assert_eq!(
             s.notice.as_deref(),
-            Some("Autosorted a new message to Receipts")
+            Some("Autosorted 1 message to Receipts")
+        );
+        assert_eq!(
+            s.notice_actions.first(),
+            Some(&NoticeAction::Show(Showing::Mailbox {
+                account: account.into(),
+                name: "Receipts".into()
+            })),
+            "its button shows where it went"
         );
         assert_eq!(s.undo, None, "Z undoes what was done by hand");
     }
@@ -8821,6 +10828,53 @@ mod tests {
     }
 
     #[test]
+    fn returns_arriving_with_new_mail_are_counted_off_their_batch() {
+        let mut s = Mail::not_started();
+        let back = |id: &str| Restoring {
+            account: "ada@example.com".into(),
+            mailbox: "INBOX".into(),
+            message_id: id.into(),
+        };
+        s.returning = vec![back("a@example.com"), back("b@example.com")];
+        s.batch_back = Some((2, 2, "Receipts".into()));
+        let target = Target {
+            account: "ada@example.com".into(),
+            mailbox: "INBOX".into(),
+            uid_validity: 1,
+            uid: None,
+        };
+        let ids = [
+            "a@example.com".into(),
+            "b@example.com".into(),
+            "n@example.com".into(),
+        ];
+        s.inbox_mail(target, 3, false, &[], &ids);
+        assert_eq!(s.batch_back, None, "both back");
+        assert!(
+            s.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("1 new message"))
+        );
+    }
+
+    #[test]
+    fn forgetting_an_accounts_mail_forgets_what_autosort_moved_there() {
+        let (_dir, mut s) = synced("forget-review", &[hello(1, false)]);
+        let m = autosorted_to_receipts(&mut s);
+        s.returned_here.push((0, m.clone()));
+        let moved = vec![(
+            message_key(&m),
+            "Receipts".to_owned(),
+            "1@example.com".to_owned(),
+        )];
+        s.notify_with("Autosorted".into(), None, [NoticeAction::MoveBack(moved)]);
+        s.forget_mail_of("ada@example.com");
+        assert!(!s.in_last_batch(&m));
+        assert!(s.returned_here.is_empty(), "no placeholder");
+        assert!(s.notice_actions.is_empty(), "nothing to move back");
+    }
+
+    #[test]
     fn a_message_moved_back_isnt_announced_as_new_mail() {
         let mut s = Mail::not_started();
         let back = |id: &str| Restoring {
@@ -8845,7 +10899,13 @@ mod tests {
         assert_eq!(s.returning, vec![back("m@example.com")]);
         s.dismiss_notice();
         s.inbox_mail(target(), 1, false, &[], &["m@example.com".into()]);
-        assert_eq!(s.notice, None, "it isn't new");
+        assert!(
+            s.notice
+                .as_deref()
+                .is_some_and(|n| n.starts_with("Moved back to")),
+            "it isn't new, but back: {:?}",
+            s.notice
+        );
         assert_eq!(s.returning, vec![]);
         // Arriving again later, as when moved back by hand, it's new.
         s.inbox_mail(target(), 1, false, &[], &["m@example.com".into()]);

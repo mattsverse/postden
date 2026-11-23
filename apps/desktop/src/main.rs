@@ -123,6 +123,14 @@ fn on_key(s: &mut Mail, ev: &KeyEvent, tx: &mut Tx) -> bool {
     }
     // Likewise confirming a mailbox is to be deleted, where Return presses Delete, the dialog's
     // default button.
+    // Likewise turning autosort on, where Return turns it on.
+    if matches!(s.asking, Some(state::Asking::Autosort(..))) {
+        if ev.key == Key::Escape {
+            s.close_asking();
+            return true;
+        }
+        return false;
+    }
     if s.delete_mailbox.mailbox.is_some() {
         if ev.key == Key::Escape {
             s.close_delete_mailbox();
@@ -164,6 +172,8 @@ fn on_key(s: &mut Mail, ev: &KeyEvent, tx: &mut Tx) -> bool {
         } else {
             s.close_settings();
         }
+        // Back at once, never fading the list up from near-black.
+        tx.instant();
         return true;
     }
     false

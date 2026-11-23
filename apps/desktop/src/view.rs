@@ -18,7 +18,7 @@ use rune_kit::{
     Badge, BadgeVariant, Button, ButtonVariant, Checkbox, Combobox, ComboboxOption, Dialog,
     Divider, IconButton, IconButtonVariant, Keybind, Kit, Markdown, MarkdownStyle, Menu, MenuEntry,
     MenuItem, Placement, PopupItem, PopupList, SegmentedControl, Select, Spinner, State, Switch,
-    TextArea, TextInput, Toast, ToastRegion, context_menu, glyphs, root,
+    TextArea, TextInput, context_menu, glyphs, root,
 };
 
 use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS, Servers};
@@ -28,8 +28,8 @@ use crate::form::{AccountForm, SECURITY, Step, Unreadable, is_set_up, security_i
 use crate::rich::RichEditor;
 use crate::search::{SERVER_PAGE, ServerSearch};
 use crate::state::{
-    AccountMenu, Answer, INBOX as INBOX_NAME, Mail, MailboxMenu, MessageMenu, NewMailbox, Reader,
-    SettingsSection, Showing,
+    AccountMenu, Answer, Asking, INBOX as INBOX_NAME, ListRow, Mail, MailboxMenu, MessageMenu,
+    NewMailbox, NoticeAction, Reader, SettingsSection, Showing,
 };
 use crate::transfer::{self as moving, Transfer};
 use crate::update::{self, Phase};
@@ -92,6 +92,24 @@ static STAR: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M8 2.25L9.69 5.83L13.5 6.31L10.7 8.97L11.4 12.75L8 10.9L4.6 12.75L5.3 8.97L2.5 6.31L6.31 5.83Z" fill="currentColor" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/>"#,
 };
+/// A message that isn't starred: the star's outline.
+static STAR_OUTLINE: Icon = Icon {
+    name: "postden-star-outline",
+    view: 16.0,
+    body: r#"<path d="M8 2.25L9.69 5.83L13.5 6.31L10.7 8.97L11.4 12.75L8 10.9L4.6 12.75L5.3 8.97L2.5 6.31L6.31 5.83Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>"#,
+};
+/// Archiving: a box with its lid.
+static ARCHIVE: Icon = Icon {
+    name: "postden-archive",
+    view: 16.0,
+    body: r#"<rect x="2.25" y="3" width="11.5" height="3" rx="0.75" stroke="currentColor" stroke-width="1.2" fill="none"/><path d="M3.25 6V12.25C3.25 12.66 3.59 13 4 13H12C12.41 13 12.75 12.66 12.75 12.25V6" stroke="currentColor" stroke-width="1.2" fill="none"/><path d="M6.5 8.75H9.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>"#,
+};
+/// Deleting: a bin.
+static TRASH: Icon = Icon {
+    name: "postden-trash",
+    view: 16.0,
+    body: r#"<path d="M2.75 4.25H13.25" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><path d="M6.25 4.25V2.75H9.75V4.25" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/><path d="M4 4.25L4.6 12.6C4.63 12.95 4.92 13.25 5.28 13.25H10.72C11.08 13.25 11.37 12.95 11.4 12.6L12 4.25" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/>"#,
+};
 static PLUS: Icon = Icon {
     name: "postden-plus",
     view: 16.0,
@@ -119,17 +137,8 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
     };
     let mut toolbar = Toolbar::new().title(title(s));
     let mut trailing = row().gap(12.0).center_y();
-    if let Some(notice) = &s.notice {
-        layer.push(
-            ToastRegion::new()
-                .toast(
-                    Toast::new("notice", notice.clone())
-                        .on_close(Mail::dismiss_notice)
-                        .build(&k),
-                )
-                .build(&k),
-        );
-    }
+    // The notice takes a bar of its own under what's shown, rather than covering it.
+    let main = with_notice(s, &k, main);
     let browsing = !s.form.open && !s.compose.open && !s.settings_open;
     if s.settings_open && s.account_settings.open {
         toolbar = toolbar.leading(
@@ -143,8 +152,9 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
         );
     }
     if let (Some(reader), true) = (&s.reader, browsing) {
+        // The list it goes back to, by name: the title gives the reader's buttons its room.
         toolbar = toolbar.leading(
-            Button::new("Back")
+            Button::new(list_title(s))
                 .icon(&BACK)
                 .variant(ButtonVariant::Ghost)
                 .help("Back to the list (Esc)")
@@ -152,20 +162,29 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
                     s.close_reader();
                     // With the list as it comes back, not a frame after.
                     s.reveal_cursor(tx);
+                    tx.instant();
                 })
                 .build(&k)
-                .key("back"),
+                .key("back")
+                .transition(Transition::none()),
         );
-        if let Some(Ok(_)) = reader.body {
-            trailing = trailing.child(
-                Button::new("Reply")
-                    .variant(ButtonVariant::Ghost)
-                    .shortcut(Command::Reply.hint(s))
-                    .on_press(|s: &mut Mail| s.reply(false))
-                    .build(&k)
-                    .key("reply"),
-            );
-        }
+        trailing = trailing.child(reader_actions(s, reader, &k));
+        // In its place from the start, waiting for the message to download, so nothing beside
+        // it moves as it does.
+        trailing = trailing.child(
+            Button::new("Reply")
+                .variant(ButtonVariant::Ghost)
+                .shortcut(Command::Reply.hint(s))
+                .disabled(!matches!(reader.body, Some(Ok(_))))
+                .on_press(|s: &mut Mail| s.reply(false))
+                .build(&k)
+                .key("reply")
+                .transition(Transition::none()),
+        );
+    }
+    // A message just arrived is told of here, always, to open at once.
+    if browsing {
+        trailing = trailing.children(toolbar_status(s, &k));
     }
     if browsing && !s.accounts.is_empty() {
         trailing = trailing.child(actions(s, &k, &mut layer));
@@ -174,6 +193,7 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
     update_dialog(s, &k, &mut layer);
     new_mailbox_dialog(s, &k, &mut layer);
     delete_mailbox_dialog(s, &k, &mut layer);
+    autosort_dialog(s, &k, &mut layer);
     palette(s, &k, &mut layer);
     let window = SplitView::new(main)
         .sidebar(
@@ -195,6 +215,293 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
     })
 }
 
+/// What's shown, with the notice's bar under it while there is one: always the same frame, so
+/// the bar coming and going never rebuilds (and fades) what's above it.
+fn with_notice(s: &Mail, k: &Kit, main: El) -> El {
+    col()
+        .key("main-with-notice")
+        .transition(Transition::none())
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(
+            col()
+                .key("main-content")
+                .transition(Transition::none())
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .child(main),
+        )
+        .children(notice(s, k))
+}
+
+/// The notice showing, if any, as a bar along the bottom of the main pane, clear of the rows
+/// above it: what happened, a second line, its buttons, and a close button.
+fn notice(s: &Mail, k: &Kit) -> Option<El> {
+    let notice = s.notice.as_ref()?;
+    let mut words = row().grow(1.0).min_w(0.0).gap(8.0).center_y().child(
+        text(notice.clone())
+            .font(k.ty.ui_medium)
+            .color(k.c.text_base)
+            .key("notice-title"),
+    );
+    if let Some(detail) = &s.notice_detail {
+        words = words.child(
+            text(detail.clone())
+                .font(k.ty.ui)
+                .color(k.c.text_muted)
+                .truncate()
+                .shrink()
+                .min_w(0.0)
+                .key("notice-detail"),
+        );
+    }
+    let mut bar = row()
+        .key(format!("notice-{}", s.notice_id()))
+        .role("status")
+        .label(notice.clone())
+        .description(s.notice_detail.clone().unwrap_or_default())
+        .w_full()
+        .h(44.0)
+        .px(20.0)
+        .gap(10.0)
+        .center_y()
+        .fill(k.c.layer_01)
+        .border_sides([1.0, 0.0, 0.0, 0.0], k.c.border_weak)
+        .transition(Transition::none())
+        .child(words);
+    for (i, action) in s.notice_actions.iter().enumerate() {
+        let label = match action {
+            // Z types into the search field rather than undoing.
+            NoticeAction::Undo if s.search.query.focused => "Undo".to_owned(),
+            NoticeAction::Undo => "Undo (Z)".to_owned(),
+            NoticeAction::MoveBack(moved) if moved.len() > 1 => "Move them back".to_owned(),
+            NoticeAction::MoveBack(_) => "Move it back".to_owned(),
+            // Beside moving them back, opening where they went is to review them.
+            NoticeAction::Show(Showing::Mailbox { account, name }) => {
+                match s.notice_actions.iter().find_map(|a| match a {
+                    NoticeAction::MoveBack(moved) => Some(moved.len()),
+                    _ => None,
+                }) {
+                    Some(1) => "Review the moved message".to_owned(),
+                    Some(n) => format!("Review {n} moved messages"),
+                    None => format!("Open {}", s.mailbox_label(account, name)),
+                }
+            }
+            NoticeAction::Show(_) => "Show".to_owned(),
+        };
+        bar = bar.child(
+            Button::new(label)
+                .variant(if i == 0 {
+                    ButtonVariant::Neutral
+                } else {
+                    ButtonVariant::Ghost
+                })
+                .on_press_tx(move |s: &mut Mail, tx| s.notice_pressed(i, tx))
+                .build(k)
+                .key(format!("notice-action-{i}"))
+                .transition(Transition::none()),
+        );
+    }
+    Some(
+        bar.child(
+            IconButton::new(k.glyph.close)
+                .variant(IconButtonVariant::GhostMuted)
+                .label("Close")
+                .help("Close")
+                .on_press(Mail::dismiss_notice)
+                .build(k)
+                .key("notice-close"),
+        ),
+    )
+}
+
+/// The open message's everyday actions, each a button with its shortcut in its tooltip: where
+/// sorting says it goes, its star, Archive and Delete.
+fn reader_actions(s: &Mail, reader: &Reader, k: &Kit) -> El {
+    let commands = crate::commands::available(s);
+    let mut group = row()
+        .gap(2.0)
+        .center_y()
+        .key("reader-actions")
+        .transition(Transition::none());
+    let named = |command: &Command| {
+        let keys = command.shortcuts(s);
+        keys.first().map_or_else(
+            || command.title(s),
+            |key| format!("{} ({})", command.title(s), key.label()),
+        )
+    };
+    if let Some(suggested @ Command::MoveAsSuggested(..)) = commands
+        .iter()
+        .find(|c| matches!(c, Command::MoveAsSuggested(..)))
+    {
+        let run = suggested.clone();
+        let title = suggested.title(s);
+        // As the list shows it: a suggestion, in its accent chip, with M; said to be one.
+        group = group
+            .child(text("Suggested").font(k.ty.small).color(k.c.text_muted))
+            .child(
+                row()
+                    .key("reader-move-suggested")
+                    .role("button")
+                    .label(format!("{title} (M)"))
+                    .help(format!(
+                        "Sorting on this computer suggests this: press it, or M, to {}",
+                        title.to_lowercase()
+                    ))
+                    .radius(3.0)
+                    .hover(k.c.hover)
+                    .min_h(30.0)
+                    .center_y()
+                    .on_press_tx(move |s: &mut Mail, tx| run.clone().run(s, tx))
+                    .child(suggestion_badge(title, true, true, k).a11y_hidden()),
+            );
+        group = group.child(el().w(8.0));
+    }
+    let starred = reader.message.envelope.flagged;
+    let mut buttons = vec![(
+        Command::ToggleStar,
+        if starred { &STAR } else { &STAR_OUTLINE },
+        "reader-star",
+    )];
+    if commands.contains(&Command::Archive) {
+        buttons.push((Command::Archive, &ARCHIVE, "reader-archive"));
+    }
+    if commands.contains(&Command::Trash) {
+        buttons.push((Command::Trash, &TRASH, "reader-trash"));
+    }
+    for (command, icon, key) in buttons {
+        let label = named(&command);
+        let accent = command == Command::ToggleStar && starred;
+        group = group.child(
+            IconButton::new(icon)
+                .variant(if accent {
+                    IconButtonVariant::Neutral
+                } else {
+                    IconButtonVariant::Ghost
+                })
+                .label(label.clone())
+                .help(label)
+                .on_press_tx(move |s: &mut Mail, tx| {
+                    command.clone().run(s, tx);
+                    // Back to the list at once, as Escape does.
+                    tx.instant();
+                })
+                .build(k)
+                .key(key),
+        );
+    }
+    group
+}
+
+/// Has what was added to `layer` since `before` (a dialog, a menu) come and go in one frame,
+/// never fading its text through what's under it.
+fn instant_since(layer: &mut Vec<El>, before: usize) {
+    let added = layer.split_off(before);
+    layer.extend(added.into_iter().map(|e| e.transition(Transition::none())));
+}
+
+/// The ⋯ menu's actions on the message under the list's cursor, with their keys; its Undo, named
+/// for what Z undoes while there's something; and the palette with every command, so none
+/// depends on knowing a shortcut.
+fn undo_and_commands(s: &Mail, mut menu: Menu) -> Menu {
+    // The mailbox shown can be autosorted to from here too, as from its menu in the sidebar.
+    if let (Showing::Mailbox { account, name }, None) = (&s.showing, &s.reader) {
+        let on = s.autosorts_to(account, name);
+        let offered = on
+            || s.autosort_candidates()
+                .iter()
+                .any(|(a, n, _)| a == account && n == name);
+        if offered {
+            let (account, name) = (account.clone(), name.clone());
+            menu = menu.item(
+                MenuItem::new(if on {
+                    "Turn off autosort here"
+                } else {
+                    "Autosort mail here…"
+                })
+                .on_select_tx(move |s: &mut Mail, tx| {
+                    s.actions_open = false;
+                    s.toggle_autosort(&account, &name);
+                    tx.instant();
+                }),
+            );
+        }
+    }
+    // From the inbox too, where its suggestions show: which mailbox, picked in the settings.
+    if !matches!(s.showing, Showing::Mailbox { .. })
+        && s.reader.is_none()
+        && s.settings.sort_mail
+        && !s.autosort_candidates().is_empty()
+    {
+        menu = menu.item(
+            MenuItem::new("Set up autosort…").on_select_tx(|s: &mut Mail, tx| {
+                s.actions_open = false;
+                s.open_settings();
+                // Where the picker is, unless moving to another computer keeps the page put, or
+                // an account's changes, not yet saved, show instead.
+                if !s.account_settings.open {
+                    s.show_settings_section(SettingsSection::General);
+                }
+                if s.settings_section == SettingsSection::General && !s.account_settings.open {
+                    s.toggle_autosort_pick();
+                }
+                tx.instant();
+            }),
+        );
+    }
+    if s.reader.is_none() && s.focused_message().is_some() {
+        let commands = crate::commands::available(s);
+        for (command, label, key) in [
+            (Command::Archive, "Archive", "E"),
+            (Command::Trash, "Move to Trash", "#"),
+        ] {
+            if commands.contains(&command) {
+                let target = s
+                    .focused_message()
+                    .map(|m| {
+                        let subject = m.envelope.subject.clone().unwrap_or_default();
+                        format!("{} · {subject}", m.envelope.from.label())
+                    })
+                    .unwrap_or_default();
+                menu = menu.item(
+                    MenuItem::new(label)
+                        .description(target)
+                        .shortcut(key)
+                        .on_select_tx(move |s: &mut Mail, tx| {
+                            s.actions_open = false;
+                            command.clone().run(s, tx);
+                        }),
+                );
+            }
+        }
+    }
+    // What Z undoes stays at hand once its notice is gone, set apart from what acts on the
+    // selected message, which it may not be.
+    if s.undo.is_some() {
+        menu = menu.separator().item(
+            MenuItem::new(s.undo_title())
+                .description(s.undo_subject.clone().unwrap_or_default())
+                .shortcut("Z")
+                .on_select(|s: &mut Mail| {
+                    s.actions_open = false;
+                    s.undo();
+                }),
+        );
+    }
+    menu = menu.item(
+        MenuItem::new("All commands…")
+            .shortcut("⌘K")
+            .on_select(|s: &mut Mail| {
+                s.actions_open = false;
+                s.toggle_palette();
+            }),
+    );
+    menu
+}
+
 /// The ⋯ menu of everything but Reply, which keeps a button of its own.
 fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     let close = |s: &mut Mail| {
@@ -206,17 +513,18 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
             IconButton::new(&MORE)
                 .variant(IconButtonVariant::Ghost)
                 .label("More actions")
-                .help("More actions")
                 .expanded(s.actions_open)
                 .on_press(|s: &mut Mail| {
                     s.actions_open = !s.actions_open;
                     // Its items close it without `on_close`: a G pressed before goes nowhere.
                     s.forget_go();
                 })
-                .build(k),
+                .build(k)
+                .key("more-actions"),
         )
         .placement(Placement::BottomEnd)
-        .min_width(200.0)
+        // Wide enough to name what its actions act on.
+        .min_width(300.0)
         .open(s.actions_open)
         .on_close(close)
         .item(
@@ -227,6 +535,7 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
                     s.compose();
                 }),
         );
+    menu = undo_and_commands(s, menu);
     if let Some(account) = s.showing.account() {
         let id = account.to_owned();
         menu = menu.item(
@@ -292,7 +601,10 @@ fn actions(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
                 }),
             );
     }
-    menu.build(k, layer)
+    let before = layer.len();
+    let built = menu.build(k, layer);
+    instant_since(layer, before);
+    built
 }
 
 fn title(s: &Mail) -> String {
@@ -321,7 +633,81 @@ fn title(s: &Mail) -> String {
         }
         .into();
     }
-    showing_title(s)
+    // A message open, its Back button names the list instead.
+    if s.reader.is_some() {
+        return String::new();
+    }
+    list_title(s)
+}
+
+/// What the list is, by name, searching or not: where a search looks, and whether the server's
+/// in it.
+fn list_title(s: &Mail) -> String {
+    match s.listing() {
+        // As soon as the server's results start coming, the title counts them in.
+        Showing::Everything
+            if matches!(
+                s.search.server(),
+                ServerSearch::Done | ServerSearch::Running
+            ) =>
+        {
+            "All mail, here and on your server".into()
+        }
+        Showing::Everything => "All mail on this computer".into(),
+        Showing::All(Role::Inbox) if s.search.everywhere => "All inboxes".into(),
+        _ => showing_title(s),
+    }
+}
+
+/// What the toolbar says of what's going on, while the list or a message shows: that autosort
+/// files mail to the mailbox shown, and a message just arrived, to open.
+fn toolbar_status(s: &Mail, k: &Kit) -> Vec<El> {
+    let mut status = Vec::new();
+    // A mailbox mail can be autosorted to says whether it is where it's looked at, and turns it
+    // on or off from there.
+    if let (Showing::Mailbox { account, name }, None, true) =
+        (&s.showing, &s.reader, s.settings.sort_mail)
+    {
+        let on = s.autosorts_to(account, name);
+        let offered = on
+            || s.autosort_candidates()
+                .iter()
+                .any(|(a, n, _)| a == account && n == name);
+        if offered {
+            let (account, name) = (account.clone(), name.clone());
+            status.push(
+                Button::new(if on {
+                    "Autosort on · Turn off"
+                } else {
+                    "Set up autosort…"
+                })
+                .variant(if on {
+                    ButtonVariant::Outline
+                } else {
+                    ButtonVariant::Ghost
+                })
+                .on_press_tx(move |s: &mut Mail, tx| {
+                    s.toggle_autosort(&account, &name);
+                    tx.instant();
+                })
+                .build(k)
+                .key("autosort-header")
+                .transition(Transition::none()),
+            );
+        }
+    }
+    if let Some((title, _)) = s.arrival() {
+        status.push(
+            Button::new(title.to_owned())
+                .icon(&INBOX)
+                .variant(ButtonVariant::Neutral)
+                .on_press(Mail::open_arrival)
+                .build(k)
+                .key("arrival")
+                .transition(Transition::none()),
+        );
+    }
+    status
 }
 
 /// What the list shows, by name: "All inboxes", an account's name, or a mailbox and its account's.
@@ -329,6 +715,7 @@ fn showing_title(s: &Mail) -> String {
     match &s.showing {
         Showing::All(Role::Sent) => "Sent".into(),
         Showing::All(_) => "All inboxes".into(),
+        Showing::Everything => "All mail".into(),
         Showing::Mailbox { account, name } if name == INBOX_NAME => s.label(account).to_owned(),
         Showing::Mailbox { account, name } => {
             let label = s
@@ -439,6 +826,8 @@ fn sidebar(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
 fn show_from_sidebar(s: &mut Mail, tx: &mut Tx, showing: Showing) {
     s.show(showing);
     keep_keys_for_list(tx);
+    // The mailbox shows whole at once, never fading through near-black.
+    tx.instant();
 }
 
 /// After a click, keys go to the window again, not the control clicked: the list's keys on
@@ -512,22 +901,67 @@ fn mailbox_row(s: &Mail, account: &str, mailbox: &Mailbox, k: &Kit, layer: &mut 
     if unread > 0 {
         r = r.badge(unread.to_string());
     }
-    if s.marking_seen(account, &mailbox.name) || s.refreshing(account, &mailbox.name) {
+    // Busy too while the last message autosort moved here is on its way back.
+    let returning = s
+        .returned_here
+        .iter()
+        .any(|(_, m)| m.account == account && m.mailbox == mailbox.name && s.is_moving(m));
+    if returning || s.marking_seen(account, &mailbox.name) || s.refreshing(account, &mailbox.name) {
         r = r.status(RowStatus::Busy);
     }
-    if s.settings.sort_mail && s.autosorts_to(account, &mailbox.name) {
+    // What autosort just moved here, still to be reviewed, is said where it's found again.
+    let to_review = s
+        .batch_in(account, &mailbox.name)
+        .map(|(moved, _)| moved.len())
+        .filter(|n| *n > 0);
+    let auto = (s.settings.sort_mail && s.autosorts_to(account, &mailbox.name)).then(|| {
+        text(if returning {
+            "Moving…".to_owned()
+        } else {
+            to_review.map_or_else(|| "auto".to_owned(), |n| format!("{n} to review"))
+        })
+        .font(k.ty.small)
+        .color(k.c.text_accent)
+        .label("Autosort on")
+        .help("Autosort on: inbox mail that belongs here moves here by itself")
+    });
+    let key = (account.to_owned(), mailbox.name.clone());
+    // Its menu, autosort among it, is a ⋯ away as well as a right-click.
+    let menu_button = (s.hovered_mailbox.as_ref() == Some(&key)
+        || s.mailbox_menu
+            .as_ref()
+            .is_some_and(|m| m.is(account, &mailbox.name)))
+    .then(|| {
+        let (on_account, on_mailbox) = key.clone();
+        IconButton::new(&MORE)
+            .variant(IconButtonVariant::Ghost)
+            .label(format!("{} actions", mailbox.label()))
+            .on_press(move |s: &mut Mail| s.open_mailbox_menu(&on_account, &on_mailbox, None))
+            .build(k)
+            .size(22.0, 22.0)
+            .key(format!("mailbox-more-{account}-{}", mailbox.name))
+    });
+    if auto.is_some() || menu_button.is_some() {
         r = r.trailing(
-            icon(&glyphs::SPARKLE, 12.0)
-                .color(k.c.text_faint)
-                .label("Autosorted to"),
+            row()
+                .gap(4.0)
+                .center_y()
+                .children(auto.into_iter().chain(menu_button)),
         );
     }
-    let (menu_account, menu_mailbox) = (account.to_owned(), mailbox.name.clone());
+    let (menu_account, menu_mailbox) = key.clone();
     let r = r
         .build(k)
         .key(format!("mailbox-{account}-{}", mailbox.name))
+        .on_hover_change(move |s: &mut Mail, inside, _| {
+            if inside {
+                s.hovered_mailbox = Some(key.clone());
+            } else if s.hovered_mailbox.as_ref() == Some(&key) {
+                s.hovered_mailbox = None;
+            }
+        })
         .on_secondary_press(move |s: &mut Mail, point, _| {
-            s.open_mailbox_menu(&menu_account, &menu_mailbox, point);
+            s.open_mailbox_menu(&menu_account, &menu_mailbox, Some(point));
         });
     match &s.mailbox_menu {
         Some(menu) if menu.is(account, &mailbox.name) => {
@@ -579,44 +1013,49 @@ fn mailbox_menu(menu: &MailboxMenu, offered: Offered, row: El, k: &Kit, layer: &
     let (a, b) = (account.clone(), mailbox.clone());
     let (refresh_account, refresh_mailbox) = (account.clone(), mailbox.clone());
     let (delete_account, delete_mailbox) = (account.clone(), mailbox.clone());
-    let mut items = context_menu(
-        format!("mailbox-menu-{account}-{mailbox}"),
-        row,
-        Some(menu.point),
-    )
-    .min_width(220.0)
-    .on_close(Mail::close_mailbox_menu)
-    .item(MenuItem::new("Refresh").on_select(move |s: &mut Mail| {
-        s.close_mailbox_menu();
-        s.refresh_mailbox(&refresh_account, &refresh_mailbox);
-    }))
-    .item(
-        MenuItem::new("Refresh all mailboxes").on_select(|s: &mut Mail| {
+    // Opened from its ⋯ button, it hangs under the row rather than at a click.
+    let mut items = context_menu(format!("mailbox-menu-{account}-{mailbox}"), row, menu.point)
+        .open(true)
+        .placement(Placement::BottomEnd)
+        .min_width(220.0)
+        .on_close(Mail::close_mailbox_menu)
+        .item(MenuItem::new("Refresh").on_select(move |s: &mut Mail| {
             s.close_mailbox_menu();
-            s.refresh_all();
-        }),
-    )
-    .item(
-        MenuItem::new(if marking {
-            "Marking all as read…"
-        } else {
-            "Mark all as read"
-        })
-        .disabled(marking)
-        .on_select(move |s: &mut Mail| {
-            s.close_mailbox_menu();
-            s.mark_all_seen(&a, &b);
-        }),
-    );
+            s.refresh_mailbox(&refresh_account, &refresh_mailbox);
+        }))
+        .item(
+            MenuItem::new("Refresh all mailboxes").on_select(|s: &mut Mail| {
+                s.close_mailbox_menu();
+                s.refresh_all();
+            }),
+        )
+        .item(
+            MenuItem::new(if marking {
+                "Marking all as read…"
+            } else {
+                "Mark all as read"
+            })
+            .disabled(marking)
+            .on_select(move |s: &mut Mail| {
+                s.close_mailbox_menu();
+                s.mark_all_seen(&a, &b);
+            }),
+        );
     if let Some(on) = autosort {
         let (account, mailbox) = (account.clone(), mailbox.clone());
         items = items.item(
             MenuItem::new("Autosort mail here")
-                .description("Moves mail that belongs here")
+                .description(if on {
+                    "On: files mail that belongs here"
+                } else {
+                    "Files mail that belongs here…"
+                })
                 .checked(on)
-                .on_select(move |s: &mut Mail| {
+                // Its dialog opens whole, at once, never fading its text over the list.
+                .on_select_tx(move |s: &mut Mail, tx| {
                     s.close_mailbox_menu();
-                    s.set_autosort(&account, &mailbox, !on);
+                    s.toggle_autosort(&account, &mailbox);
+                    tx.instant();
                 }),
         );
     }
@@ -639,7 +1078,10 @@ fn mailbox_menu(menu: &MailboxMenu, offered: Offered, row: El, k: &Kit, layer: &
             }),
         );
     }
-    items.build(k, layer).w_full()
+    let before = layer.len();
+    let built = items.build(k, layer).w_full();
+    instant_since(layer, before);
+    built
 }
 
 /// An account, standing for its inbox, over its mailboxes. Right-clicking it opens its menu.
@@ -783,6 +1225,174 @@ fn new_mailbox_dialog(s: &Mail, k: &Kit, layer: &mut Vec<El>) {
 
 /// The dialog confirming a mailbox is to be deleted with the mail in it: a warning, why the server
 /// refused, and Delete, busy until the server answers.
+/// Asks before autosort is turned on for a mailbox: what it does, and which messages in the
+/// inbox it moves straight away.
+fn autosort_dialog(s: &Mail, k: &Kit, layer: &mut Vec<El>) {
+    const SHOWN: usize = 3;
+    let Some(Asking::Autosort((account, mailbox), move_now)) = &s.asking else {
+        return;
+    };
+    let label = s.mailbox_label(account, mailbox);
+    let now = s.autosort_preview();
+    let mut body = col().w_full().gap(10.0).padding(16.0).pt(0.0).child(
+        text(format!(
+            "New mail that sorting is sure belongs in {label} skips the inbox and goes \
+             there by itself. Turn it off any time from this menu or in Settings → General."
+        ))
+        .wrap(),
+    );
+    if now.is_empty() {
+        body = body.child(
+            text("Nothing in your inbox moves right now.")
+                .font(k.ty.small)
+                .color(k.c.text_muted),
+        );
+    } else {
+        let n = now.len();
+        let s_ = if n == 1 { "" } else { "s" };
+        let mut list = col().gap(4.0).child(
+            text(format!("{n} message{s_} already in your inbox fit too:"))
+                .font(k.ty.ui_medium)
+                .key("autosort-count"),
+        );
+        for subject in now.iter().take(SHOWN) {
+            list = list.child(
+                text(format!("· {subject}"))
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .truncate(),
+            );
+        }
+        if n > SHOWN {
+            list = list.child(
+                text(format!("and {} more", n - SHOWN))
+                    .font(k.ty.small)
+                    .color(k.c.text_muted),
+            );
+        }
+        // In a box of its own, so the choice shows as one before it's ticked.
+        body = body.child(list).child(
+            row()
+                .w_full()
+                .padding(8.0)
+                .radius(6.0)
+                .border(1.0, k.c.border_strong)
+                .child(
+                    // A switch, whose off is as plain to see as its on.
+                    labeled_switch(
+                        &format!("Also move these {n} now"),
+                        Switch::new(*move_now).on_toggle(Mail::toggle_autosort_move_now),
+                        "autosort-move-now",
+                        k,
+                    ),
+                ),
+        );
+    }
+    body = body.child(
+        row()
+            .w_full()
+            .gap(8.0)
+            .center_y()
+            .child(el().grow(1.0))
+            .child(
+                Button::new("Cancel")
+                    .variant(ButtonVariant::Neutral)
+                    .on_press_tx(close_at_once)
+                    .build(k)
+                    .key("autosort-cancel"),
+            )
+            .child(
+                Button::new("Turn on autosort")
+                    .variant(ButtonVariant::Submit)
+                    .on_press_tx(|s: &mut Mail, tx| {
+                        s.submit_autosort();
+                        tx.instant();
+                    })
+                    .build(k)
+                    .key("autosort-confirm")
+                    .default_button(),
+            ),
+    );
+    instant_dialog(
+        "autosort",
+        format!("Autosort mail to {label}?"),
+        420.0,
+        body,
+        k,
+        layer,
+    );
+}
+
+/// Closes what asks to be confirmed in one frame, with nothing fading.
+fn close_at_once(s: &mut Mail, tx: &mut Tx) {
+    s.close_asking();
+    tx.instant();
+}
+
+/// A modal dialog like the kit's, closing with [`Mail::close_asking`], that's whole the frame
+/// it opens and gone the frame it closes: its text never fades over what's under it.
+fn instant_dialog(key: &str, title: String, width: f32, body: El, k: &Kit, layer: &mut Vec<El>) {
+    let none = Transition::none;
+    let dismiss = IconButton::new(k.glyph.close)
+        .variant(IconButtonVariant::Ghost)
+        .label("Close")
+        .on_press_tx(close_at_once)
+        .build(k)
+        .key("close")
+        .size(20.0, 20.0)
+        .mt(-2.0)
+        .mr(-2.0)
+        .transition(none());
+    let panel = col()
+        .key(format!("{key}-dialog"))
+        .role("dialog")
+        .label(title.clone())
+        .w_full()
+        .max_w(width)
+        .radius(6.0)
+        .fill(k.c.layer_01)
+        .child(
+            row()
+                .key("header")
+                .w_full()
+                .padding(16.0)
+                .items_start()
+                .child(
+                    col().grow(1.0).child(
+                        text(title)
+                            .font(k.ty.ui_medium.lh(16.0))
+                            .color(k.c.text_base),
+                    ),
+                )
+                .child(dismiss),
+        )
+        .child(col().key("body").w_full().child(body));
+    let panel = k
+        .elevate(panel, &k.elevation.overlay)
+        .modal_tx(true, close_at_once)
+        .modal_click_outside(true)
+        .transition(none());
+    layer.push(
+        el().key(format!("{key}-scrim"))
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .fill(k.c.scrim)
+            .a11y_hidden()
+            .transition(none()),
+    );
+    layer.push(
+        el().key(format!("{key}-layer"))
+            .absolute(0.0, 0.0)
+            .w_full()
+            .h_full()
+            .padding(16.0)
+            .center()
+            .child(panel)
+            .transition(none()),
+    );
+}
+
 fn delete_mailbox_dialog(s: &Mail, k: &Kit, layer: &mut Vec<El>) {
     let d = &s.delete_mailbox;
     let Some((account, mailbox)) = &d.mailbox else {
@@ -913,11 +1523,134 @@ fn inbox(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     col()
         .key("inbox")
+        // Swapped with the reader at once, never faded through it.
+        .transition(Transition::none())
         .w_full()
         .grow(1.0)
         .min_h(0.0)
         .child(search_bar(s, k))
+        .children(batch_banner(s, k))
         .child(list)
+}
+
+/// Over a mailbox autosort just moved a batch to, which messages came, and a way to send them
+/// back, until that's done or they're kept.
+fn batch_banner(s: &Mail, k: &Kit) -> Option<El> {
+    let Showing::Mailbox { account, name } = &s.showing else {
+        return None;
+    };
+    // The last one on its way back, the review holds its place until it's there.
+    let Some((moved, _)) = s.batch_in(account, name) else {
+        return s
+            .returned_here
+            .iter()
+            .any(|(_, m)| m.account == *account && m.mailbox == *name && s.is_moving(m))
+            .then(|| closing_banner(k));
+    };
+    // In the order the list shows them, so each is found where it's named.
+    let listed: Vec<String> = s
+        .messages
+        .iter()
+        .filter(|m| s.in_last_batch(m))
+        .map(|m| crate::state::subject_of(&m.envelope))
+        .collect();
+    let subjects = if listed.len() == moved.len() {
+        listed
+    } else {
+        moved.to_vec()
+    };
+    let n = subjects.len();
+    // What's left to look at, rather than what autosort once did.
+    let what = if n == 1 {
+        "1 message autosort moved here".to_owned()
+    } else {
+        format!("{n} messages autosort moved here")
+    };
+    let words = col()
+        .grow(1.0)
+        .min_w(0.0)
+        .gap(2.0)
+        .child(
+            text(format!("To review: {what}"))
+                .font(k.ty.ui_medium)
+                .color(k.c.text_base),
+        )
+        // What moving one back means, before it's done.
+        .child(
+            text("Moved back, a message stays in Inbox; autosort goes on for new mail.")
+                .font(k.ty.small)
+                .color(k.c.text_muted)
+                .truncate(),
+        );
+    // Which ones, the rows say themselves, each tagged with a way back.
+    Some(
+        row()
+            // Of how many, so a message leaving redraws it whole, never listing one twice.
+            .key(format!("autosort-batch-{n}"))
+            .transition(Transition::none())
+            .w_full()
+            .px(20.0)
+            .py(10.0)
+            .gap(10.0)
+            .center_y()
+            .fill(k.c.layer_01)
+            .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+            .child(words)
+            // One left, its own row's Move to Inbox is the way back: not two of them.
+            .children((n > 1).then(|| {
+                Button::new(match n {
+                    1 => "Move it back to Inbox".to_owned(),
+                    2 => "Move both to Inbox".to_owned(),
+                    _ => format!("Move all {n} to Inbox"),
+                })
+                .variant(ButtonVariant::Neutral)
+                .on_press(Mail::move_back_last_batch)
+                .build(k)
+                .key("autosort-batch-back")
+            }))
+            .child(
+                // What ending the review does with them, said on its button.
+                Button::new(if n == 1 {
+                    format!("Keep it in {}", s.mailbox_label(account, name))
+                } else {
+                    format!("Keep them in {}", s.mailbox_label(account, name))
+                })
+                .variant(ButtonVariant::Ghost)
+                .on_press(Mail::keep_last_batch)
+                .build(k)
+                .key("autosort-batch-keep"),
+            ),
+    )
+}
+
+/// The review banner while the last message it named is on its way back: its own shape, so
+/// nothing under it moves before the end.
+fn closing_banner(k: &Kit) -> El {
+    row()
+        .key("autosort-batch-closing")
+        .transition(Transition::none())
+        .w_full()
+        .px(20.0)
+        .py(10.0)
+        .center_y()
+        .fill(k.c.layer_01)
+        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+        .child(
+            col()
+                .gap(2.0)
+                .grow(1.0)
+                .child(
+                    text("Moving the last message to Inbox…")
+                        .font(k.ty.ui_medium)
+                        .color(k.c.text_base),
+                )
+                .child(
+                    text("Moved back, a message stays in Inbox; autosort goes on for new mail.")
+                        .font(k.ty.small)
+                        .color(k.c.text_muted),
+                ),
+        )
+        .child(el().h(32.0))
 }
 
 /// The search field; unless the list already shows every inbox, whether to search just what it
@@ -925,12 +1658,17 @@ fn inbox(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
 fn search_bar(s: &Mail, k: &Kit) -> El {
     let mut input = TextInput::new(&s.search.query)
         .label("Search mail")
-        .placeholder("Search by subject, sender or recipient (⌘F)")
+        // Once it has the keys, what it looks through.
+        .placeholder(if s.search.is_active() || s.search.query.focused {
+            "Subject, sender, recipient or downloaded text"
+        } else {
+            "Search mail on this computer (⌘F)"
+        })
         .leading_icon(&glyphs::SEARCH)
         .width(None)
         .on_edit(|s: &mut Mail| &mut s.search.query)
         .on_change(|s: &mut Mail, _| s.search_changed())
-        .on_submit(|s: &mut Mail, _| s.search_server())
+        .on_submit(|s: &mut Mail, tx| s.search_submitted(tx))
         // Escape ends the search and leaves the field, so keys on their own work on the list again;
         // ↓ leaves it for the results, with the cursor on the first.
         .on_key(|s: &mut Mail, ev: &rune::KeyEvent, tx| {
@@ -939,6 +1677,7 @@ fn search_bar(s: &Mail, k: &Kit) -> El {
             match ev.key {
                 rune::Key::Escape => {
                     s.clear_search();
+                    tx.instant();
                 }
                 // Only ↓ alone: ⇧↓ and ⌘↓ still select and move in the field.
                 _ if Shortcut::Down.matches(ev, false) && s.cursor_to_first(tx) => {}
@@ -952,49 +1691,156 @@ fn search_bar(s: &Mail, k: &Kit) -> El {
             s.clear_search();
         });
     }
-    let mut bar = row()
+    // A button, not another segmented control: next to the field, it leaves the field room.
+    let unread = Command::ToggleUnreadOnly.title(s);
+    let field = row()
+        .w_full()
+        .gap(12.0)
+        .center_y()
+        .child(row().grow(1.0).min_w(0.0).child(input.build(k)))
+        .child(
+            IconButton::new(&UNREAD)
+                .variant(if s.settings.unread_only {
+                    IconButtonVariant::Neutral
+                } else {
+                    IconButtonVariant::GhostMuted
+                })
+                .label(unread.clone())
+                .help(unread)
+                .on_press_tx(|s: &mut Mail, tx| {
+                    s.set_unread_only(!s.settings.unread_only);
+                    keep_keys_for_list(tx);
+                })
+                .build(k)
+                .key("unread-only"),
+        );
+    let bar = col()
         .key("search")
         .w_full()
         .px(20.0)
         .pt(4.0)
         .pb(10.0)
+        .gap(8.0)
+        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+        .child(field);
+    // While searching, or about to, where: what's shown, every inbox, or all mail; and asking
+    // the server. On a row of their own, so the field keeps its width for what's typed.
+    if s.search.is_active() || s.search.query.focused {
+        bar.child(search_controls(s, k))
+    } else {
+        bar
+    }
+}
+
+/// Under the search field while searching: where to search, and asking the mail server too.
+fn search_controls(s: &Mail, k: &Kit) -> El {
+    let here = showing_title(s);
+    let inboxes = s.showing == Showing::All(Role::Inbox);
+    let mut labels = Vec::new();
+    if !inboxes {
+        labels.push(here.as_str());
+    }
+    labels.extend(["All inboxes", "All mail"]);
+    let picked = if s.search.all_mail {
+        labels.len() - 1
+    } else if s.search.everywhere || inboxes {
+        labels.len() - 2
+    } else {
+        0
+    };
+    let scope = SegmentedControl::new(&labels, Some(picked))
+        .label("Search in")
+        .fit()
+        .on_pick(move |s: &mut Mail, i, _| {
+            let i = if inboxes { i + 1 } else { i };
+            s.search_within(i == 1, i == 2);
+            s.search.query.focused = true;
+        })
+        .build(k)
+        .key("search-in")
+        .transition(Transition::none());
+    row()
+        .key("search-controls")
+        .transition(Transition::none())
+        .w_full()
         .gap(12.0)
         .center_y()
-        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
-        .child(row().grow(1.0).min_w(0.0).child(input.build(k)));
-    if s.showing != Showing::All(Role::Inbox) {
-        let here = showing_title(s);
-        let labels = [here.as_str(), "All inboxes"];
-        bar = bar.child(
-            SegmentedControl::new(&labels, Some(usize::from(s.search.everywhere)))
-                .label("Search in")
-                .fit()
-                .on_pick(|s: &mut Mail, i, tx| {
-                    s.search_everywhere(i == 1);
-                    keep_keys_for_list(tx);
-                })
-                .build(k),
-        );
-    }
-    // A button, not another segmented control: next to the one above, the field had no room
-    // left in a narrow window.
-    let unread = Command::ToggleUnreadOnly.title(s);
-    bar.child(
-        IconButton::new(&UNREAD)
-            .variant(if s.settings.unread_only {
-                IconButtonVariant::Neutral
-            } else {
-                IconButtonVariant::GhostMuted
-            })
-            .label(unread.clone())
-            .help(unread)
-            .on_press_tx(|s: &mut Mail, tx| {
-                s.set_unread_only(!s.settings.unread_only);
-                keep_keys_for_list(tx);
+        .child(scope)
+        .child(el().grow(1.0))
+        // What asking the server adds, before it's asked.
+        .children((s.search.server() == ServerSearch::NotAsked).then(|| {
+            text(format!(
+                "Looks in {} there, older mail too",
+                search_scope(s)
+            ))
+            .key("server-adds")
+            .transition(Transition::none())
+            .font(k.ty.small)
+            .color(k.c.text_muted)
+            .truncate()
+            .min_w(0.0)
+            .shrink()
+        }))
+        .child(server_control(s, k))
+}
+
+/// Asking the mail server too, for this query only: a button that says it sends it there,
+/// then where the results come from, and a way back to only what's on this computer.
+fn server_control(s: &Mail, k: &Kit) -> El {
+    let note = |words: &str| {
+        text(words.to_owned())
+            .font(k.ty.small)
+            .color(k.c.text_base)
+            .key("search-local-note")
+            .transition(Transition::none())
+    };
+    let local_only = || {
+        Button::new("Show local results only")
+            .variant(ButtonVariant::Ghost)
+            .on_press(|s: &mut Mail| {
+                s.search_local_only();
+                s.search.query.focused = true;
             })
             .build(k)
-            .key("unread-only"),
-    )
+            .key("search-local-only")
+            .transition(Transition::none())
+    };
+    // Keyed by what it shows, so one state replaces the other whole, in the same frame,
+    // rather than the old sliding out from under the new.
+    let state = match s.search.server() {
+        ServerSearch::NotAsked => "ask",
+        ServerSearch::Running => "asking",
+        ServerSearch::Done => "done",
+        ServerSearch::Failed(_) => "failed",
+    };
+    let slot = row()
+        .key(format!("server-{state}"))
+        .transition(Transition::none())
+        .gap(8.0)
+        .center_y()
+        .justify_end();
+    match s.search.server() {
+        ServerSearch::NotAsked => slot.child(
+            // Where on the server it looks, named where the user agrees to send it.
+            Button::new("Send this query to your mail server")
+                .variant(ButtonVariant::Neutral)
+                .disabled(!s.search.is_active())
+                // The caret stays in the query, to refine it.
+                .on_press(|s: &mut Mail| {
+                    s.search_server();
+                    s.search.query.focused = true;
+                })
+                .build(k)
+                .key("search-server-switch")
+                .transition(Transition::none()),
+        ),
+        ServerSearch::Running => slot.child(note("Asking your mail server…")),
+        // The title says the server's results are in; here, only the way back.
+        ServerSearch::Done => slot.child(local_only()),
+        ServerSearch::Failed(_) => slot
+            .child(note("Couldn't search your mail server"))
+            .child(local_only()),
+    }
 }
 
 /// The end of a search's results: a button to search the server too, a spinner while it does,
@@ -1002,6 +1848,7 @@ fn search_bar(s: &Mail, k: &Kit) -> El {
 fn server_search(s: &Mail, k: &Kit) -> El {
     let end = row()
         .key("server-search")
+        .transition(Transition::none())
         .w_full()
         .min_h(48.0)
         .px(20.0)
@@ -1016,15 +1863,6 @@ fn server_search(s: &Mail, k: &Kit) -> El {
             .key(key)
     };
     match s.search.server() {
-        ServerSearch::Running => end
-            .child(
-                Spinner::new()
-                    .size(16.0)
-                    .color(k.c.icon_muted)
-                    .build(k)
-                    .enter_delay(SPINNER_DELAY),
-            )
-            .child(note("Searching the server…".into())),
         ServerSearch::Failed(n) => {
             let mailboxes = if n == 1 {
                 "a mailbox".to_owned()
@@ -1041,48 +1879,273 @@ fn server_search(s: &Mail, k: &Kit) -> El {
         ServerSearch::Done => end.child(note(
             "Includes matches on the server, in message text too.".into(),
         )),
-        ServerSearch::NotAsked => end.child(button(
-            "Search the server, in message text too (↩)",
-            "search-server",
-        )),
+        // Asked by the bar's own button, which says what it adds.
+        // Asking, it's said once, beside the control that asked.
+        ServerSearch::NotAsked | ServerSearch::Running => end,
     }
 }
 
 /// What the list says when it has nothing to show.
 fn empty_list(s: &Mail, k: &Kit) -> El {
     let searching = s.search.is_active();
+    // An inbox got to zero, rather than nothing listed yet.
+    if !searching
+        && !s.accounts.is_empty()
+        && s.settings.unread_only
+        && s.listed_unread() == 0
+        && s.listing_synced()
+    {
+        return nothing_unread(s, k);
+    }
     let server = s.search.server();
+    let scope = search_scope(s);
     let hint = if searching && server == ServerSearch::Running {
-        "No cached mail matches. Searching the server…"
+        format!("Nothing in {scope} matches yet. Searching the server…")
     } else if searching && server == ServerSearch::Done {
-        "Nothing matches, here or on the server."
+        format!("Nothing in {scope} matches, here or on the server.")
     } else if searching {
-        "No cached mail matches."
-    } else if s.accounts.is_empty() {
+        format!(
+            "Nothing in {scope} matches in subjects, people or downloaded text on this computer."
+        )
+    } else {
+        empty_hint(s).into()
+    };
+    let mut empty = col()
+        .key("empty")
+        .transition(Transition::none())
+        .w_full()
+        .grow(1.0)
+        .center()
+        .gap(4.0)
+        .child(text(hint).font(k.ty.ui).color(k.c.text_muted));
+    // Filed away, mail isn't in an inbox: a search there can look through every mailbox, the
+    // query kept. That comes first: it answers at once, unlike the server.
+    if searching && !s.search.all_mail {
+        empty = empty.child(el().h(6.0)).child(
+            Button::new("Search all mail on this computer (↩)")
+                .icon(&glyphs::SEARCH)
+                .variant(ButtonVariant::Neutral)
+                // The caret goes back to the query, to refine it or press Return.
+                .on_press(|s: &mut Mail| {
+                    s.search_within(false, true);
+                    s.search.query.focused = true;
+                })
+                .build(k)
+                .key("search-all-mail"),
+        );
+    }
+    // The server's way to find more stays where it always is, above: said here, not moved.
+    if searching && matches!(server, ServerSearch::Failed(_)) {
+        empty = empty.child(server_search(s, k));
+    }
+    empty
+}
+
+/// Where a search looks, by name, as the empty list says it.
+fn search_scope(s: &Mail) -> String {
+    match s.listing() {
+        Showing::Everything => "all mail".into(),
+        Showing::All(Role::Inbox) => "your inboxes".into(),
+        _ => showing_title(s),
+    }
+}
+
+/// What the list says when it has nothing to show and isn't searching.
+fn empty_hint(s: &Mail) -> &'static str {
+    if s.accounts.is_empty() {
         "Add an account to get started."
     } else if s.settings.unread_only && s.listed_unread() > 0 {
         // Counted, but not listed: not fetched yet, or read and still being marked so.
         "Some unread mail here isn't shown yet."
-    } else if s.settings.unread_only && s.listing_synced() {
-        return nothing_unread(s, k);
     } else if s.showing_sent() {
         "No sent mail yet."
     } else if matches!(&s.showing, Showing::Mailbox { name, .. } if name != INBOX_NAME) {
         "Nothing here yet. Other mailboxes are checked every few minutes."
     } else {
         "No mail yet. New messages appear here as they arrive."
-    };
-    let mut empty = col()
-        .key("empty")
-        .w_full()
-        .grow(1.0)
-        .center()
-        .gap(4.0)
-        .child(text(hint).font(k.ty.ui).color(k.c.text_muted));
-    if searching && matches!(server, ServerSearch::NotAsked | ServerSearch::Failed(_)) {
-        empty = empty.child(server_search(s, k));
     }
-    empty
+}
+
+/// Sorting's settings: suggestions on or off, where mail is autosorted to, and forgetting what
+/// it learned, which asks first.
+fn sorting_settings(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
+    let note = |words: &str| {
+        text(words.to_owned())
+            .font(k.ty.small)
+            .color(k.c.text_muted)
+            .wrap()
+    };
+    // The reset belongs with the switch, not with any one mailbox's autosort.
+    let sorting = col()
+        .w_full()
+        .gap(10.0)
+        .child(labeled_switch(
+            "Sort mail on this computer",
+            Switch::new(s.settings.sort_mail)
+                .on_toggle(|s: &mut Mail| s.set_sort_mail(!s.settings.sort_mail)),
+            "sort-mail",
+            k,
+        ))
+        .child(note(
+            "Tags inbox mail with where it seems to go (press the tag, or M, to move it) and \
+             whether it seems important. Turning this off pauses suggestions and autosort.",
+        ))
+        .child(forget_sorting(s, k));
+    // Autosort hangs off the switch above, as it runs only while that's on.
+    let mut autosort = col()
+        .w_full()
+        .gap(10.0)
+        .pl(14.0)
+        .border_sides([0.0, 0.0, 0.0, 2.0], k.c.border_strong)
+        .child(text("Autosort").font(k.ty.ui_medium).color(k.c.text_base));
+    let autosorted = s.autosorted_mailboxes();
+    if autosorted.is_empty() {
+        autosort = autosort.child(note(
+            "Off for every mailbox. Right-click a mailbox and choose Autosort mail here to \
+             have mail that belongs there skip the inbox.",
+        ));
+    }
+    for (account, mailbox) in autosorted {
+        let label = format!(
+            "{} · {}",
+            s.mailbox_label(&account, &mailbox),
+            s.label(&account)
+        );
+        let key = format!("autosort-{account}-{mailbox}");
+        // Kept while sorting is off, but paused, as nothing's sorted.
+        let label = if s.settings.sort_mail {
+            label
+        } else {
+            format!("{label} (paused)")
+        };
+        autosort = autosort.child(labeled_switch(
+            &label,
+            Switch::new(true).on_toggle(move |s: &mut Mail| s.toggle_autosort(&account, &mailbox)),
+            &key,
+            k,
+        ));
+    }
+    if let Some(pick) = autosort_picker(s, k, layer) {
+        autosort = autosort.child(pick);
+    }
+    sorting.child(autosort.mt(4.0))
+}
+
+/// A switch with its label in full contrast before it, as what it turns on is what's read
+/// first: the kit's own label is faint, a hint's.
+fn labeled_switch(label: &str, switch: Switch, key: &str, k: &Kit) -> El {
+    row()
+        .gap(10.0)
+        .center_y()
+        .child(text(label.to_owned()).font(k.ty.ui).color(k.c.text_base))
+        .child(
+            switch
+                .label(label)
+                .hide_label()
+                .build(k)
+                .key(key.to_owned()),
+        )
+}
+
+/// Forgetting what sorting learned, which asks first, saying what's kept.
+fn forget_sorting(s: &Mail, k: &Kit) -> El {
+    // Asked on the button's own line, so nothing below it moves.
+    if s.asking == Some(Asking::ForgetSorting) {
+        return row()
+            .min_h(52.0)
+            .gap(8.0)
+            .center_y()
+            // The question first, read before the button; what follows, under it.
+            .child(
+                col()
+                    .gap(2.0)
+                    .max_w(380.0)
+                    .min_w(0.0)
+                    .child(
+                        text(if s.autosorted_mailboxes().is_empty() {
+                            "Clear what sorting learned from your actions?"
+                        } else {
+                            "Reset learned sorting?"
+                        })
+                        .font(k.ty.ui_medium)
+                        .color(k.c.text_base)
+                        .wrap(),
+                    )
+                    .child(
+                        text("Clears where it learned your mail goes and what seems important to you. Autosort continues while it learns again from the mail on this computer.")
+                            .font(k.ty.small)
+                            .color(k.c.text_muted)
+                            .wrap(),
+                    ),
+            )
+            .child(
+                Button::new("Reset learned sorting")
+                    .variant(ButtonVariant::Danger)
+                    .on_press_tx(|s: &mut Mail, tx| {
+                        s.forget_sorting();
+                        tx.instant();
+                    })
+                    .build(k)
+                    .key("forget-sorting-confirm"),
+            )
+            .child(
+                Button::new("Cancel")
+                    .variant(ButtonVariant::Ghost)
+                    .on_press_tx(close_at_once)
+                    .build(k)
+                    .key("forget-sorting-cancel"),
+            );
+    }
+    // As tall as the question that takes its place, so nothing below moves when it does.
+    row().min_h(52.0).center_y().child(
+        Button::new("Reset learned sorting…")
+            .variant(ButtonVariant::Ghost)
+            .on_press_tx(|s: &mut Mail, tx| {
+                s.ask_forget_sorting();
+                // The question takes the button's place at once, never over it.
+                tx.instant();
+            })
+            .build(k)
+            .key("forget-sorting"),
+    )
+}
+
+/// A menu of the mailboxes mail could be autosorted to but isn't, each asking to turn it on.
+fn autosort_picker(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
+    let candidates = s.autosort_candidates();
+    if candidates.is_empty() {
+        return None;
+    }
+    let several = s.accounts.len() > 1;
+    let mut pick = Menu::new("autosort-pick")
+        .trigger(
+            Button::new("Autosort another mailbox…")
+                .icon(&PLUS)
+                .variant(ButtonVariant::Ghost)
+                .on_press(Mail::toggle_autosort_pick)
+                .build(k)
+                .key("autosort-add"),
+        )
+        .placement(Placement::BottomStart)
+        .min_width(220.0)
+        .open(s.asking == Some(Asking::AutosortPick))
+        .on_close(Mail::close_asking);
+    for (account, name, label) in candidates {
+        let label = if several {
+            format!("{label} · {}", s.label(&account))
+        } else {
+            label
+        };
+        pick = pick.item(MenuItem::new(label).on_select_tx(move |s: &mut Mail, tx| {
+            s.close_asking();
+            s.toggle_autosort(&account, &name);
+            tx.instant();
+        }));
+    }
+    let before = layer.len();
+    let built = pick.build(k, layer);
+    instant_since(layer, before);
+    Some(row().child(built))
 }
 
 /// What a list of only unread mail says once there's none: an inbox got to zero.
@@ -1090,6 +2153,7 @@ fn nothing_unread(s: &Mail, k: &Kit) -> El {
     let inbox = match &s.showing {
         Showing::All(role) => *role == Role::Inbox,
         Showing::Mailbox { name, .. } => name == INBOX_NAME,
+        Showing::Everything => false,
     };
     let (title, hint) = if inbox {
         (
@@ -1131,74 +2195,105 @@ fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     let now = ZonedDateTime::now();
     // Mail from several accounts says whose it is.
     let multiple_accounts = s.listing().account().is_none() && s.accounts.len() > 1;
+    // Searching all mail, each says which mailbox it's in.
+    let all_mail = *s.listing() == Showing::Everything;
     let sent = s.showing_sent();
-    let mut list = messages_column();
-    for m in s.shown() {
+    let mut list = messages_column(searching, &showing_title(s));
+    list = list.children(search_coverage(s, k));
+    for listed in s.list_rows() {
+        let m = match listed {
+            ListRow::Message(m) => m,
+            ListRow::Returned(m) => {
+                list = list.child(returned_row(s, m, k));
+                continue;
+            }
+        };
         let e = &m.envelope;
         let strong = if e.seen { k.ty.ui } else { k.ty.ui_medium };
         let (account, mailbox, uid) = (m.account.clone(), m.mailbox.clone(), e.uid);
         let (menu_account, menu_mailbox) = (account.clone(), mailbox.clone());
         let key = crate::state::message_key(m);
+        // Where a search found it in its text, once that's on this computer.
+        let second = second_line(s, m, k);
         // The keyboard's cursor, while the list shows.
         let under_cursor = s.reader.is_none() && s.cursor.as_ref() == Some(&key);
-        let mut line = row()
+        // While the search field has the keys, M types: the hint goes.
+        let m_works = under_cursor && !s.search.query.focused;
+        // The cursor's row stands apart from one under the pointer: a stronger fill and an
+        // accent edge, so a key acts on the row it looks like it will.
+        let line = row()
             .key(crate::state::row_key(&key))
+            // A row comes and goes at once: a search's rows never fade through the list's.
+            .transition(Transition::none())
             .fill(if under_cursor {
-                k.c.hover
+                k.c.pressed
             } else {
                 Color::TRANSPARENT
             })
-            .on_press(move |s: &mut Mail| s.open_message(&account, &mailbox, uid))
+            // Opens whole at once, never fading through near-black.
+            .on_press_tx(move |s: &mut Mail, tx| {
+                s.open_message(&account, &mailbox, uid);
+                tx.instant();
+            })
+            // Reaching another row, the pointer shows its buttons again.
+            .on_hover_change(releases_row_actions(key.clone()))
             .on_secondary_press(move |s: &mut Mail, point, _| {
                 s.open_message_menu(&menu_account, &menu_mailbox, uid, point);
             })
             .w_full()
-            .h(40.0)
-            .px(20.0)
-            .gap(14.0)
+            // A match in its text shows a line of it under the subject.
+            .h(if second.is_some() { 54.0 } else { 40.0 })
+            .pl(3.0)
+            .pr(20.0)
+            .gap(12.0)
             .center_y()
-            .hover(k.c.hover)
+            .hover(if under_cursor { k.c.pressed } else { k.c.hover })
             .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+            .child(
+                el().w(3.0)
+                    .h_full()
+                    .fill(match (under_cursor, s.search.query.focused) {
+                        // Muted while the keys go to the search field.
+                        (true, true) => k.c.border_strong,
+                        (true, false) => k.c.text_accent,
+                        _ => Color::TRANSPARENT,
+                    }),
+            )
             .child(dot(if e.seen {
                 Color::TRANSPARENT
             } else {
                 k.c.text_accent
             }))
-            .child(
-                text(if sent {
-                    format!("To: {}", postden_app::recipients(&e.to))
-                } else {
-                    e.from.label().to_owned()
-                })
-                .font(strong)
-                .color(k.c.text_base)
-                .truncate()
-                .w(190.0),
-            )
-            .child(subject(e, strong, k))
-            .child(tags(s, &key, k))
+            .child(sender_cell(s, e, sent, strong, k))
+            .child(subject(e, strong, s.search.query(), second, k))
+            .child(tags(
+                s,
+                &key,
+                s.kept_from_autosort(&m.account, e),
+                m_works,
+                k,
+            ))
             // A slot whether starred or not, so the dates line up.
             .child(if e.flagged {
                 icon(&STAR, 14.0).color(k.c.text_accent).label("Starred")
             } else {
                 el().w(14.0)
             });
-        if multiple_accounts {
-            line = line.child(
-                text(s.label(&m.account).to_owned())
-                    .font(k.ty.small)
-                    .color(k.c.text_faint)
-                    .truncate()
-                    .w(140.0),
-            );
-        }
-        let line = line.child(
-            row().w(64.0).justify_end().child(
-                text(postden_app::format_date(e.date, &now))
-                    .font(k.ty.small)
-                    .color(k.c.text_muted),
-            ),
-        );
+        // On the cursor's row and the one under the pointer, each acting on its own message:
+        // the cursor's stay where the keys act while the pointer is elsewhere.
+        let hovering = s.reader.is_none() && s.hovered_row.is_some();
+        let shows_actions = (under_cursor && !s.search.query.focused)
+            || (hovering && s.hovered_row.as_ref() == Some(&key));
+        let actions = (shows_actions && s.row_actions_held.as_ref() != Some(&key))
+            .then(|| row_actions(s, &key, under_cursor && !s.search.query.focused, k));
+        // The row the pointer's buttons act on, not the cursor's, is outlined as their target.
+        let pointer_target = actions.is_some() && hovering && !under_cursor;
+        let line = row_end(s, m, line, (all_mail, multiple_accounts), &now, actions, k);
+        let line = if pointer_target {
+            line.outline(1.0, -1.0, k.c.border_base)
+        } else {
+            line
+        };
         list = list.child(match &s.message_menu {
             Some(menu) if menu.is(&m.account, &m.mailbox, e.uid) => {
                 message_menu(s, m, menu, line, k, layer)
@@ -1206,6 +2301,12 @@ fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
             _ => line,
         });
     }
+    scrolling(s, list, searching, k)
+}
+
+/// The list's column, scrolling, ending with what reads older mail, and searching, what asks the
+/// server.
+fn scrolling(s: &Mail, mut list: El, searching: bool, k: &Kit) -> El {
     if s.has_older() {
         list = list.child(older(s, k));
     }
@@ -1215,13 +2316,283 @@ fn message_list(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     list.scroll(ScrollSpec {
         stick_bottom: false,
     })
+    // A row cut off at an edge fades out rather than leaving a sliver of its tags; one the
+    // cursor reaches stops clear of the fade.
+    .scroll_edge_fade(20.0)
+    .scroll_margin(20.0)
     .grow(1.0)
     .min_h(0.0)
 }
 
+/// The line under a row's subject, while there's one: where a search found it in its text (or
+/// that it did, while that text downloads), and, autosort having just brought it here, a way to
+/// send it back alone. On a line of its own, so the subject keeps its width.
+fn second_line(s: &Mail, m: &StoredMessage, k: &Kit) -> Option<El> {
+    let mut line = Vec::new();
+    if let Some(query) = s.search.query()
+        && !crate::search::matches(&m.envelope, query)
+    {
+        line.push(s.excerpt(m, query).map_or_else(
+            || {
+                text("Found in the message text")
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+            },
+            |excerpt| {
+                text(excerpt.clone())
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .spans(found_spans(&excerpt, query, k))
+                    .truncate()
+                    .min_w(0.0)
+                    .label("Matched in the message text")
+            },
+        ));
+    }
+    if s.in_last_batch(m) {
+        let message = m.clone();
+        line.push(text("Autosorted").font(k.ty.small).color(k.c.text_muted));
+        line.push(
+            Button::new("Move to Inbox")
+                .variant(ButtonVariant::Outline)
+                // A returned row keeps its place, so this one never slides under the pointer.
+                .on_press(move |s: &mut Mail| s.move_back_one(&message))
+                .build(k)
+                .key(format!("autosorted-move-back-{}", m.envelope.uid)),
+        );
+    }
+    (!line.is_empty()).then(|| row().gap(8.0).center_y().min_w(0.0).children(line))
+}
+
+/// What the pointer reaching the row `key` does: shows the cursor row's buttons again, unless
+/// it's still on the row they're held back for.
+fn releases_row_actions(
+    key: crate::search::MessageKey,
+) -> impl Fn(&mut Mail, bool, &mut Tx) + 'static {
+    move |s: &mut Mail, inside, _| {
+        if inside {
+            if s.hover_quiet_until
+                .is_some_and(|t| std::time::Instant::now() < t)
+            {
+                return;
+            }
+            s.hovered_row = Some(key.clone());
+            if s.row_actions_held.as_ref() != Some(&key) {
+                s.row_actions_held = None;
+            }
+        } else {
+            if s.hovered_row.as_ref() == Some(&key) {
+                s.hovered_row = None;
+            }
+            // Gone from the row they were held back on, the pointer can't click them unseen.
+            if s.row_actions_held.as_ref() == Some(&key) {
+                s.row_actions_held = None;
+            }
+        }
+    }
+}
+
+/// What a search looks through, as a line above what it found: where, which fields, and
+/// whether the mail server was asked too.
+fn search_coverage(s: &Mail, k: &Kit) -> Option<El> {
+    let query = s.search.query()?;
+    // Where it looked, the title and the controls above already say: here, how many it found.
+    let n = s.shown().count();
+    let found = if n == 1 {
+        format!("1 message matches “{query}”")
+    } else {
+        format!("{n} messages match “{query}”")
+    };
+    // Where it looked, beside what it found.
+    let coverage = match s.search.server() {
+        ServerSearch::Done => format!("{found} · on this computer and your mail server"),
+        ServerSearch::Running => format!("{found} so far"),
+        _ => format!("{found} · on this computer: subjects, people and downloaded text"),
+    };
+    Some(
+        row()
+            .key("search-coverage")
+            .transition(Transition::none())
+            .w_full()
+            .px(20.0)
+            .py(6.0)
+            .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+            .child(
+                text(coverage)
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .truncate(),
+            ),
+    )
+}
+
+/// The end of a message's row: its mailbox, searching all mail; its account, listing several;
+/// and its date.
+fn row_end(
+    s: &Mail,
+    m: &StoredMessage,
+    mut line: El,
+    (all_mail, multiple_accounts): (bool, bool),
+    now: &ZonedDateTime,
+    row_actions: Option<El>,
+    k: &Kit,
+) -> El {
+    if all_mail {
+        line = line.child(
+            row().w(80.0).justify_end().child(
+                text(shortened(&s.mailbox_label(&m.account, &m.mailbox)))
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+                    .truncate(),
+            ),
+        );
+    }
+    if multiple_accounts {
+        line = line.child(
+            text(s.label(&m.account).to_owned())
+                .font(k.ty.small)
+                .color(k.c.text_faint)
+                .truncate()
+                .w(140.0),
+        );
+    }
+    // Archive and Delete, when shown, in a slot every row keeps, so the date stays put.
+    line.child(row_actions.unwrap_or_else(|| el().w(ROW_ACTIONS_WIDTH)))
+        .child(
+            row().w(64.0).justify_end().child(
+                text(postden_app::format_date(m.envelope.date, now))
+                    .font(k.ty.small)
+                    .color(k.c.text_muted),
+            ),
+        )
+}
+
+/// How wide the slot is that every row keeps for its Archive and Delete buttons, just before
+/// its date, so neither the date nor the rest of the row moves as they come and go.
+const ROW_ACTIONS_WIDTH: f32 = 48.0;
+
+/// Archive and Delete for the message under the cursor, each as its key does, in the date's
+/// slot of its row.
+/// With `keyed`, on the cursor's row, their tooltips give the keys that act on it too; on a row
+/// the pointer is over, they don't, as the keys act on the cursor's.
+fn row_actions(s: &Mail, message: &crate::search::MessageKey, keyed: bool, k: &Kit) -> El {
+    // What this row's message can do, whichever the cursor is on (or none, in a mailbox just
+    // opened): moved to its account's Archive or Trash, unless it's there already.
+    let (account, mailbox, _) = message;
+    // Where sorting suggests Archive, its chip, always shown, is the one Archive control.
+    let suggested = s.suggested(message);
+    let offered = |role: Role| {
+        !s.settings_open
+            && s.mailbox_with_role(account, role)
+                .is_some_and(|b| b.name != *mailbox && suggested != Some(b.name.as_str()))
+    };
+    let mut group = row()
+        .w(ROW_ACTIONS_WIDTH)
+        .gap(2.0)
+        .justify_end()
+        .center_y()
+        .key("row-actions")
+        .transition(Transition::none());
+    for (command, icon, key, label) in [
+        (Command::Archive, &ARCHIVE, "row-archive", "Archive (E)"),
+        (Command::Trash, &TRASH, "row-trash", "Move to Trash (#)"),
+    ] {
+        let label = if keyed {
+            label
+        } else {
+            label.split(" (").next().unwrap_or(label)
+        };
+        let role = if command == Command::Archive {
+            Role::Archive
+        } else {
+            Role::Trash
+        };
+        if offered(role) {
+            group = group.child(
+                IconButton::new(icon)
+                    .variant(IconButtonVariant::GhostMuted)
+                    .label(label)
+                    .help(label)
+                    .on_press_tx({
+                        let message = message.clone();
+                        move |s: &mut Mail, tx| {
+                            // On this row's message, whichever the cursor is on.
+                            s.cursor = Some(message.clone());
+                            command.clone().run(s, tx);
+                            // The row taking its place, under the same pointer, waits to show its own.
+                            s.row_actions_held.clone_from(&s.cursor);
+                        }
+                    })
+                    .build(k)
+                    .key(key),
+            );
+        }
+    }
+    // The pointer's, apart from the cursor's, as a pill of their own: the keys act elsewhere.
+    if keyed {
+        group
+    } else {
+        group.fill(k.c.layer_02).radius(6.0)
+    }
+}
+
 /// A message's subject in the list, taking the room left, muted once it's read.
-fn subject(e: &postden_core::message::Envelope, strong: TextStyle, k: &Kit) -> El {
-    text(e.subject.clone().unwrap_or_else(|| "(no subject)".into()))
+/// Who a row's message is from, or, sent, whom it went to; matches of the search marked.
+fn sender_cell(
+    s: &Mail,
+    e: &postden_core::message::Envelope,
+    sent: bool,
+    strong: TextStyle,
+    k: &Kit,
+) -> El {
+    text(if sent {
+        format!("To: {}", postden_app::recipients(&e.to))
+    } else {
+        e.from.label().to_owned()
+    })
+    .spans(match (s.search.query(), sent) {
+        (Some(q), false) => found_spans(e.from.label(), q, k),
+        _ => Vec::new(),
+    })
+    .font(strong)
+    .color(k.c.text_base)
+    .truncate()
+    // Searching all mail, the mailbox's column takes some of its room.
+    .w(if *s.listing() == Showing::Everything {
+        112.0
+    } else {
+        120.0
+    })
+}
+
+/// The words of `query` found in `text`, marked as the kit's search marks them.
+fn found_spans(text: &str, query: &str, k: &Kit) -> Vec<rune::Span> {
+    crate::search::found_in(text, query)
+        .into_iter()
+        .map(|r| rune::Span {
+            color: Some(k.c.text_base),
+            weight: Some(650.0),
+            bg: Some(k.alpha(k.c.text_accent, 0.22)),
+            bg_pad: 1.0,
+            ..rune::Span::new(r.start, r.end)
+        })
+        .collect()
+}
+
+/// With a `second` line, as [`second_line`] makes, that's under it.
+fn subject(
+    e: &postden_core::message::Envelope,
+    strong: TextStyle,
+    query: Option<&str>,
+    second: Option<El>,
+    k: &Kit,
+) -> El {
+    let subject = e.subject.clone().unwrap_or_else(|| "(no subject)".into());
+    let spans = query.map_or_else(Vec::new, |q| found_spans(&subject, q, k));
+    // Cut short, the whole subject shows on hover.
+    let line = text(subject.clone())
+        .help_when_truncated(subject)
+        .spans(spans)
         .font(strong)
         .color(if e.seen {
             k.c.text_muted
@@ -1229,62 +2600,225 @@ fn subject(e: &postden_core::message::Envelope, strong: TextStyle, k: &Kit) -> E
             k.c.text_base
         })
         .truncate()
+        .min_w(0.0);
+    let Some(second) = second else {
+        return line.grow(1.0);
+    };
+    col()
         .grow(1.0)
         .min_w(0.0)
+        .gap(2.0)
+        .child(line)
+        .child(second)
+}
+
+/// A message just moved back out of the mailbox shown, in the place it had, said to be moved:
+/// the rows after it stay where the pointer last found them.
+fn returned_row(s: &Mail, m: &StoredMessage, k: &Kit) -> El {
+    let e = &m.envelope;
+    let back = s.mailbox_with_role(&m.account, Role::Inbox).map_or_else(
+        || "Inbox".to_owned(),
+        |b| s.mailbox_label(&m.account, &b.name),
+    );
+    row()
+        .key(format!("returned-{}", e.uid))
+        .transition(Transition::none())
+        .w_full()
+        .h(54.0)
+        .pl(3.0)
+        .pr(20.0)
+        .gap(12.0)
+        .center_y()
+        .border_sides([0.0, 0.0, 1.0, 0.0], k.c.border_weak)
+        .opacity(0.7)
+        .child(el().w(3.0))
+        .child(dot(Color::TRANSPARENT))
+        .child(sender_cell(s, e, false, k.ty.ui, k))
+        .child(subject(
+            e,
+            k.ty.ui,
+            None,
+            Some(
+                text(if s.is_moving(m) {
+                    format!("Moving to {back}…")
+                } else {
+                    format!("Moved to {back}")
+                })
+                // Its status readable, though the message itself is set back.
+                .font(k.ty.small_medium)
+                .color(k.c.text_base),
+            ),
+            k,
+        ))
 }
 
 /// What sorting says of a message in the list: that it seems important, and where it seems to
 /// belong, which moves it there when pressed (or with M).
-fn tags(s: &Mail, key: &crate::search::MessageKey, k: &Kit) -> El {
+/// Under the cursor, the suggestion spells out what M does.
+fn tags(
+    s: &Mail,
+    key: &crate::search::MessageKey,
+    kept_from: Option<&str>,
+    focused: bool,
+    k: &Kit,
+) -> El {
     // Narrow, the folder's name is cut short rather than the date pushed off the row.
     let mut tags = row().gap(6.0).center_y().shrink();
+    // Moved back from where autosort put it, it says it stays, not that it could go there;
+    // searching, the subject has that room, and the row names its mailbox anyway.
+    // Only once it's back: still where autosort put it, it isn't kept anywhere yet.
+    if let Some(from) = kept_from
+        && key.1 != from
+        && s.suggested(key).is_none_or(|to| to == from)
+    {
+        if s.search.is_active() {
+            return tags;
+        }
+        let label = s.mailbox_label(&key.0, from);
+        return tags.child(
+            text(format!("Kept in {}", s.mailbox_label(&key.0, &key.1)))
+                .font(k.ty.small)
+                .color(k.c.text_muted)
+                .help(format!("Moved back from {label}: autosort leaves it here")),
+        );
+    }
     let Some(t) = s.tags(key) else {
         return tags;
     };
     if t.important {
-        tags = tags.child(
-            Badge::new("Important")
-                .variant(BadgeVariant::Accent)
-                .build(k),
-        );
+        // Beside a suggestion, the subject needs the room: said by a mark, named on hover.
+        let crowded = s.suggested(key).is_some() && (!s.search.is_active() || focused);
+        tags = tags.child(if crowded {
+            row()
+                .size(18.0, 18.0)
+                .center()
+                .radius(9.0)
+                .fill(k.c.layer_02)
+                .label("Likely important")
+                .help("Likely important: sorting on this computer thinks this matters to you")
+                .child(text("!").font(k.ty.small_medium).color(k.c.text_muted))
+        } else {
+            // Quieter than what the user marked themselves, a star.
+            Badge::new("Likely important")
+                .variant(BadgeVariant::Subtle)
+                .build(k)
+                .help("Sorting on this computer thinks this matters to you")
+        });
     }
-    if let Some(to) = s.suggested(key) {
+    // Searching, a row's subject and the text it matched need the room: where it could go
+    // shows on the row at hand, under the cursor or the pointer.
+    let at_hand = focused || s.hovered_row.as_ref() == Some(key);
+    if let Some(to) = s
+        .suggested(key)
+        .filter(|_| at_hand || !s.search.is_active())
+    {
         let label = s.mailbox_label(&key.0, to);
         let (pressed, shown) = (key.clone(), to.to_owned());
+        // Archive suggested, this is the row's one Archive control, so E works on it too.
+        let archives = s
+            .mailbox_with_role(&key.0, Role::Archive)
+            .is_some_and(|b| b.name == to);
         tags = tags.child(
             row()
-                // Of its destination too: a press held while that changes is no press on it.
-                .key(format!("suggested-{}-{to}", crate::state::row_key(key)))
+                // Of its destination too: a press held while that changes is no press on it. And of
+                // whether it's spelled out, so it's swapped whole rather than stretched.
+                .key(format!(
+                    "suggested-{}-{to}-{focused}",
+                    crate::state::row_key(key)
+                ))
+                .transition(Transition::none())
                 .role("button")
-                .label(format!("Move to {label} (M)"))
+                // M moves the message under the cursor, so only its badge says so.
+                .label(if focused {
+                    format!("Move to {label} (M)")
+                } else {
+                    format!("Move to {label}")
+                })
+                .help(if focused && archives {
+                    format!("Sorting on this computer suggests {label}: press this, M or E")
+                } else if focused {
+                    format!(
+                        "Sorting on this computer suggests {label}: press this, or M, to move it"
+                    )
+                } else {
+                    format!("Sorting on this computer suggests {label}: press this to move it")
+                })
                 .radius(3.0)
                 .hover(k.c.hover)
+                // Easier to hit than it looks: the row's height, the badge centred in it.
+                .min_h(30.0)
+                .center_y()
                 .on_press(move |s: &mut Mail| s.move_as_suggested(&pressed, &shown))
                 .shrink()
-                .child(shrinking_badge(format!("→ {}", shortened(&label)), k).a11y_hidden()),
+                .child(
+                    suggestion_badge(
+                        format!("Move to {}", shortened(&label)),
+                        focused,
+                        focused || s.hovered_row.as_ref() == Some(key),
+                        k,
+                    )
+                    .a11y_hidden(),
+                ),
         );
     }
     tags
 }
 
-/// A badge like the kit's, whose text is cut short with "…" once its row has no room for it.
-fn shrinking_badge(label: String, k: &Kit) -> El {
+/// Where sorting suggests a message goes, as a button: a badge in the accent's outline. Under
+/// the cursor it shows M, the key that moves it there, in a slot it keeps either way, so the row
+/// doesn't reflow as the cursor passes.
+fn suggestion_badge(label: String, focused: bool, lit: bool, k: &Kit) -> El {
+    let font = TextStyle {
+        line_height: 11.0,
+        ..k.ty.small_medium
+    };
     row()
         .center()
-        .h(16.0)
-        .px(4.0)
-        .radius(2.0)
+        .h(18.0)
+        .pl(7.0)
+        .pr(3.0)
+        .gap(5.0)
+        .radius(5.0)
         .fill(k.c.layer_02)
-        .border(0.5, k.c.border_base)
+        // Quiet until it's the one M acts on: the messages come first, not what to do with them.
+        // A button at rest, in full text; blue where it's at hand, under the pointer or the
+        // cursor; M only where the keys act.
+        .border(
+            1.0,
+            if lit {
+                k.c.border_focus
+            } else {
+                k.c.border_strong
+            },
+        )
         .shrink()
+        // An arrow: something it does, not only something said of the message.
+        .child(
+            text("→")
+                .font(font)
+                .color(if lit { k.c.text_accent } else { k.c.text_base }),
+        )
         .child(
             text(label)
-                .font(TextStyle {
-                    line_height: 11.0,
-                    ..k.ty.small_medium
-                })
-                .color(k.c.text_muted)
+                .font(font)
+                .color(if lit { k.c.text_accent } else { k.c.text_base })
                 .truncate(),
+        )
+        .child(
+            row()
+                .center()
+                .size(12.0, 12.0)
+                .radius(6.0)
+                .fill(if focused {
+                    k.c.bg_accent
+                } else {
+                    Color::TRANSPARENT
+                })
+                .child(text("M").font(font).color(if focused {
+                    k.c.text_contrast
+                } else {
+                    Color::TRANSPARENT
+                })),
         )
 }
 
@@ -1300,9 +2834,16 @@ fn shortened(label: &str) -> String {
 
 /// The list's column. Back from what covered it (a message, the settings, a message being
 /// written), the list comes back at its top: it scrolls to its cursor.
-fn messages_column() -> El {
+/// The list's column, another while searching and for each list shown, so the results and the
+/// list, or one mailbox and the next, swap whole rather than sliding through each other.
+fn messages_column(searching: bool, showing: &str) -> El {
     col()
-        .key("messages")
+        .key(if searching {
+            format!("messages-search-{showing}")
+        } else {
+            format!("messages-{showing}")
+        })
+        .transition(Transition::none())
         .w_full()
         .on_visible(|s: &mut Mail, shown, tx| {
             if shown {
@@ -1378,7 +2919,10 @@ fn message_menu(
         }
     }));
     items = message_menu_moves(s, m, menu, items);
-    items.build(k, layer).w_full()
+    let before = layer.len();
+    let built = items.build(k, layer).w_full();
+    instant_since(layer, before);
+    built
 }
 
 /// The end of a message's menu: snoozing it, and moving it to another of its account's mailboxes.
@@ -1451,6 +2995,16 @@ fn message_menu_moves(s: &Mail, m: &StoredMessage, menu: &MessageMenu, mut items
         };
         items = items.item(MenuItem::new(format!("Move to {label}")).on_select(suggested));
     }
+    // One of a batch autosort just moved can go back alone.
+    if s.in_last_batch(m) {
+        let message = m.clone();
+        items = items.item(
+            MenuItem::new("Move back to Inbox").on_select(move |s: &mut Mail| {
+                s.close_message_menu();
+                s.move_back_one(&message);
+            }),
+        );
+    }
     if let Some(archive) = archive {
         items = items.item(MenuItem::new("Archive").on_select(move_to(&archive.name)));
     }
@@ -1469,7 +3023,7 @@ fn message_menu_moves(s: &Mail, m: &StoredMessage, menu: &MessageMenu, mut items
     }
     if let Some(trash) = elsewhere(Role::Trash) {
         items = items.separator().item(
-            MenuItem::new("Delete")
+            MenuItem::new("Move to Trash")
                 .danger(true)
                 .on_select(move_to(&trash.name)),
         );
@@ -1506,19 +3060,11 @@ fn older(s: &Mail, k: &Kit) -> El {
 }
 
 /// How long the spinner waits before showing, so a message that downloads quickly never flashes it.
-const SPINNER_DELAY: f32 = 0.15;
+const SPINNER_DELAY: f32 = 0.3;
 
 /// The open message: a spinner while it downloads, then its headers and text, which rise in.
-fn message(r: &Reader, k: &Kit) -> El {
-    let Some(body) = &r.body else {
-        return col().key("downloading").w_full().grow(1.0).center().child(
-            Spinner::new()
-                .size(24.0)
-                .color(k.c.icon_muted)
-                .build(k)
-                .enter_delay(SPINNER_DELAY),
-        );
-    };
+/// A message's subject, star, sender and date, then its To and Cc once its text is here.
+fn reader_header(r: &Reader, k: &Kit) -> El {
     let e = &r.message.envelope;
     let subject = e.subject.clone().unwrap_or_else(|| "(no subject)".into());
     let mut header = col()
@@ -1526,6 +3072,7 @@ fn message(r: &Reader, k: &Kit) -> El {
         .child({
             let subject = text(subject)
                 .key("subject")
+                .transition(Transition::none())
                 .font(SUBJECT)
                 .color(k.c.text_base)
                 .wrap()
@@ -1542,18 +3089,63 @@ fn message(r: &Reader, k: &Kit) -> El {
                 .gap(8.0)
                 .children(std::iter::once(subject).chain(star))
         })
-        .child(header_line(k, "From", std::slice::from_ref(&e.from)));
-    if let Ok(body) = body {
+        // The date sits beside who it's from, so the To and Cc lines arriving with the text
+        // don't move it.
+        .child({
+            let date = long_date(e.date).map(|date| {
+                text(date)
+                    .key("date")
+                    .transition(Transition::none())
+                    .font(k.ty.small)
+                    .color(k.c.text_muted)
+            });
+            row()
+                .gap(12.0)
+                .w_full()
+                .child(
+                    header_line(k, "From", std::slice::from_ref(&e.from))
+                        .grow(1.0)
+                        .min_w(0.0),
+                )
+                .children(date)
+        });
+    if let Some(Ok(body)) = &r.body {
         if !body.to.is_empty() {
-            header = header.child(header_line(k, "To", &body.to));
+            header = header.child(
+                header_line(k, "To", &body.to)
+                    .key("to")
+                    .transition(Transition::none()),
+            );
         }
         if !body.cc.is_empty() {
-            header = header.child(header_line(k, "Cc", &body.cc));
+            header = header.child(
+                header_line(k, "Cc", &body.cc)
+                    .key("cc")
+                    .transition(Transition::none()),
+            );
         }
     }
-    if let Some(date) = long_date(e.date) {
-        header = header.child(text(date).font(k.ty.small).color(k.c.text_muted));
-    }
+    header
+}
+
+fn message(r: &Reader, k: &Kit) -> El {
+    let header = reader_header(r, k);
+    // Who it's from and what it's about show at once; only its text waits to download.
+    let Some(body) = &r.body else {
+        let waiting = row()
+            .key("downloading")
+            // Gone the frame the text is there, never over it.
+            .transition(Transition::none())
+            .w_full()
+            .py(24.0)
+            .center()
+            // Only once it's taken a while: a quick download shows none.
+            .children(
+                r.waited
+                    .then(|| Spinner::new().size(20.0).color(k.c.icon_muted).build(k)),
+            );
+        return reader_frame(r, header, waiting, k);
+    };
     let content = match body {
         Err(error) => col()
             .key("open-failed")
@@ -1571,6 +3163,7 @@ fn message(r: &Reader, k: &Kit) -> El {
                 content = content.child(
                     text(format!("Attachments: {}", body.attachments.join(", ")))
                         .key("attachments")
+                        .transition(Transition::none())
                         .font(k.ty.small)
                         .color(k.c.text_muted)
                         .wrap(),
@@ -1585,7 +3178,9 @@ fn message(r: &Reader, k: &Kit) -> El {
                             .selectable(true)
                             .on_link_tx(|s: &mut Mail, url: &str, tx: &mut Tx| s.open_link(url, tx))
                             .build(k)
-                            .key("body"),
+                            .key("body")
+                            // In full the frame it's there, not faded up from nothing.
+                            .transition(Transition::none()),
                     ),
                     k,
                 );
@@ -1595,7 +3190,14 @@ fn message(r: &Reader, k: &Kit) -> El {
             } else {
                 text(body.text.clone()).color(k.c.text_base)
             };
-            content.child(shown.key("body").font(k.ty.body).wrap().selectable(true))
+            content.child(
+                shown
+                    .key("body")
+                    .transition(Transition::none())
+                    .font(k.ty.body)
+                    .wrap()
+                    .selectable(true),
+            )
         }
     };
     reader_frame(r, header, content, k)
@@ -1609,8 +3211,9 @@ fn reader_frame(r: &Reader, header: El, content: El, k: &Kit) -> El {
             "reader-{}",
             crate::state::row_key(&crate::state::message_key(&r.message))
         ))
-        // Fades and rises a few points into place as the download lands.
-        .transition(Transition::offset(0.0, 8.0).combined(Transition::opacity()))
+        // Opaque, and in place at once: the list and it never show through each other.
+        .transition(Transition::none())
+        .fill(k.c.bg_base)
         .w_full()
         .child(
             col()
@@ -2468,6 +4071,8 @@ fn settings(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
         .key("settings-sections");
     let mut page = col()
         .key("settings")
+        // Swapped with the list at once, never faded through it.
+        .transition(Transition::none())
         .w_full()
         .max_w(560.0)
         .padding(24.0)
@@ -2482,6 +4087,8 @@ fn settings(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
     };
     col()
         .key("settings-scroll")
+        // Swapped with the list at once, never faded through it.
+        .transition(Transition::none())
         .w_full()
         .child(page)
         .scroll(ScrollSpec {
@@ -2512,33 +4119,10 @@ fn general_settings(s: &Mail, k: &Kit, page: El, layer: &mut Vec<El>) -> El {
             k,
             "Sorting mail",
             Some(
-                "Postden learns, on this computer, from what you do with your mail: where you \
-                 file it, what you keep in your inbox, what you star or delete, and who you \
-                 write to. Once it's often right, inbox mail that looks like it belongs in a \
-                 mailbox is tagged with it (press the tag, or M, to move it there), and mail \
-                 that looks important says so. To have mail moved by itself instead, right-click \
-                 a mailbox and choose Autosort mail here: inbox mail from the last few days that \
-                 it's sure belongs there goes there, and so does new mail as it comes, each \
-                 message once. Nothing leaves your computer, unless you export what it learned \
-                 with your accounts.",
+                "Learned on this computer from where you file mail, what you keep, star or \
+                 delete, and who you write to. What sorting learns stays on this computer.",
             ),
-            row()
-                .gap(12.0)
-                .center_y()
-                .child(
-                    Switch::new(s.settings.sort_mail)
-                        .label("Sort my inbox")
-                        .on_toggle(|s: &mut Mail| s.set_sort_mail(!s.settings.sort_mail))
-                        .build(k)
-                        .key("sort-mail"),
-                )
-                .child(
-                    Button::new("Forget what it learned")
-                        .variant(ButtonVariant::Ghost)
-                        .on_press(Mail::forget_sorting)
-                        .build(k)
-                        .key("forget-sorting"),
-                ),
+            sorting_settings(s, k, layer),
         ))
         .child(setting_section(
             k,
@@ -2547,21 +4131,25 @@ fn general_settings(s: &Mail, k: &Kit, page: El, layer: &mut Vec<El>) -> El {
                 "Postden tells you about new mail in your inboxes while its window isn't in \
                  front: who sent it and its subject, or how many messages came.",
             ),
-            Switch::new(s.settings.notify_new_mail)
-                .label("Notify me of new mail")
-                .on_toggle(|s: &mut Mail| s.set_notify_new_mail(!s.settings.notify_new_mail))
-                .build(k)
-                .key("notify-new-mail"),
+            labeled_switch(
+                "Notify me of new mail",
+                Switch::new(s.settings.notify_new_mail)
+                    .on_toggle(|s: &mut Mail| s.set_notify_new_mail(!s.settings.notify_new_mail)),
+                "notify-new-mail",
+                k,
+            ),
         ))
         .child(setting_section(
             k,
             "Closing the window",
             Some(CLOSING_ABOUT),
-            Switch::new(s.settings.keep_running)
-                .label("Keep running in the background")
-                .on_toggle(|s: &mut Mail| s.set_keep_running(!s.settings.keep_running))
-                .build(k)
-                .key("keep-running"),
+            labeled_switch(
+                "Keep running in the background",
+                Switch::new(s.settings.keep_running)
+                    .on_toggle(|s: &mut Mail| s.set_keep_running(!s.settings.keep_running)),
+                "keep-running",
+                k,
+            ),
         ))
         .child(setting_section(
             k,
@@ -2667,11 +4255,13 @@ fn prefetch_setting(s: &Mail, k: &Kit) -> El {
     })
     .build(k)
     .key("prefetch");
-    let keep_opened = Switch::new(s.settings.keep_opened)
-        .label("Keep opened messages downloaded")
-        .on_toggle(|s: &mut Mail| s.set_keep_opened(!s.settings.keep_opened))
-        .build(k)
-        .key("keep-opened");
+    let keep_opened = labeled_switch(
+        "Keep opened messages downloaded",
+        Switch::new(s.settings.keep_opened)
+            .on_toggle(|s: &mut Mail| s.set_keep_opened(!s.settings.keep_opened)),
+        "keep-opened",
+        k,
+    );
     let clear = Button::new("Clear downloaded messages")
         .on_press(Mail::clear_downloaded)
         .build(k)
@@ -2699,11 +4289,13 @@ fn prefetch_setting(s: &Mail, k: &Kit) -> El {
 /// Whether the people mail is sent to are remembered, to suggest them as recipients, and a
 /// button to forget them.
 fn contacts_setting(s: &Mail, k: &Kit) -> El {
-    let remember = Switch::new(s.settings.remember_contacts)
-        .label("Remember who I write to")
-        .on_toggle(|s: &mut Mail| s.set_remember_contacts(!s.settings.remember_contacts))
-        .build(k)
-        .key("remember-contacts");
+    let remember = labeled_switch(
+        "Remember who I write to",
+        Switch::new(s.settings.remember_contacts)
+            .on_toggle(|s: &mut Mail| s.set_remember_contacts(!s.settings.remember_contacts)),
+        "remember-contacts",
+        k,
+    );
     let forget = Button::new("Forget contacts")
         .on_press(Mail::forget_contacts)
         .build(k)
@@ -3752,13 +5344,13 @@ fn updates(s: &Mail, k: &Kit, layer: &mut Vec<El>) -> El {
                 .color(k.c.text_muted)
                 .selectable(true),
         )
-        .child(
+        .child(labeled_switch(
+            "Check for updates automatically",
             Switch::new(s.settings.check_updates)
-                .label("Check for updates automatically")
-                .on_toggle(|s: &mut Mail| s.set_check_updates(!s.settings.check_updates))
-                .build(k)
-                .key("auto-update"),
-        )
+                .on_toggle(|s: &mut Mail| s.set_check_updates(!s.settings.check_updates)),
+            "auto-update",
+            k,
+        ))
         .child(channel(s, k, layer))
         .child(buttons);
     let status = u.status();
