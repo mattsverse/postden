@@ -50,7 +50,7 @@ use postden_secrets::Backend;
 pub use profile::{
     ImportOptions, Imported, MIN_PASSPHRASE, Profile, ProfileAccount, ProfileSettings, is_sealed,
 };
-pub use settings::{POLL_INTERVALS, PREFETCH_COUNTS, Settings, Theme};
+pub use settings::{POLL_INTERVALS, PREFETCH_COUNTS, Settings, Theme, ThreadOrder, ThreadRail};
 pub use sorting::{Autosort, Sorted, Sorter, Tags, is_filed_in};
 
 /// Why a Postden operation failed, phrased for the user.
@@ -368,6 +368,8 @@ mod tests {
             date: None,
             seen: false,
             flagged: false,
+            in_reply_to: None,
+            references: Vec::new(),
         };
         let alert = |unread: &[Envelope]| new_mail_alert("Work", unread);
         let pair = |title: &str, body: &str| Some((title.to_owned(), body.to_owned()));

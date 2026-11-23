@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use jiff::{Timestamp, ZonedDateTime};
 use postden_app::{
     Autosort, Draft, Imported, Login, Mailroom, Passwords, Profile, Settings, Sorted, Sorter, Tags,
-    Theme, Update, check_logins, contacts, eml_file_name, finish_google_sign_in, import, is_sealed,
-    password_key, remove_account, save_account, signature, smtp_password_key, start_google_sign_in,
+    Theme, ThreadOrder, ThreadRail, Update, check_logins, contacts, eml_file_name,
+    finish_google_sign_in, import, is_sealed, password_key, remove_account, save_account,
+    signature, smtp_password_key, start_google_sign_in,
 };
 use postden_core::account::{Account, Signature};
 use postden_core::message::{Address, Body, Envelope, Mailbox, Role};
@@ -32,6 +33,7 @@ use crate::compose::{ComposeForm, Mode, Recipients};
 use crate::form::{AccountForm, AppAccounts, GoogleSignIn, Imports, Step, Unreadable, is_set_up};
 use crate::notifications::{self, Alert, Target};
 use crate::search::{self, MailboxKey, MessageKey, SERVER_PAGE, Search};
+use crate::thread::Thread;
 use crate::transfer::{self, Transfer};
 use crate::update::{self, Phase, Updater};
 
@@ -70,6 +72,9 @@ pub(crate) struct Reader {
     /// Whether its text has been downloading long enough to say so: one quick to come shows
     /// no spinner at all.
     pub(crate) waited: bool,
+    /// The thread it's in, as cached, laid out for the rail beside it: just this message when
+    /// it's in none.
+    pub(crate) thread: Thread,
 }
 
 impl Reader {
@@ -524,6 +529,9 @@ const UNDO_HISTORY: usize = 10;
 
 /// How long a message's text may take to download before the reader shows a spinner for it.
 const READER_SPINNER_MS: u64 = 300;
+/// How much of each message's text the thread's rail reads, at most, for the few words it
+/// shows: enough to pass what a reply quotes at its top.
+const SNIPPET_READ: usize = 2000;
 
 /// How long a notice shows before it closes on its own.
 const NOTICE_SECS: u64 = 6;
@@ -678,6 +686,12 @@ pub(crate) struct Mail {
     pending_reply: Option<(MessageKey, Answer)>,
     /// Messages being moved, left out of the list until the server answers.
     moving: HashSet<MessageKey>,
+    /// The list's row J and K go on from while the message open, reached through its thread's
+    /// rail, isn't listed: the one the thread was opened from.
+    thread_anchor: Option<MessageKey>,
+    /// How each downloaded message's text begins, as the thread's rail shows it, once read: or
+    /// that it says nothing but what it quotes.
+    snippets: HashMap<MessageKey, Option<String>>,
     /// Mailboxes being marked read, as asked with [`Mail::mark_all_seen`], until the server answers.
     marking_seen: HashSet<MailboxKey>,
     /// Mailboxes being refreshed, as asked with [`Mail::refresh_mailbox`], with the number of the
@@ -854,6 +868,8 @@ impl Mail {
             next_delete: 0,
             pending_reply: None,
             moving: HashSet::new(),
+            thread_anchor: None,
+            snippets: HashMap::new(),
             marking_seen: HashSet::new(),
             refreshing: HashMap::new(),
             refreshing_all: HashMap::new(),
@@ -1454,6 +1470,8 @@ impl Mail {
                 self.notify(format!("couldn't read mail: {e}"));
             }
         }
+        // Its messages as listed now, and those that came since.
+        self.refresh_thread();
     }
 
     /// One of an account's mailboxes started over: what was older is to be fetched again, and
@@ -1462,6 +1480,8 @@ impl Mail {
     fn started_over(&mut self, account: &str, mailbox: &str) {
         self.no_older
             .remove(&(account.to_owned(), mailbox.to_owned()));
+        self.snippets
+            .retain(|key, _| key.0 != account || key.1 != mailbox);
         self.search.forget_mailbox(account, mailbox);
         self.starring
             .retain(|key, _| key.0 != account || key.1 != mailbox);
@@ -1555,8 +1575,9 @@ impl Mail {
             }
             update @ Update::Opened { .. } => self.opened_update(update, tx),
             // Sent mail is shown as it's listed, without a notice.
-            // New mail, or the text of what a search found in it, can be shown now.
-            Update::Mail { .. } | Update::Peeked { .. } => self.reload(),
+            // New mail, the text of what a search found in it, or the threads of mail cached
+            // before they were fetched, can be shown now.
+            Update::Mail { .. } | Update::Peeked { .. } | Update::Threaded { .. } => self.reload(),
             update @ Update::Unread { .. } => self.unread_found(&update),
             Update::Mailboxes { account } => self.mailboxes_listed(&account),
             Update::Older {
@@ -2243,7 +2264,14 @@ impl Mail {
         };
         let open = self.reader.as_ref().map(|r| message_key(&r.message));
         let from = open.clone().or_else(|| self.cursor.clone());
-        let at = from.and_then(|k| keys.iter().position(|x| *x == k));
+        let at = from
+            .and_then(|k| keys.iter().position(|x| *x == k))
+            .or_else(|| {
+                // Opened from its thread's rail, a message the list doesn't show goes on from the
+                // row the thread was opened from.
+                let anchor = self.thread_anchor.as_ref().filter(|_| open.is_some())?;
+                keys.iter().position(|x| x == anchor)
+            });
         let row = match at {
             Some(i) => i.saturating_add_signed(by).min(last),
             // An open message the list doesn't show has no next one.
@@ -2608,6 +2636,7 @@ impl Mail {
         self.put_away
             .remove(&(account.to_owned(), mailbox.to_owned(), uid));
         self.pending_reply = None;
+        self.thread_anchor = None;
         let listed = self
             .messages
             .iter()
@@ -2646,6 +2675,7 @@ impl Mail {
             markdown: None,
             uid_validity,
             waited: false,
+            thread: Thread::default(),
         };
         let mut started = true;
         if let Ok(services) = &self.services {
@@ -2702,7 +2732,134 @@ impl Mail {
         if reader.body.is_none() {
             self.spinner_after_a_while(message_key(&reader.message));
         }
+        reader.thread = self.read_thread(&reader.message);
         self.reader = Some(reader);
+    }
+
+    /// The thread `open` is in, as cached, each message as the list shows it, with the start of
+    /// its text where that's downloaded.
+    fn read_thread(&mut self, open: &StoredMessage) -> Thread {
+        let Ok(services) = &self.services else {
+            return Thread::new(vec![open.clone()]);
+        };
+        let open_key = message_key(open);
+        let mut messages = services
+            .store
+            .thread(open)
+            .unwrap_or_else(|_| vec![open.clone()]);
+        // Those on their way elsewhere aren't to be opened from here, as from the list.
+        messages.retain(|m| {
+            let key = message_key(m);
+            key == open_key || !self.moving.contains(&key)
+        });
+        let mut thread = Thread::new(messages);
+        for row in &mut thread.rows {
+            let key = message_key(&row.message);
+            if key == open_key {
+                row.message = open.clone();
+            } else if let Some(listed) = self.messages.iter().find(|m| message_key(m) == key) {
+                row.message = listed.clone();
+            } else {
+                self.shown_as_asked(&mut row.message);
+            }
+            // Read once per message: its text doesn't change, and reading it means loading
+            // all of it. One not downloaded yet is looked for again, as it may be by then.
+            if let Some(snippet) = self.snippets.get(&key) {
+                row.snippet.clone_from(snippet);
+                continue;
+            }
+            let Some(text) = services
+                .store
+                .text_start(&key.0, &key.1, key.2, SNIPPET_READ)
+                .ok()
+                .flatten()
+            else {
+                continue;
+            };
+            row.snippet = crate::thread::snippet(&text);
+            self.snippets.insert(key, row.snippet.clone());
+        }
+        thread
+    }
+
+    /// Reads the open message's thread again, as what's cached of it changed.
+    fn refresh_thread(&mut self) {
+        let Some(open) = self.reader.as_ref().map(|r| r.message.clone()) else {
+            return;
+        };
+        let thread = self.read_thread(&open);
+        if let Some(reader) = &mut self.reader {
+            reader.thread = thread;
+        }
+    }
+
+    /// Whether the open message is in a thread of more than itself, for its rail to show.
+    pub(crate) fn has_thread(&self) -> bool {
+        self.reader
+            .as_ref()
+            .is_some_and(|r| r.thread.rows.len() > 1)
+    }
+
+    /// Opens a message of the open one's thread. The list's cursor stays where it was when the
+    /// list doesn't show it, so J and K go on from there.
+    pub(crate) fn open_in_thread(&mut self, key: &MessageKey) {
+        let listed = |s: &Self, key: &MessageKey| s.messages.iter().any(|m| message_key(m) == *key);
+        // The row it was opened from: the one open, if listed, else the one before it was.
+        let anchor = self
+            .reader
+            .as_ref()
+            .map(|r| message_key(&r.message))
+            .filter(|open| listed(self, open))
+            .or_else(|| self.thread_anchor.clone())
+            .or_else(|| self.cursor.clone());
+        self.open_message(&key.0, &key.1, key.2);
+        if !listed(self, key) {
+            self.cursor.clone_from(&anchor);
+            self.thread_anchor = anchor;
+        }
+    }
+
+    /// Opens the message `by` places later in the open one's thread, by date, or earlier for a
+    /// negative `by`, if there's one.
+    pub(crate) fn step_thread(&mut self, by: isize) {
+        let Some(reader) = &self.reader else { return };
+        let Some(at) = reader.thread.position(&message_key(&reader.message)) else {
+            return;
+        };
+        let Some(row) = at
+            .checked_add_signed(by)
+            .and_then(|to| reader.thread.rows.get(to))
+        else {
+            return;
+        };
+        let key = message_key(&row.message);
+        self.open_in_thread(&key);
+    }
+
+    /// Shows the rail beside an open message's thread as `rail` says, from now on.
+    pub(crate) fn set_thread_rail(&mut self, rail: ThreadRail) {
+        if self.settings.thread_rail == rail {
+            return;
+        }
+        self.settings.thread_rail = rail;
+        self.save_settings();
+    }
+
+    /// Shrinks the thread's rail to its graph, or shows it whole again, as ⇧⌘T does.
+    pub(crate) fn toggle_thread_rail(&mut self) {
+        self.set_thread_rail(match self.settings.thread_rail {
+            ThreadRail::Open => ThreadRail::Strip,
+            ThreadRail::Strip | ThreadRail::Hidden => ThreadRail::Open,
+        });
+    }
+
+    /// Starts each thread's rail from its oldest message or its newest, from now on.
+    pub(crate) fn set_thread_order(&mut self, order: ThreadOrder) {
+        if self.settings.thread_order == order {
+            return;
+        }
+        self.settings.thread_order = order;
+        self.save_settings();
     }
 
     /// Lets the reader show a spinner for the message `key`'s text, if it's still downloading
@@ -2747,6 +2904,7 @@ impl Mail {
     /// being marked so is put away, for a list of only unread mail: the messages listed, as those J
     /// and K went through, and the one open, listed or not, as when opened from a notification.
     fn leave_reader(&mut self) {
+        self.thread_anchor = None;
         let Some(reader) = self.reader.take() else {
             return;
         };
@@ -3281,10 +3439,16 @@ impl Mail {
         } else {
             self.unreading.insert(key);
         }
-        if let Some(reader) = &mut self.reader
-            && reader.is(account, mailbox, uid)
-        {
-            reader.message.envelope.seen = seen;
+        if let Some(reader) = &mut self.reader {
+            if reader.is(account, mailbox, uid) {
+                reader.message.envelope.seen = seen;
+            }
+            // Its dot in the thread's rail too, at once.
+            for row in &mut reader.thread.rows {
+                if is_message(&row.message, account, mailbox, uid) {
+                    row.message.envelope.seen = seen;
+                }
+            }
         }
         if let Some(listed) = self
             .messages
@@ -5311,7 +5475,13 @@ impl Mail {
     pub(crate) fn retry_open(&mut self) {
         if let Some(r) = self.reader.take() {
             let m = r.message;
+            // Still the message the rail opened: J and K go on from where they did.
+            let anchor = self.thread_anchor.take();
             self.open_message(&m.account, &m.mailbox, m.envelope.uid);
+            if anchor.is_some() {
+                self.cursor.clone_from(&anchor);
+            }
+            self.thread_anchor = anchor;
         }
     }
 
@@ -7371,6 +7541,7 @@ impl Mail {
         }
         self.undo_history.retain(|(u, _)| u.account() != id);
         self.undoing.retain(|u| u.account() != id);
+        self.snippets.retain(|key, _| key.0 != id);
         self.unanswered.retain(|(key, _), _| key.0 != id);
         self.read_later.retain(|key, _| key.0 != id);
         self.starring.retain(|key, _| key.0 != id);
@@ -8541,6 +8712,8 @@ mod tests {
                 date: None,
                 seen: true,
                 flagged: false,
+                in_reply_to: None,
+                references: Vec::new(),
             },
         };
         s.reader = Some(Reader {
@@ -8550,6 +8723,7 @@ mod tests {
             uid_validity: Some(1),
             seen_before: true,
             waited: false,
+            thread: Thread::default(),
         });
         s.leaving = vec![Restoring {
             account: "ada@example.com".into(),
@@ -8650,6 +8824,8 @@ mod tests {
                     date: None,
                     seen,
                     flagged: false,
+                    in_reply_to: None,
+                    references: Vec::new(),
                 },
             },
             body: None,
@@ -8657,6 +8833,7 @@ mod tests {
             uid_validity: Some(1),
             seen_before: seen,
             waited: false,
+            thread: Thread::default(),
         });
     }
 
@@ -8708,6 +8885,8 @@ mod tests {
                 date: None,
                 seen: true,
                 flagged: true,
+                in_reply_to: None,
+                references: Vec::new(),
             },
         };
         s.search.found.push(found);
@@ -8788,6 +8967,8 @@ mod tests {
                 date: None,
                 seen: true,
                 flagged: false,
+                in_reply_to: None,
+                references: Vec::new(),
             },
         });
         s.open_message("ada@example.com", "INBOX", 1);
@@ -8905,6 +9086,8 @@ mod tests {
             date: Some(i64::from(uid)),
             seen,
             flagged: false,
+            in_reply_to: None,
+            references: Vec::new(),
         }
     }
 
@@ -9476,6 +9659,55 @@ mod tests {
         read(&s, 1);
         s.reload();
         assert_eq!(uids(&s), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn j_and_k_go_on_from_the_list_after_the_rail_opened_a_message_it_doesnt_show() {
+        let threaded = |uid: u32, id: &str, parent: Option<&str>| Envelope {
+            message_id: Some(id.into()),
+            in_reply_to: parent.map(Into::into),
+            references: parent.into_iter().map(Into::into).collect(),
+            ..hello(uid, true)
+        };
+        let (_dir, mut s) = synced(
+            "thread-anchor",
+            &[
+                threaded(1, "other@example.com", None),
+                threaded(2, "ask@example.com", None),
+                threaded(3, "answer@example.com", Some("ask@example.com")),
+            ],
+        );
+        // Ada's own reply is in Sent, which the inboxes' list doesn't show.
+        let services = s.services.as_mut().unwrap();
+        services
+            .store
+            .save_messages(
+                "ada@example.com",
+                "Sent",
+                Role::Sent,
+                1,
+                &[threaded(9, "mine@example.com", Some("answer@example.com"))],
+            )
+            .unwrap();
+        s.reload();
+        assert_eq!(uids(&s), [3, 2, 1]);
+        s.open_message("ada@example.com", INBOX, 3);
+        assert!(s.has_thread());
+        s.open_in_thread(&("ada@example.com".into(), "Sent".into(), 9));
+        assert!(
+            s.reader
+                .as_ref()
+                .is_some_and(|r| r.is("ada@example.com", "Sent", 9))
+        );
+        // Its download tried again, as after it failed.
+        s.retry_open();
+        // On from the reply it was opened from, not stuck on a message the list lacks.
+        s.move_cursor(1, &mut Tx::default());
+        assert!(
+            s.reader
+                .as_ref()
+                .is_some_and(|r| r.is("ada@example.com", INBOX, 2))
+        );
     }
 
     #[test]

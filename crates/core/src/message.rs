@@ -49,6 +49,11 @@ pub struct Envelope {
     pub seen: bool,
     /// Whether the message is starred: flagged `\\Flagged` on the server.
     pub flagged: bool,
+    /// The `Message-ID` it replies to, from its `In-Reply-To` header, without angle brackets.
+    pub in_reply_to: Option<String>,
+    /// The thread it belongs to, from its `References` header: oldest first, without angle
+    /// brackets.
+    pub references: Vec<String>,
 }
 
 /// What a mailbox is for. Each account has one inbox and at most one Sent, Archive, Trash,

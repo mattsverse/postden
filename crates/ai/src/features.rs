@@ -96,6 +96,8 @@ mod tests {
             date: None,
             seen: false,
             flagged: false,
+            in_reply_to: None,
+            references: Vec::new(),
         }
     }
 

@@ -5,6 +5,7 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use jiff::{Timestamp, ZonedDateTime};
+use postden_app::ThreadRail;
 use postden_core::message::Role;
 use postden_store::StoredMessage;
 use rune::{Key, KeyEvent, TextEdit, Tx};
@@ -136,6 +137,14 @@ pub(crate) enum Command {
     PreviousMessage,
     /// Opens the message under the list's cursor.
     OpenMessage,
+    /// Opens the next message of the open one's thread, by date.
+    NewerInThread,
+    /// Opens the previous message of the open one's thread, by date.
+    OlderInThread,
+    /// Shrinks the open thread's rail to its graph, or shows it whole again.
+    ToggleThread,
+    /// Hides the open thread's rail.
+    HideThread,
     /// Lists when the focused message can be snoozed until.
     PickSnooze,
     /// Lists where the focused message can be moved to.
@@ -208,6 +217,9 @@ impl Command {
             Self::PreviousMessage if s.reader.is_none() => vec![Key('k'), Up],
             Self::PreviousMessage => vec![Key('k')],
             Self::OpenMessage => vec![Enter],
+            Self::NewerInThread => vec![Key('n')],
+            Self::OlderInThread => vec![Key('p')],
+            Self::ToggleThread => vec![Shortcut::shift_cmd('t')],
             Self::PickSnooze => vec![Key('h')],
             Self::PickMove => vec![Key('v')],
             Self::PickMailbox => vec![Go('l')],
@@ -284,6 +296,13 @@ impl Command {
             Self::NextMessage => "Next message".into(),
             Self::PreviousMessage => "Previous message".into(),
             Self::OpenMessage => "Open message".into(),
+            Self::NewerInThread => "Next message in thread".into(),
+            Self::OlderInThread => "Previous message in thread".into(),
+            Self::ToggleThread if s.settings.thread_rail == ThreadRail::Open => {
+                "Shrink the thread to its graph".into()
+            }
+            Self::ToggleThread => "Show the thread".into(),
+            Self::HideThread => "Hide the thread".into(),
             Self::PickSnooze => "Snooze…".into(),
             Self::PickMove => "Move to…".into(),
             Self::PickMailbox => "Go to mailbox…".into(),
@@ -374,6 +393,15 @@ impl Command {
                 s.open_cursor();
                 tx.instant();
             }
+            // Held down, it doesn't open (and mark read) every one it passes.
+            Self::NewerInThread | Self::OlderInThread if tx.key_repeat() => {}
+            Self::NewerInThread | Self::OlderInThread => {
+                s.step_thread(if self == Self::NewerInThread { 1 } else { -1 });
+                crate::rail::reveal_open(s, tx);
+                tx.instant();
+            }
+            Self::ToggleThread => s.toggle_thread_rail(),
+            Self::HideThread => s.set_thread_rail(ThreadRail::Hidden),
             Self::PickSnooze | Self::PickMove => {
                 if let Some(m) = s.focused_message() {
                     let message = (m.account.clone(), m.mailbox.clone(), m.envelope.uid);
@@ -445,6 +473,22 @@ fn destinations(s: &Mail, message: &MessageKey) -> Vec<Command> {
         .collect()
 }
 
+/// What can be done with the open message's thread, if it's in one.
+fn thread_commands(s: &Mail) -> Vec<Command> {
+    if !s.has_thread() {
+        return Vec::new();
+    }
+    let mut commands = vec![
+        Command::NewerInThread,
+        Command::OlderInThread,
+        Command::ToggleThread,
+    ];
+    if s.settings.thread_rail != ThreadRail::Hidden {
+        commands.push(Command::HideThread);
+    }
+    commands
+}
+
 /// The commands that apply to what the window shows, in the palette's order.
 pub(crate) fn available(s: &Mail) -> Vec<Command> {
     // The list, or a message from it, is shown: not a form, a message being written or the
@@ -503,6 +547,9 @@ pub(crate) fn available(s: &Mail) -> Vec<Command> {
         browsing && s.reader.is_none() && s.focused_message().is_some(),
         Command::OpenMessage,
     );
+    for command in thread_commands(s).into_iter().filter(|_| browsing) {
+        add(true, command);
+    }
     add(browsing && has_accounts, Command::Search);
     add(browsing && has_accounts, Command::Refresh);
     add(browsing && has_accounts, Command::RefreshAll);
@@ -882,6 +929,8 @@ mod tests {
                     date: None,
                     seen: false,
                     flagged: false,
+                    in_reply_to: None,
+                    references: Vec::new(),
                 },
             });
         }

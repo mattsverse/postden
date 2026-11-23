@@ -2,8 +2,9 @@
 //! ahead of their opening, whether opened messages are kept, whether mail is sorted, whether new
 //! mail is announced with a system notification, whether the app keeps running with its window
 //! closed, whether updates are checked for and which ones (the release track), whether the people
-//! mail is sent to are remembered, whether the message list shows only unread mail, and whether the
-//! sidebar groups the mailboxes with none unread, kept in the [`Store`].
+//! mail is sent to are remembered, whether the message list shows only unread mail, whether the
+//! sidebar groups the mailboxes with none unread, and how a thread shows beside the message open,
+//! kept in the [`Store`].
 
 use std::time::Duration;
 
@@ -25,6 +26,69 @@ const UPDATE_TRACK: &str = "update_track";
 const REMEMBER_CONTACTS: &str = "remember_contacts";
 const UNREAD_ONLY: &str = "unread_only";
 const GROUP_READ_MAILBOXES: &str = "group_read_mailboxes";
+const THREAD_ORDER: &str = "thread_order";
+const THREAD_RAIL: &str = "thread_rail";
+
+/// Which end of a thread its rail starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThreadOrder {
+    /// The first message at the top, as it's read.
+    #[default]
+    OldestFirst,
+    /// The latest at the top, as the message list is.
+    NewestFirst,
+}
+
+impl ThreadOrder {
+    pub const ALL: [Self; 2] = [Self::OldestFirst, Self::NewestFirst];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OldestFirst => "Oldest first",
+            Self::NewestFirst => "Newest first",
+        }
+    }
+
+    const fn key(self) -> &'static str {
+        match self {
+            Self::OldestFirst => "oldest",
+            Self::NewestFirst => "newest",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|o| o.key() == key)
+    }
+}
+
+/// How the rail beside an open message shows the rest of its thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThreadRail {
+    /// Its graph, with who wrote each message, when, and how it begins.
+    #[default]
+    Open,
+    /// Its graph alone, as a narrow strip.
+    Strip,
+    /// Not at all.
+    Hidden,
+}
+
+impl ThreadRail {
+    const ALL: [Self; 3] = [Self::Open, Self::Strip, Self::Hidden];
+
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Strip => "strip",
+            Self::Hidden => "hidden",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.key() == key)
+    }
+}
 
 /// Whether the window is light, dark, or follows the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -121,6 +185,10 @@ pub struct Settings {
     /// Whether the sidebar keeps each account's mailboxes with nothing unread in a group of their
     /// own, closed until opened. Off by default.
     pub group_read_mailboxes: bool,
+    /// Which end of a thread its rail starts from. The oldest by default.
+    pub thread_order: ThreadOrder,
+    /// How the rail beside an open message shows its thread. Open by default.
+    pub thread_rail: ThreadRail,
 }
 
 impl Default for Settings {
@@ -139,6 +207,8 @@ impl Default for Settings {
             remember_contacts: false,
             unread_only: false,
             group_read_mailboxes: false,
+            thread_order: ThreadOrder::default(),
+            thread_rail: ThreadRail::default(),
         }
     }
 }
@@ -202,6 +272,14 @@ impl Settings {
             .setting(GROUP_READ_MAILBOXES)?
             .and_then(|s| s.parse().ok())
             .unwrap_or(default.group_read_mailboxes);
+        let thread_order = store
+            .setting(THREAD_ORDER)?
+            .and_then(|o| ThreadOrder::from_key(&o))
+            .unwrap_or(default.thread_order);
+        let thread_rail = store
+            .setting(THREAD_RAIL)?
+            .and_then(|r| ThreadRail::from_key(&r))
+            .unwrap_or(default.thread_rail);
         Ok(Self {
             theme,
             poll_interval,
@@ -216,6 +294,8 @@ impl Settings {
             remember_contacts,
             unread_only,
             group_read_mailboxes,
+            thread_order,
+            thread_rail,
         })
     }
 
@@ -243,6 +323,8 @@ impl Settings {
             (REMEMBER_CONTACTS, &self.remember_contacts.to_string()),
             (UNREAD_ONLY, &self.unread_only.to_string()),
             (GROUP_READ_MAILBOXES, &self.group_read_mailboxes.to_string()),
+            (THREAD_ORDER, self.thread_order.key()),
+            (THREAD_RAIL, self.thread_rail.key()),
         ])?;
         Ok(())
     }
@@ -270,6 +352,8 @@ mod tests {
             remember_contacts: true,
             unread_only: true,
             group_read_mailboxes: true,
+            thread_order: ThreadOrder::NewestFirst,
+            thread_rail: ThreadRail::Strip,
         };
         settings.save(&store).unwrap();
         assert_eq!(Settings::load(&store).unwrap(), settings);
@@ -291,6 +375,8 @@ mod tests {
         store.set_setting(REMEMBER_CONTACTS, "everyone").unwrap();
         store.set_setting(UNREAD_ONLY, "mostly").unwrap();
         store.set_setting(GROUP_READ_MAILBOXES, "some").unwrap();
+        store.set_setting(THREAD_ORDER, "sideways").unwrap();
+        store.set_setting(THREAD_RAIL, "folded").unwrap();
         assert_eq!(Settings::load(&store).unwrap(), Settings::default());
     }
 

@@ -3,7 +3,7 @@
 //! Account passwords never land here; they live in a [`postden_core::secrets::SecretStore`].
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -130,11 +130,32 @@ CREATE TABLE IF NOT EXISTS messages (
     to_list    TEXT,
     -- 1 when starred: flagged as such on the server.
     flagged    INTEGER NOT NULL DEFAULT 0,
+    -- The Message-ID it replies to: its In-Reply-To, else the last of its References, as a
+    -- reply naming only those says by it.
+    in_reply_to TEXT,
+    -- Its References, oldest first, separated by U+001E. NULL until they were fetched: cached
+    -- before this version, they're fetched afterwards, as message_threading says.
+    refs       TEXT,
     PRIMARY KEY (account, mailbox, uid),
     FOREIGN KEY (account, mailbox) REFERENCES mailboxes(account, name) ON DELETE CASCADE
 ) STRICT;
 
 CREATE INDEX IF NOT EXISTS messages_by_date ON messages(date DESC);
+CREATE INDEX IF NOT EXISTS messages_by_message_id ON messages(account, message_id);
+
+-- Every Message-ID a cached message points to, from its In-Reply-To and References: what finds
+-- the replies to a message, and the messages beside it in its thread.
+CREATE TABLE IF NOT EXISTS message_refs (
+    account TEXT NOT NULL,
+    mailbox TEXT NOT NULL,
+    uid     INTEGER NOT NULL,
+    ref     TEXT NOT NULL,
+    PRIMARY KEY (account, mailbox, uid, ref),
+    FOREIGN KEY (account, mailbox, uid) REFERENCES messages(account, mailbox, uid)
+        ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS message_refs_by_ref ON message_refs(account, ref);
 
 -- Messages the server last had unread that aren't cached, for the mailbox's unread count: the
 -- cache holds only the newest, and the newest of the older unread mail.
@@ -292,7 +313,7 @@ CREATE TABLE IF NOT EXISTS prefetch_mailboxes (
 ";
 
 /// The schema version [`SCHEMA`] creates, kept in `PRAGMA user_version`.
-const VERSION: i64 = 7;
+const VERSION: i64 = 8;
 
 /// How long, in seconds, what [`Store::put_away_message`] noted of a message holds: a week. Its
 /// copy where it went is cached by then, and says so itself; and moved since by another mail
@@ -301,7 +322,7 @@ const PUT_AWAY_HOLDS: i64 = 7 * 24 * 60 * 60;
 
 /// Columns added since version 0, for databases created before them. Tables added since are
 /// created by [`SCHEMA`] itself.
-const MIGRATIONS: [(&str, &str, &str); 8] = [
+const MIGRATIONS: [(&str, &str, &str); 10] = [
     ("mailboxes", "role", "TEXT NOT NULL DEFAULT 'inbox'"),
     ("messages", "to_list", "TEXT"),
     // Version 2.
@@ -316,9 +337,19 @@ const MIGRATIONS: [(&str, &str, &str); 8] = [
     ("mailboxes", "floor", "INTEGER"),
     // Version 7.
     ("mailboxes", "counted", "INTEGER NOT NULL DEFAULT 0"),
+    // Version 8.
+    ("messages", "in_reply_to", "TEXT"),
+    ("messages", "refs", "TEXT"),
 ];
 
-const MESSAGE_COLUMNS: &str = "m.account, m.mailbox, m.uid, m.message_id, m.from_name, m.from_email, m.subject, m.date, m.seen, m.to_list, m.flagged";
+const MESSAGE_COLUMNS: &str = "m.account, m.mailbox, m.uid, m.message_id, m.from_name, m.from_email, m.subject, m.date, m.seen, m.to_list, m.flagged, m.in_reply_to, m.refs";
+
+/// How many columns [`MESSAGE_COLUMNS`] reads: a query's own come after them.
+const MESSAGE_COLUMN_COUNT: usize = 13;
+
+/// The most messages [`Store::thread`] gathers: a mailing list's threads can run to thousands,
+/// more than a rail can show.
+const THREAD_LIMIT: usize = 200;
 
 /// A transaction that takes the write lock at once, for one that reads what it then writes on:
 /// begun deferred, another connection's write in between (the sorter's, the mail watchers')
@@ -401,6 +432,58 @@ fn under(marks: &mut Marks, uid_validity: u32) -> &mut Marks {
     marks
 }
 
+/// What [`Store::thread`] reached of a thread so far.
+#[derive(Debug, Default)]
+struct ThreadWalk {
+    /// Every copy reached, in the order reached: nearest first.
+    found: Vec<StoredMessage>,
+    /// Where each copy reached is, by mailbox and UID.
+    rows: HashSet<(String, u32)>,
+    /// The messages reached, each once however many mailboxes it's in: by Message-ID, or where
+    /// it is for one without.
+    distinct: HashSet<String>,
+    /// Message-IDs whose message and direct replies are still to look for, nearest first.
+    next: VecDeque<String>,
+    /// Message-IDs looked for so, and looked for in References.
+    looked: HashSet<String>,
+    swept: HashSet<String>,
+    /// Message-IDs to look for in References once nothing's left along replies, nearest first:
+    /// each message's own, then its References from the latest back.
+    to_sweep: VecDeque<String>,
+}
+
+impl ThreadWalk {
+    fn full(&self) -> bool {
+        self.distinct.len() >= THREAD_LIMIT
+    }
+
+    /// Takes `m` in, unless it's reached already, and then looks next for its direct replies
+    /// and the message it replies to: In-Reply-To, or the last of its References.
+    fn add(&mut self, m: StoredMessage) {
+        if !self.rows.insert((m.mailbox.clone(), m.envelope.uid)) {
+            return;
+        }
+        let e = &m.envelope;
+        let parent = e.in_reply_to.as_ref().or_else(|| e.references.last());
+        for id in e.message_id.iter().chain(parent) {
+            if !self.looked.contains(id) {
+                self.next.push_back(id.clone());
+            }
+        }
+        for id in e.message_id.iter().chain(e.references.iter().rev()) {
+            if !self.swept.contains(id) {
+                self.to_sweep.push_back(id.clone());
+            }
+        }
+        let id = e
+            .message_id
+            .clone()
+            .unwrap_or_else(|| format!("{}\u{1f}{}", m.mailbox, e.uid));
+        self.distinct.insert(id);
+        self.found.push(m);
+    }
+}
+
 /// The SQLite-backed cache.
 #[derive(Debug)]
 pub struct Store {
@@ -465,6 +548,10 @@ impl Store {
             }
             conn.execute_batch(&format!("PRAGMA user_version = {VERSION}"))?;
         }
+        // On a column a migration may have just added.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS messages_by_in_reply_to ON messages(account, in_reply_to)",
+        )?;
         Ok(Self {
             conn,
             removed: HashSet::new(),
@@ -1632,10 +1719,10 @@ impl Store {
         let rows = stmt.query_map([text_chars], |row| {
             Ok((
                 message_from_row(row)?,
-                row.get::<_, String>(11)?,
-                row.get::<_, Option<String>>(12)?,
-                row.get::<_, u32>(13)?,
-                row.get::<_, bool>(14)?,
+                row.get::<_, String>(MESSAGE_COLUMN_COUNT)?,
+                row.get::<_, Option<String>>(MESSAGE_COLUMN_COUNT + 1)?,
+                row.get::<_, u32>(MESSAGE_COLUMN_COUNT + 2)?,
+                row.get::<_, bool>(MESSAGE_COLUMN_COUNT + 3)?,
             ))
         })?;
         rows.map(|row| {
@@ -1692,6 +1779,268 @@ impl Store {
             ))?
             .query_map(params![account, mailbox, since], message_from_row)?
             .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The cached messages of the thread `message` is in, oldest first: those it replies to,
+    /// those replying to it, and on, as their In-Reply-To and References say, in any of its
+    /// account's mailboxes. A message cached in more than one mailbox, as Gmail lists one in
+    /// its All Mail too, is given once: `message` itself, or else its copy anywhere but an
+    /// archive, the Trash or Junk, if there's one. At most [`THREAD_LIMIT`] messages, those
+    /// nearest `message`'s first.
+    ///
+    /// Where `message` sits in its thread is read from the store, as it may have been fetched
+    /// since `message` was; the rest of it is as given.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn thread(&self, message: &StoredMessage) -> Result<Vec<StoredMessage>> {
+        let account = message.account.as_str();
+        let mut seed = message.clone();
+        if let Some(stored) = self.message(account, &message.mailbox, message.envelope.uid)? {
+            seed.envelope.in_reply_to = stored.envelope.in_reply_to;
+            seed.envelope.references = stored.envelope.references;
+        }
+        let mut walk = ThreadWalk::default();
+        walk.add(seed);
+        let at = |row: &Row<'_>| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        };
+        let mut by_id = self.conn.prepare_cached(
+            "SELECT mailbox, uid, message_id FROM messages WHERE account = ?1 AND message_id = ?2",
+        )?;
+        let mut by_reply = self.conn.prepare_cached(
+            "SELECT mailbox, uid, message_id FROM messages WHERE account = ?1 AND in_reply_to = ?2",
+        )?;
+        let mut by_ref = self.conn.prepare_cached(
+            "SELECT mailbox, uid, NULL FROM message_refs WHERE account = ?1 AND ref = ?2",
+        )?;
+        // Nearest first: along who replied to whom, then, while there's room, by References,
+        // which also find replies to messages that aren't cached. Each found message is looked
+        // from again, along replies first.
+        while !walk.full() {
+            if let Some(id) = walk.next.pop_front() {
+                if !walk.looked.insert(id.clone()) {
+                    continue;
+                }
+                let places: Vec<(String, u32, Option<String>)> = by_id
+                    .query_map(params![account, id], at)?
+                    .chain(by_reply.query_map(params![account, id], at)?)
+                    .collect::<rusqlite::Result<_>>()?;
+                for (mailbox, uid, _) in places {
+                    if walk.full() {
+                        break;
+                    }
+                    if let Some(m) = self.message(account, &mailbox, uid)? {
+                        walk.add(m);
+                    }
+                }
+                continue;
+            }
+            // Nothing more along replies: the nearest of the References not looked through yet.
+            let Some(id) = walk.to_sweep.pop_front() else {
+                break;
+            };
+            if !walk.swept.insert(id.clone()) {
+                continue;
+            }
+            // The message itself, as one whose parent between isn't cached points past it, and
+            // those pointing to it.
+            let mut places = by_id
+                .query_map(params![account, id], at)?
+                .chain(by_ref.query_map(params![account, id], at)?);
+            while let Some(place) = places.next().transpose()? {
+                if walk.full() {
+                    break;
+                }
+                let (mailbox, uid, _) = place;
+                if walk.rows.contains(&(mailbox.clone(), uid)) {
+                    continue;
+                }
+                if let Some(m) = self.message(account, &mailbox, uid)? {
+                    walk.add(m);
+                }
+            }
+        }
+        self.other_copies(account, &mut walk)?;
+        self.one_copy_each(message, walk.found)
+    }
+
+    /// `found`, the copies [`Store::thread`] reached nearest first, one per message: `message`
+    /// itself, else its copy in the most telling mailbox. At most [`THREAD_LIMIT`], oldest first.
+    fn one_copy_each(
+        &self,
+        message: &StoredMessage,
+        found: Vec<StoredMessage>,
+    ) -> Result<Vec<StoredMessage>> {
+        let account = message.account.as_str();
+        // One copy of each message, by Message-ID: the one asked about, else the one in the
+        // most telling mailbox.
+        let roles: HashMap<String, Role> = self
+            .mailboxes(account)?
+            .into_iter()
+            .map(|m| (m.name, m.role))
+            .collect();
+        let rank = |m: &StoredMessage| -> u8 {
+            if m.mailbox == message.mailbox && m.envelope.uid == message.envelope.uid {
+                return 0;
+            }
+            match roles.get(&m.mailbox).copied().unwrap_or(Role::Other) {
+                Role::Archive => 2,
+                Role::Trash | Role::Junk => 3,
+                _ => 1,
+            }
+        };
+        // One copy of each, in the order each message was first reached, nearest first: the
+        // best ranked of its copies.
+        let mut kept: Vec<StoredMessage> = Vec::new();
+        let mut at_id: HashMap<String, usize> = HashMap::new();
+        for m in found {
+            let Some(id) = m.envelope.message_id.clone() else {
+                kept.push(m);
+                continue;
+            };
+            match at_id.get(&id).and_then(|&i| kept.get_mut(i)) {
+                Some(copy) if rank(&m) < rank(copy) => *copy = m,
+                Some(_) => {}
+                None => {
+                    at_id.insert(id, kept.len());
+                    kept.push(m);
+                }
+            }
+        }
+        kept.truncate(THREAD_LIMIT);
+        kept.sort_by_key(|m| (m.envelope.date.unwrap_or(i64::MIN), m.envelope.uid));
+        Ok(kept)
+    }
+
+    /// Takes in the other copies of the messages `walk` reached, for the best of them to be
+    /// shown: found by Message-ID alone, however many more of the thread there are.
+    fn other_copies(&self, account: &str, walk: &mut ThreadWalk) -> Result<()> {
+        let mut by_id = self.conn.prepare_cached(
+            "SELECT mailbox, uid FROM messages WHERE account = ?1 AND message_id = ?2",
+        )?;
+        let ids: Vec<String> = walk
+            .found
+            .iter()
+            .filter_map(|m| m.envelope.message_id.clone())
+            .collect();
+        for id in ids {
+            let places: Vec<(String, u32)> = by_id
+                .query_map(params![account, id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (mailbox, uid) in places {
+                if walk.rows.contains(&(mailbox.clone(), uid)) {
+                    continue;
+                }
+                if let Some(m) = self.message(account, &mailbox, uid)? {
+                    walk.rows.insert((mailbox, uid));
+                    walk.found.push(m);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The beginning of a cached message's text, at most `chars` characters of it, if its body
+    /// was downloaded: without reading the rest of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn text_start(
+        &self,
+        account: &str,
+        mailbox: &str,
+        uid: u32,
+        chars: usize,
+    ) -> Result<Option<String>> {
+        let chars = i64::try_from(chars).unwrap_or(i64::MAX);
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT substr(text, 1, ?4) FROM bodies
+                 WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+            )?
+            .query_row(params![account, mailbox, uid, chars], |row| row.get(0))
+            .optional()?)
+    }
+
+    /// The UIDs of up to `limit` messages in `mailbox` whose In-Reply-To and References were
+    /// never fetched, as they were cached before they were: newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read fails.
+    pub fn unthreaded(&self, account: &str, mailbox: &str, limit: usize) -> Result<Vec<u32>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT uid FROM messages WHERE account = ?1 AND mailbox = ?2 AND refs IS NULL
+             ORDER BY uid DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![account, mailbox, limit], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Saves where messages `asked` of `mailbox` sit in their threads, as `found` (UID,
+    /// In-Reply-To and References) says, unless the mailbox is no longer cached under
+    /// `uid_validity`. Those asked for but not found, gone from the server, are saved as in no
+    /// thread, so they aren't asked for again. Returns whether anything was saved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the write fails. Nothing is written in that case.
+    pub fn save_threading(
+        &mut self,
+        (account, mailbox, uid_validity): (&str, &str, u32),
+        asked: &[u32],
+        found: &[(u32, Option<String>, Vec<String>)],
+    ) -> Result<bool> {
+        let tx = immediate(&mut self.conn)?;
+        let cached: Option<u32> = tx
+            .query_row(
+                "SELECT uid_validity FROM mailboxes WHERE account = ?1 AND name = ?2",
+                [account, mailbox],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if cached != Some(uid_validity) {
+            return Ok(false);
+        }
+        let none = (None, Vec::new());
+        {
+            let mut update = tx.prepare(
+                "UPDATE messages SET in_reply_to = ?4, refs = ?5
+                 WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+            )?;
+            for &uid in asked {
+                let (in_reply_to, references) = found
+                    .iter()
+                    .find(|(u, ..)| *u == uid)
+                    .map_or((&none.0, &none.1), |(_, i, r)| (i, r));
+                let changed = update.execute(params![
+                    account,
+                    mailbox,
+                    uid,
+                    parent_of(in_reply_to.as_ref(), references),
+                    join_ids(references)
+                ])?;
+                if changed > 0 {
+                    save_refs(
+                        &tx,
+                        (account, mailbox, uid),
+                        in_reply_to.as_deref(),
+                        references,
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// One cached message, or `None` when it isn't cached.
@@ -2149,8 +2498,51 @@ fn message_from_row(row: &Row<'_>) -> rusqlite::Result<StoredMessage> {
                     .unwrap_or_default(),
             ),
             flagged: row.get(10)?,
+            in_reply_to: row.get(11)?,
+            references: split_ids(row.get::<_, Option<String>>(12)?.as_deref()),
         },
     })
+}
+
+/// The Message-ID a message replies to: its In-Reply-To, else the last of its References.
+fn parent_of<'a>(in_reply_to: Option<&'a String>, references: &'a [String]) -> Option<&'a String> {
+    in_reply_to.or_else(|| references.last())
+}
+
+/// Message-IDs as one column, separated by U+001E.
+fn join_ids(ids: &[String]) -> String {
+    ids.join("\u{1e}")
+}
+
+/// The Message-IDs [`join_ids`] wrote, or none for `NULL`.
+fn split_ids(column: Option<&str>) -> Vec<String> {
+    column
+        .unwrap_or_default()
+        .split('\u{1e}')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Notes the Message-IDs `uid` points to, from its In-Reply-To and References, replacing what
+/// was noted.
+fn save_refs(
+    tx: &Transaction<'_>,
+    (account, mailbox, uid): (&str, &str, u32),
+    in_reply_to: Option<&str>,
+    references: &[String],
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM message_refs WHERE account = ?1 AND mailbox = ?2 AND uid = ?3",
+        params![account, mailbox, uid],
+    )?;
+    let mut insert = tx.prepare_cached(
+        "INSERT OR IGNORE INTO message_refs (account, mailbox, uid, ref) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for id in references.iter().map(String::as_str).chain(in_reply_to) {
+        insert.execute(params![account, mailbox, uid, id])?;
+    }
+    Ok(())
 }
 
 /// Addresses as one column: each as name, U+001F, email; separated by U+001E. Missing parts are
@@ -2243,12 +2635,15 @@ fn insert_messages(
     messages: &[Envelope],
 ) -> Result<()> {
     let mut insert = tx.prepare(
-        "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "INSERT INTO messages (account, mailbox, uid, message_id, from_name, from_email, subject,
+            date, seen, to_list, flagged, in_reply_to, refs)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(account, mailbox, uid) DO UPDATE SET
             message_id = excluded.message_id, from_name = excluded.from_name,
             from_email = excluded.from_email, subject = excluded.subject,
             date = excluded.date, seen = excluded.seen, to_list = excluded.to_list,
-            flagged = excluded.flagged",
+            flagged = excluded.flagged, in_reply_to = excluded.in_reply_to,
+            refs = excluded.refs",
     )?;
     for m in messages {
         insert.execute(params![
@@ -2263,7 +2658,15 @@ fn insert_messages(
             m.seen,
             encode_addresses(&m.to),
             m.flagged,
+            parent_of(m.in_reply_to.as_ref(), &m.references),
+            join_ids(&m.references),
         ])?;
+        save_refs(
+            tx,
+            (account, mailbox, m.uid),
+            m.in_reply_to.as_deref(),
+            &m.references,
+        )?;
     }
     Ok(())
 }
@@ -2310,6 +2713,8 @@ mod tests {
                 email: Some("me@example.com".into()),
             }],
             flagged: false,
+            in_reply_to: None,
+            references: Vec::new(),
         }
     }
 
@@ -4260,5 +4665,295 @@ mod tests {
         assert_eq!(store.matching_contacts(|_| true, 1).unwrap().len(), 1);
         assert_eq!(store.forget_contacts().unwrap(), 2);
         assert_eq!(store.matching_contacts(|_| true, 10).unwrap(), vec![]);
+    }
+
+    /// Message `uid`, dated `date`, replying to `parent`, with `references` for its thread.
+    fn reply(uid: u32, date: i64, parent: Option<u32>, references: &[u32]) -> Envelope {
+        Envelope {
+            in_reply_to: parent.map(|p| format!("{p}@example.com")),
+            references: references
+                .iter()
+                .map(|r| format!("{r}@example.com"))
+                .collect(),
+            ..envelope(uid, date)
+        }
+    }
+
+    fn uids(messages: &[StoredMessage]) -> Vec<(&str, u32)> {
+        messages
+            .iter()
+            .map(|m| (m.mailbox.as_str(), m.envelope.uid))
+            .collect()
+    }
+
+    #[test]
+    fn a_thread_gathers_every_reply_oldest_first_across_mailboxes() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account(ME)).unwrap();
+        // 1 starts it; 2 and 3 reply to it; 4, in Sent, replies to 2; 5 is another thread.
+        let inbox = [
+            reply(1, 10, None, &[]),
+            reply(3, 30, Some(1), &[1]),
+            reply(5, 15, None, &[]),
+        ];
+        store
+            .save_messages(ME, "INBOX", Role::Inbox, 1, &inbox)
+            .unwrap();
+        store
+            .save_messages(ME, "Sent", Role::Sent, 1, &[reply(4, 40, Some(2), &[1, 2])])
+            .unwrap();
+        store
+            .save_messages(ME, "Lists", Role::Other, 1, &[reply(2, 20, Some(1), &[1])])
+            .unwrap();
+        let from_the_last = store.message(ME, "Sent", 4).unwrap().unwrap();
+        let thread = store.thread(&from_the_last).unwrap();
+        assert_eq!(
+            uids(&thread),
+            vec![("INBOX", 1), ("Lists", 2), ("INBOX", 3), ("Sent", 4)]
+        );
+        // From the first, the replies are found by what they point to.
+        let from_the_first = store.message(ME, "INBOX", 1).unwrap().unwrap();
+        assert_eq!(store.thread(&from_the_first).unwrap(), thread);
+        let alone = store.message(ME, "INBOX", 5).unwrap().unwrap();
+        assert_eq!(uids(&store.thread(&alone).unwrap()), vec![("INBOX", 5)]);
+    }
+
+    #[test]
+    fn replies_to_a_message_not_cached_are_in_one_thread_by_their_references() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account(ME)).unwrap();
+        // 1 isn't cached; 2 and 3 both reply to it.
+        let inbox = [reply(2, 20, Some(1), &[1]), reply(3, 30, Some(1), &[1])];
+        store
+            .save_messages(ME, "INBOX", Role::Inbox, 1, &inbox)
+            .unwrap();
+        let open = store.message(ME, "INBOX", 3).unwrap().unwrap();
+        assert_eq!(
+            uids(&store.thread(&open).unwrap()),
+            vec![("INBOX", 2), ("INBOX", 3)]
+        );
+    }
+
+    #[test]
+    fn a_message_in_two_mailboxes_is_in_its_thread_once() {
+        let mut store = gmail(&gmail_list());
+        let mut answer = reply(10, 20, Some(1), &[1]);
+        answer.message_id = Some("answer@example.com".into());
+        store
+            .save_messages(ME, "INBOX", Role::Inbox, 1, &[answer])
+            .unwrap();
+        let open = store.message(ME, "INBOX", 10).unwrap().unwrap();
+        // The inbox's copy of 1, not All Mail's.
+        assert_eq!(
+            uids(&store.thread(&open).unwrap()),
+            vec![("INBOX", 1), ("INBOX", 10)]
+        );
+        // Opened from All Mail, that copy is the one shown.
+        let archived = store.message(ME, "[Gmail]/All Mail", 9).unwrap().unwrap();
+        assert_eq!(
+            uids(&store.thread(&archived).unwrap()),
+            vec![("[Gmail]/All Mail", 9), ("INBOX", 10)]
+        );
+    }
+
+    #[test]
+    fn threading_cached_before_it_was_fetched_is_saved_once_fetched() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account(ME)).unwrap();
+        store
+            .save_messages(
+                ME,
+                "INBOX",
+                Role::Inbox,
+                1,
+                &[envelope(1, 10), envelope(2, 20)],
+            )
+            .unwrap();
+        // As a version before threading left them.
+        store
+            .conn
+            .execute("UPDATE messages SET refs = NULL", [])
+            .unwrap();
+        assert_eq!(store.unthreaded(ME, "INBOX", 10).unwrap(), vec![2, 1]);
+        let found = [(
+            2,
+            Some("1@example.com".to_owned()),
+            vec!["1@example.com".to_owned()],
+        )];
+        // Under another UIDVALIDITY, the UIDs name other messages.
+        assert!(
+            !store
+                .save_threading((ME, "INBOX", 9), &[2, 1], &found)
+                .unwrap()
+        );
+        assert_eq!(store.unthreaded(ME, "INBOX", 10).unwrap(), vec![2, 1]);
+        // 1, not found, is in no thread, and not asked for again.
+        assert!(
+            store
+                .save_threading((ME, "INBOX", 1), &[2, 1], &found)
+                .unwrap()
+        );
+        assert_eq!(
+            store.unthreaded(ME, "INBOX", 10).unwrap(),
+            Vec::<u32>::new()
+        );
+        let first = store.message(ME, "INBOX", 1).unwrap().unwrap();
+        assert_eq!(
+            uids(&store.thread(&first).unwrap()),
+            vec![("INBOX", 1), ("INBOX", 2)]
+        );
+    }
+
+    #[test]
+    fn copies_in_two_mailboxes_count_once_toward_the_limit() {
+        let mut store = gmail(&gmail_list());
+        // A chain of 150 replies, each in the inbox and All Mail.
+        let chain: Vec<Envelope> = (100..250)
+            .map(|uid| reply(uid, i64::from(uid), (uid > 100).then(|| uid - 1), &[]))
+            .collect();
+        store
+            .save_messages(ME, "INBOX", Role::Inbox, 1, &chain)
+            .unwrap();
+        store
+            .save_messages(ME, "[Gmail]/All Mail", Role::Archive, 1, &chain)
+            .unwrap();
+        let last = store.message(ME, "INBOX", 249).unwrap().unwrap();
+        let thread = store.thread(&last).unwrap();
+        assert_eq!(thread.len(), 150, "every message of the chain, once");
+        assert!(thread.iter().all(|m| m.mailbox == "INBOX"));
+    }
+
+    #[test]
+    fn a_message_given_from_before_its_thread_was_fetched_is_threaded_as_stored() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account(ME)).unwrap();
+        store
+            .save_messages(
+                ME,
+                "INBOX",
+                Role::Inbox,
+                1,
+                &[reply(1, 10, None, &[]), reply(2, 20, Some(1), &[1])],
+            )
+            .unwrap();
+        // As the window kept it, listed before its In-Reply-To was fetched.
+        let mut stale = store.message(ME, "INBOX", 2).unwrap().unwrap();
+        stale.envelope.in_reply_to = None;
+        stale.envelope.references = Vec::new();
+        stale.envelope.seen = true;
+        let thread = store.thread(&stale).unwrap();
+        assert_eq!(uids(&thread), vec![("INBOX", 1), ("INBOX", 2)]);
+        // The rest of it as given, as the window shows it.
+        assert!(
+            thread
+                .iter()
+                .any(|m| m.envelope.uid == 2 && m.envelope.seen)
+        );
+    }
+
+    #[test]
+    fn a_long_thread_keeps_the_messages_nearest_the_one_open() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account(ME)).unwrap();
+        // 300 replies, each to the one before, each with the whole chain as its References.
+        let chain: Vec<Envelope> = (1..=300)
+            .map(|uid| {
+                let parent = (uid > 1).then(|| uid - 1);
+                let references: Vec<u32> = (1..uid).collect();
+                reply(uid, i64::from(uid), parent, &references)
+            })
+            .collect();
+        store
+            .save_messages(ME, "INBOX", Role::Inbox, 1, &chain)
+            .unwrap();
+        let last = store.message(ME, "INBOX", 300).unwrap().unwrap();
+        let thread = store.thread(&last).unwrap();
+        assert_eq!(thread.len(), THREAD_LIMIT);
+        let first = thread.first().map(|m| m.envelope.uid);
+        assert_eq!(first, Some(101), "the 200 nearest, up to the one open");
+    }
+
+    #[test]
+    fn a_side_reply_to_a_much_answered_message_is_still_found() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account(ME)).unwrap();
+        // 150 replies, each to the one before, each with the whole chain as its References;
+        // and 1000, replying to the first, beside them.
+        let mut messages: Vec<Envelope> = (1..=150)
+            .map(|uid| {
+                let parent = (uid > 1).then(|| uid - 1);
+                let references: Vec<u32> = (1..uid).collect();
+                reply(uid, i64::from(uid), parent, &references)
+            })
+            .collect();
+        messages.push(reply(1000, 1000, Some(1), &[1]));
+        store
+            .save_messages(ME, "INBOX", Role::Inbox, 1, &messages)
+            .unwrap();
+        let last = store.message(ME, "INBOX", 150).unwrap().unwrap();
+        assert_eq!(store.thread(&last).unwrap().len(), 151);
+    }
+
+    #[test]
+    fn a_thread_opened_halfway_keeps_both_neighbours() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account(ME)).unwrap();
+        let chain: Vec<Envelope> = (1..=400)
+            .map(|uid| {
+                let parent = (uid > 1).then(|| uid - 1);
+                let references: Vec<u32> = (1..uid).collect();
+                reply(uid, i64::from(uid), parent, &references)
+            })
+            .collect();
+        store
+            .save_messages(ME, "INBOX", Role::Inbox, 1, &chain)
+            .unwrap();
+        let middle = store.message(ME, "INBOX", 200).unwrap().unwrap();
+        let thread = store.thread(&middle).unwrap();
+        assert_eq!(thread.len(), THREAD_LIMIT);
+        let has = |uid: u32| thread.iter().any(|m| m.envelope.uid == uid);
+        assert!(has(199) && has(201), "the one it replies to, and its reply");
+        assert!(has(110) && has(290), "as near on each side");
+    }
+
+    #[test]
+    fn messages_either_side_of_one_not_cached_are_one_thread() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account(ME)).unwrap();
+        // 2 isn't cached: 3 replies to it, its References reaching back to 1.
+        store
+            .save_messages(
+                ME,
+                "INBOX",
+                Role::Inbox,
+                1,
+                &[reply(1, 10, None, &[]), reply(3, 30, Some(2), &[1, 2])],
+            )
+            .unwrap();
+        for uid in [1, 3] {
+            let open = store.message(ME, "INBOX", uid).unwrap().unwrap();
+            assert_eq!(
+                uids(&store.thread(&open).unwrap()),
+                vec![("INBOX", 1), ("INBOX", 3)],
+                "opened at {uid}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_naming_its_parent_only_in_its_references_is_found_as_a_reply() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account(ME)).unwrap();
+        // Without In-Reply-To, each names the one before last in its References.
+        let chain: Vec<Envelope> = (1..=400)
+            .map(|uid| reply(uid, i64::from(uid), None, &(1..uid).collect::<Vec<_>>()))
+            .collect();
+        store
+            .save_messages(ME, "INBOX", Role::Inbox, 1, &chain)
+            .unwrap();
+        let middle = store.message(ME, "INBOX", 200).unwrap().unwrap();
+        let thread = store.thread(&middle).unwrap();
+        let has = |uid: u32| thread.iter().any(|m| m.envelope.uid == uid);
+        assert!(has(199) && has(201), "the one it replies to, and its reply");
     }
 }

@@ -565,6 +565,8 @@ mod tests {
                 date: Some(NOW - 10 * DAY),
                 seen: true,
                 flagged: false,
+                in_reply_to: None,
+                references: Vec::new(),
             },
         }
     }
