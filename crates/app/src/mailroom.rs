@@ -14,11 +14,11 @@ use postden_core::account::{Account, Server};
 use postden_core::message::{Address, Body, Envelope, Mailbox, Outgoing, Role};
 use postden_core::secrets::SecretStore;
 use postden_mail::imap::{
-    Event, Flags, Found, Nudge, Older, Prefetched, SNOOZED_NAME, Status, Unread, UnreadIn, Verdict,
-    WatchConfig, create_mailbox, delete_mailbox, download_message, fetch_older, fetch_unread,
-    fetch_unread_each, mark_all_seen, move_message, open_message, prefetch_messages, refresh,
-    restore_message, save_sent_copy, search, set_flagged, set_seen, snooze_message, wake_message,
-    watch,
+    Event, Flags, Found, Nudge, Older, Prefetched, SNOOZED_NAME, Status, Threading, Unread,
+    UnreadIn, Verdict, WatchConfig, create_mailbox, delete_mailbox, download_message, fetch_older,
+    fetch_threading, fetch_unread, fetch_unread_each, mark_all_seen, move_message, open_message,
+    prefetch_messages, refresh, restore_message, save_sent_copy, search, set_flagged, set_seen,
+    snooze_message, wake_message, watch,
 };
 use postden_mail::{Credentials, smtp};
 use postden_store::{Snooze, Store, Written};
@@ -40,6 +40,9 @@ const PREFETCH_MAX_SIZE: u32 = 5 * 1024 * 1024;
 /// How many of a mailbox's unread messages older than what's cached are kept cached, the newest:
 /// as many as a first sync fetches. Each search for them fetches only those not cached yet.
 const UNREAD_KEPT: usize = 200;
+/// How many messages cached before threads were fetched have theirs read at once: their
+/// `In-Reply-To` and `References` headers, a few hundred bytes each.
+const THREADING_BATCH: usize = 500;
 
 /// Something the UI should show. By the time it's sent, the mail is already in the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +123,9 @@ pub enum Update {
     /// Messages asked for with [`Mailroom::peek`] were downloaded, and their text is in the
     /// store, to show where a search found them.
     Peeked { account: String, mailbox: String },
+    /// Where messages cached before threads were fetched sit in their threads was read, and is
+    /// in the store: the threads [`Store::thread`] gives may have grown.
+    Threaded { account: String },
     /// A message asked for with [`Mailroom::open`] was downloaded, or couldn't be. Once downloaded
     /// it's read, on the server and in the store, unless the server wouldn't mark it: `marked`.
     Opened {
@@ -533,6 +539,18 @@ enum Job {
         cleared: u64,
         result: Result<Prefetched, String>,
     },
+    /// Where messages cached before threads were fetched sit in their threads was read, or
+    /// couldn't be.
+    Threaded {
+        account: String,
+        mailbox: String,
+        /// The account's watch they were asked for under: see [`Job::Watching`].
+        watch: u64,
+        uid_validity: u32,
+        /// Every message asked for, found or not.
+        uids: Vec<u32>,
+        result: Result<Vec<Threading>, String>,
+    },
     /// Messages asked for by [`Job::Prefetch`] were downloaded, or couldn't be.
     Prefetched {
         account: String,
@@ -930,6 +948,7 @@ impl Mailroom {
             busy: HashSet::new(),
             skipped: HashSet::new(),
             failed: HashSet::new(),
+            threading: HashSet::new(),
         };
         std::thread::Builder::new()
             .name("postden-store".into())
@@ -2170,16 +2189,149 @@ struct Prefetcher {
     /// are downloaded ahead meanwhile: each is tried again once the account's mail syncs, or
     /// it's asked to download ahead again.
     failed: HashSet<(String, u64, String)>,
+    /// The accounts whose messages cached before threads were fetched are having theirs read:
+    /// one batch at a time each.
+    threading: HashSet<String>,
 }
 
 impl Prefetcher {
+    /// Saves what a job brought and says what the UI should show, as [`Prefetcher::save_job`];
+    /// and once an account's mail synced, reads where its messages cached before threads were
+    /// fetched sit in theirs.
+    fn save(&mut self, store: &mut Store, job: Job) -> Vec<Update> {
+        let synced = match &job {
+            Job::Watched(Event::Synced { account, .. })
+            | Job::Watching {
+                event: Event::Synced { account, .. },
+                ..
+            } => Some(account.clone()),
+            _ => None,
+        };
+        let mut updates = match job {
+            Job::Threaded {
+                account,
+                mailbox,
+                watch,
+                uid_validity,
+                uids,
+                result,
+            } => {
+                return self.save_threading(
+                    store,
+                    (account, mailbox),
+                    (watch, uid_validity),
+                    &uids,
+                    result,
+                );
+            }
+            job => self.save_job(store, job),
+        };
+        if let Some(account) = synced {
+            self.thread_ahead(store, &account, &mut updates);
+        }
+        updates
+    }
+
+    /// Saves where messages `uids` sit in their threads, as [`Prefetcher::thread_ahead`] read
+    /// it, unless the account was replaced meanwhile, then reads the next batch. Failing, it's
+    /// read again once the account's mail syncs.
+    fn save_threading(
+        &mut self,
+        store: &mut Store,
+        (account, mailbox): (String, String),
+        (watch, uid_validity): (u64, u32),
+        uids: &[u32],
+        result: Result<Vec<Threading>, String>,
+    ) -> Vec<Update> {
+        self.threading.remove(&account);
+        let Ok(found) = result else {
+            return Vec::new();
+        };
+        // Held from checking the watch until it's written, as in `save_job`: unwatching waits
+        // for it, so nothing read under a replaced account is written over its successor's.
+        let watches = Arc::clone(&self.watches);
+        let current = watches.lock().unwrap_or_else(PoisonError::into_inner);
+        if current.get(&account) != Some(&watch) {
+            return Vec::new();
+        }
+        let saved = store.save_threading((&account, &mailbox, uid_validity), uids, &found);
+        drop(current);
+        if let Err(e) = saved {
+            return vec![Update::SaveFailed {
+                account,
+                error: e.to_string(),
+            }];
+        }
+        let mut updates = vec![Update::Threaded {
+            account: account.clone(),
+        }];
+        self.thread_ahead(store, &account, &mut updates);
+        updates
+    }
+
+    /// Reads where a batch of `account`'s messages cached before threads were fetched sit in
+    /// theirs, from the first of its mailboxes that has any, unless a batch is under way.
+    fn thread_ahead(&mut self, store: &Store, account: &str, updates: &mut Vec<Update>) {
+        if self.threading.contains(account) {
+            return;
+        }
+        let Some((server, credentials, watch)) = self
+            .logins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(account)
+            .cloned()
+        else {
+            return;
+        };
+        let next = (|| -> postden_store::Result<Option<(String, u32, Vec<u32>)>> {
+            for (mailbox, state) in store.mailbox_states(account)? {
+                let uids = store.unthreaded(account, &mailbox, THREADING_BATCH)?;
+                if !uids.is_empty() {
+                    return Ok(Some((mailbox, state.uid_validity, uids)));
+                }
+            }
+            Ok(None)
+        })();
+        let (mailbox, uid_validity, uids) = match next {
+            Ok(Some(next)) => next,
+            Ok(None) => return,
+            Err(e) => {
+                updates.push(Update::SaveFailed {
+                    account: account.to_owned(),
+                    error: e.to_string(),
+                });
+                return;
+            }
+        };
+        // The mailroom is going away: nobody would save what comes back.
+        let Some(jobs) = self.jobs.upgrade() else {
+            return;
+        };
+        self.threading.insert(account.to_owned());
+        let account = account.to_owned();
+        self.handle.spawn(async move {
+            let result = fetch_threading(&server, &credentials, &mailbox, uid_validity, &uids)
+                .await
+                .map_err(|e| e.to_string());
+            let _ignored = jobs.send(Job::Threaded {
+                account,
+                mailbox,
+                watch,
+                uid_validity,
+                uids,
+                result,
+            });
+        });
+    }
+
     /// Saves what a job brought and says what the UI should show, then downloads ahead what
     /// the account's inbox and mailboxes chosen lack if the job may have changed that.
     #[expect(
         clippy::significant_drop_tightening,
         reason = "a watch's number is held until what it brought is written"
     )]
-    fn save(&mut self, store: &mut Store, job: Job) -> Vec<Update> {
+    fn save_job(&mut self, store: &mut Store, job: Job) -> Vec<Update> {
         // Held from checking a watch's number until what it brought is written: unwatching
         // waits for it, so once `Mailroom::unwatch` returns, nothing of that watch is written.
         let watches = Arc::clone(&self.watches);
@@ -3195,6 +3347,8 @@ mod tests {
                     date: None,
                     seen: false,
                     flagged: false,
+                    in_reply_to: None,
+                    references: Vec::new(),
                 })
                 .collect(),
             asked: 0,
@@ -3301,6 +3455,8 @@ mod tests {
                 date: None,
                 seen: false,
                 flagged: false,
+                in_reply_to: None,
+                references: Vec::new(),
             })
             .collect();
         let job = |uid_validity, older: &[Envelope]| Job::Older {
@@ -3509,6 +3665,7 @@ mod tests {
             busy: HashSet::new(),
             skipped: HashSet::new(),
             failed: HashSet::new(),
+            threading: HashSet::new(),
         };
         ((runtime, jobs), prefetcher)
     }
@@ -3529,6 +3686,37 @@ mod tests {
                 too_big: too_big.to_vec(),
             }),
         }
+    }
+
+    #[test]
+    fn threads_read_under_a_replaced_watch_are_not_saved() {
+        let mut store = Store::open_in_memory().unwrap();
+        store.save_account(&account()).unwrap();
+        let (_runtime, mut prefetcher) = prefetcher(0);
+        prefetcher.save(&mut store, messages(1, &[2]));
+        let threaded = |watch| Job::Threaded {
+            account: "me@example.com".into(),
+            mailbox: "INBOX".into(),
+            watch,
+            uid_validity: 1,
+            uids: vec![2],
+            result: Ok(vec![(2, Some("parent@example.com".into()), Vec::new())]),
+        };
+        let parent = |store: &Store| {
+            store
+                .message("me@example.com", "INBOX", 2)
+                .unwrap()
+                .and_then(|m| m.envelope.in_reply_to)
+        };
+        // Read under watch 2, while the account is watched as 1: of another server.
+        prefetcher.save(&mut store, threaded(2));
+        assert_eq!(parent(&store), None, "replaced");
+        let updates = prefetcher.save(&mut store, threaded(1));
+        assert!(
+            matches!(&updates[..], [Update::Threaded { .. }]),
+            "got {updates:?}"
+        );
+        assert_eq!(parent(&store).as_deref(), Some("parent@example.com"));
     }
 
     #[test]
@@ -4286,6 +4474,8 @@ mod tests {
                 date: None,
                 seen: true,
                 flagged: false,
+                in_reply_to: None,
+                references: Vec::new(),
             }],
             asked: 0,
         });
@@ -4383,6 +4573,8 @@ mod tests {
                 date: None,
                 seen: true,
                 flagged: false,
+                in_reply_to: None,
+                references: Vec::new(),
             }],
             asked: 0,
         });
@@ -4652,6 +4844,8 @@ mod tests {
             date: Some(1),
             seen: true,
             flagged: false,
+            in_reply_to: None,
+            references: Vec::new(),
         };
         save(
             &mut store,

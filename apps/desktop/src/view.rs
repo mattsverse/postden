@@ -2,7 +2,7 @@
 //! being written, the add-account form or the settings in the main pane.
 
 use jiff::ZonedDateTime;
-use postden_app::{POLL_INTERVALS, PREFETCH_COUNTS, Theme};
+use postden_app::{POLL_INTERVALS, PREFETCH_COUNTS, Theme, ThreadOrder};
 use postden_core::account::{Account, Security};
 use postden_core::message::{Address, Mailbox, Role};
 use postden_html::compat::{self, Client, Provider};
@@ -131,7 +131,7 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
     } else if s.compose.open {
         compose(s, &s.compose, &k, &mut layer)
     } else if let Some(reader) = &s.reader {
-        message(reader, &k)
+        crate::rail::with_rail(s, reader, message(reader, &k), &k)
     } else {
         inbox(s, &k, &mut layer)
     };
@@ -168,6 +168,7 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
                 .key("back")
                 .transition(Transition::none()),
         );
+        trailing = trailing.children(crate::rail::toggle(s, &k));
         trailing = trailing.child(reader_actions(s, reader, &k));
         // In its place from the start, waiting for the message to download, so nothing beside
         // it moves as it does.
@@ -4167,6 +4168,7 @@ fn general_settings(s: &Mail, k: &Kit, page: El, layer: &mut Vec<El>) -> El {
                 .build(k)
                 .key("group-read-mailboxes"),
         ))
+        .child(thread_setting(s, k))
         .child(contacts_setting(s, k))
         .child(setting_section(
             k,
@@ -4177,6 +4179,36 @@ fn general_settings(s: &Mail, k: &Kit, page: El, layer: &mut Vec<El>) -> El {
             ),
             updates(s, k, layer),
         ))
+}
+
+/// How an open message's thread shows: from its oldest message or its newest.
+fn thread_setting(s: &Mail, k: &Kit) -> El {
+    let orders: Vec<&str> = ThreadOrder::ALL.iter().map(|o| o.label()).collect();
+    let order = SegmentedControl::new(
+        &orders,
+        ThreadOrder::ALL
+            .iter()
+            .position(|o| *o == s.settings.thread_order),
+    )
+    .label("Order")
+    .fit()
+    .on_pick(|s: &mut Mail, i, _| {
+        if let Some(order) = ThreadOrder::ALL.get(i) {
+            s.set_thread_order(*order);
+        }
+    })
+    .build(k)
+    .key("thread-order");
+    setting_section(
+        k,
+        "Threads",
+        Some(
+            "When a message is part of a thread, a graph beside it shows the whole thread: each \
+             reply follows the message it answers, and a second reply to the same message \
+             branches off, as git draws commits. ⇧⌘T shrinks it to the graph alone.",
+        ),
+        row().child(order),
+    )
 }
 
 /// The settings' Advanced section: how often mail is checked, and how many messages are

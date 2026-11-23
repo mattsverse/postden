@@ -218,6 +218,54 @@ pub async fn prefetch_messages(
     result
 }
 
+/// Where a message sits in its thread: its UID, the `Message-ID` it replies to and its
+/// `References`, oldest first.
+pub type Threading = (u32, Option<String>, Vec<String>);
+
+/// Reads where messages `uids` of `mailbox` sit in their threads.
+///
+/// Only their `In-Reply-To` and `References` headers are read, and they stay unread. Those no
+/// longer on the server are left out. See [`open_message`] for `uid_validity`.
+///
+/// # Errors
+///
+/// Returns an error when the connection fails or the mailbox changed.
+pub async fn fetch_threading(
+    server: &Server,
+    credentials: &Credentials,
+    mailbox: &str,
+    uid_validity: u32,
+    uids: &[u32],
+) -> Result<Vec<Threading>> {
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut session = connect(server, credentials).await?;
+    let result = async {
+        select(&mut session, mailbox, uid_validity).await?;
+        let fetches: Vec<_> = with_timeout(async {
+            session
+                .uid_fetch(uid_set(uids), super::envelope::THREADING_QUERY)
+                .await?
+                .try_collect()
+                .await
+        })
+        .await?;
+        Ok(fetches
+            .iter()
+            .filter_map(|f| {
+                let uid = f.uid.filter(|uid| uids.contains(uid))?;
+                let (in_reply_to, references) =
+                    super::envelope::threading(f.header().unwrap_or_default());
+                Some((uid, in_reply_to, references))
+            })
+            .collect())
+    }
+    .await;
+    logout(session).await;
+    result
+}
+
 /// UIDs as an IMAP sequence set, such as `3,7,12`.
 fn uid_set(uids: &[u32]) -> String {
     uids.iter()

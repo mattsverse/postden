@@ -379,6 +379,8 @@ mod tests {
             date: Some(1_794_475_800),
             seen: true,
             flagged: false,
+            in_reply_to: None,
+            references: Vec::new(),
         }
     }
 
