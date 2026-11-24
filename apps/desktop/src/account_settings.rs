@@ -233,27 +233,14 @@ impl AccountSettings {
         if !self.open {
             return false;
         }
-        // An editor's HTML can differ from what it was given without the text differing, so a
-        // visual signature compares by what it shows, images in place.
-        let shown = |s: &Option<Signature>| {
-            s.as_ref().map(|s| {
-                (
-                    signature::text(s),
-                    signature::image_widths(&s.html),
-                    s.images.clone(),
-                    s.source,
-                )
-            })
-        };
+        // What's saved is the editor's own HTML from when the page opened, so the HTML differs
+        // only once something in it, formatting included, does.
         let current = self.current();
         current.label != self.saved.label
             || current.name != self.saved.name
             || current.servers != self.saved.servers
             || (self.edits_servers() && self.servers.has_passwords())
-            || match (&current.signature, &self.saved.signature) {
-                (Some(a), Some(b)) if a.source || b.source => a != b,
-                _ => shown(&current.signature) != shown(&self.saved.signature),
-            }
+            || current.signature != self.saved.signature
     }
 
     /// Draws the preview again, after an edit.
@@ -350,6 +337,33 @@ mod tests {
             mime: "image/png".into(),
             data: png.into(),
         }
+    }
+
+    #[test]
+    fn a_colored_signature_reopens_in_the_visual_editor() {
+        let mut page = AccountSettings::new(&account(), None, None);
+        page.signature.text.replace_text("Ada Lovelace");
+        page.signature.text.set_selection(0, 3);
+        page.signature.set_color(Some("#1a73e8"));
+        let saved = page.built().unwrap();
+        assert!(!saved.source);
+        assert!(saved.html.contains("color:#1a73e8"), "{}", saved.html);
+
+        let mut reopened = AccountSettings::new(&account(), Some(&saved), None);
+        assert_eq!(reopened.signature.mode, Mode::Visual);
+        reopened.signature.text.set_selection(0, 3);
+        assert_eq!(reopened.signature.text.active_color(), Some("#1a73e8"));
+        assert_eq!(reopened.built().unwrap().html, saved.html);
+        assert!(!reopened.is_changed());
+
+        reopened.signature.set_color(Some("#d93025"));
+        assert!(reopened.is_changed(), "a new color can be saved");
+        reopened.signature.text.set_selection(0, 3);
+        reopened.signature.set_color(None);
+        assert!(reopened.is_changed(), "so can taking it off");
+        reopened.signature.text.set_selection(0, 3);
+        reopened.signature.set_color(Some("#1a73e8"));
+        assert!(!reopened.is_changed(), "back as it was");
     }
 
     #[test]

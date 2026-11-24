@@ -14,7 +14,7 @@ pub(crate) enum Mode {
 }
 
 /// The inline formatting the visual editor offers, all of which every major mail app shows.
-const fn marks() -> [Mark; 6] {
+const fn marks() -> [Mark; 7] {
     [
         Mark::Bold,
         Mark::Italic,
@@ -22,8 +22,20 @@ const fn marks() -> [Mark; 6] {
         Mark::Strike,
         Mark::Code,
         Mark::Link(String::new()),
+        Mark::Color(String::new()),
     ]
 }
+
+/// The text colors offered, by name: dark enough to read on white, light enough to tell apart
+/// from black.
+pub(crate) const COLORS: [(&str, &str); 6] = [
+    ("Gray", "#5f6368"),
+    ("Red", "#d93025"),
+    ("Orange", "#e37400"),
+    ("Green", "#188038"),
+    ("Blue", "#1a73e8"),
+    ("Purple", "#9334e6"),
+];
 
 const BLOCKS: [Block; 4] = [
     Block::Bullet(0),
@@ -51,6 +63,8 @@ pub(crate) struct RichEditor {
     pub(crate) confirm_visual: bool,
     /// The address of the link being added to the selection, while it's typed.
     pub(crate) link: Option<TextEdit>,
+    /// Whether the text colors are showing, to pick one for the selection.
+    pub(crate) picking_color: bool,
 }
 
 impl RichEditor {
@@ -117,6 +131,7 @@ impl RichEditor {
         self.source = TextEdit::new(html);
         self.source.focused = true;
         self.link = None;
+        self.picking_color = false;
         self.confirm_visual = false;
         self.mode = Mode::Source;
     }
@@ -156,6 +171,7 @@ impl RichEditor {
         let mut link = TextEdit::new(self.text.active_link().unwrap_or_default());
         link.focused = true;
         self.link = Some(link);
+        self.picking_color = false;
     }
 
     /// Links the selection to the address typed, or unlinks it when the address is blank.
@@ -176,6 +192,24 @@ impl RichEditor {
     pub(crate) fn remove_link(&mut self) {
         self.link = None;
         self.text.set_link(None);
+        self.text.focused = true;
+    }
+
+    /// Shows the text colors to pick from, or hides them.
+    pub(crate) fn toggle_colors(&mut self) {
+        self.picking_color = !self.picking_color;
+        if self.picking_color {
+            self.link = None;
+        } else {
+            self.text.focused = true;
+        }
+    }
+
+    /// Colors the selection, or what's typed next, `color` (`#rrggbb`); `None` puts back the
+    /// default color.
+    pub(crate) fn set_color(&mut self, color: Option<&str>) {
+        self.text.set_color(color);
+        self.picking_color = false;
         self.text.focused = true;
     }
 
@@ -237,6 +271,87 @@ mod tests {
         assert!(e.confirm_visual);
         assert!(e.set_mode(Mode::Visual), "the second goes ahead");
         assert_eq!(e.text.text.trim(), "Hi");
+    }
+
+    #[test]
+    fn text_is_colored_recolored_and_reset() {
+        let mut e = RichEditor::visual(None, "Hello there");
+        e.text.set_selection(0, 5);
+        e.toggle_colors();
+        assert!(e.picking_color);
+        e.set_color(Some(COLORS[1].1));
+        assert!(!e.picking_color, "picking a color closes the colors");
+        assert!(e.is_formatted(), "colored text goes as HTML");
+        assert_eq!(e.text.active_color(), Some("#d93025"));
+        assert!(
+            e.html()
+                .contains(r#"<span style="color:#d93025">Hello</span>"#),
+            "{}",
+            e.html()
+        );
+
+        e.set_color(Some(COLORS[4].1));
+        assert_eq!(e.text.active_color(), Some("#1a73e8"));
+        assert!(!e.html().contains("#d93025"), "{}", e.html());
+
+        e.set_color(None);
+        assert_eq!(e.text.active_color(), None);
+        assert!(!e.is_formatted(), "default color is plain text");
+        assert!(!e.html().contains("color"), "{}", e.html());
+    }
+
+    #[test]
+    fn color_survives_the_html_source() {
+        let mut e = RichEditor::visual(None, "Hello there");
+        e.text.set_selection(6, 11);
+        e.set_color(Some(COLORS[3].1));
+        let html = e.html();
+        assert!(e.set_mode(Mode::Source));
+        assert!(e.source.text.contains("color:#188038"), "{}", e.source.text);
+        assert!(e.set_mode(Mode::Visual), "colored source goes back at once");
+        assert_eq!(e.html(), html);
+        e.text.set_selection(6, 11);
+        assert_eq!(e.text.active_color(), Some("#188038"));
+    }
+
+    #[test]
+    fn color_source_that_fits_keeps_its_color() {
+        for (style, hex) in [
+            ("color:#D93025", "#d93025"),
+            (" COLOR : #ABC ; ", "#aabbcc"),
+            ("color: #1a73e8;", "#1a73e8"),
+        ] {
+            let html = format!("<p>a <span style=\"{style}\">b</span></p>");
+            let mut e = RichEditor::source(&html);
+            assert!(e.set_mode(Mode::Visual), "{style} fits");
+            assert!(
+                e.html()
+                    .contains(&format!("<span style=\"color:{hex}\">b</span>")),
+                "{style}: {}",
+                e.html()
+            );
+        }
+    }
+
+    #[test]
+    fn colored_code_goes_back_to_visual_at_once() {
+        let mut e = RichEditor::visual(None, "Hello there");
+        e.text.set_selection(0, 5);
+        e.toggle_mark(Mark::Code);
+        e.set_color(Some(COLORS[1].1));
+        let html = e.html();
+        assert!(e.set_mode(Mode::Source));
+        assert!(e.set_mode(Mode::Visual), "{html}");
+        assert_eq!(e.html(), html);
+    }
+
+    #[test]
+    fn styles_beyond_color_still_warn() {
+        let mut e = RichEditor::source(
+            "<p><span style=\"color:#d93025;background-color:#ffff00\">b</span></p>",
+        );
+        assert!(!e.set_mode(Mode::Visual), "the first press warns");
+        assert!(e.confirm_visual);
     }
 
     #[test]

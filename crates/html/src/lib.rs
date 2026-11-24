@@ -110,23 +110,79 @@ const EDITABLE: &[&str] = &[
     "span",
 ];
 
-/// Whether `html` uses only what a visual editor keeps (see [`EDITABLE`]), with no attributes
-/// but links' `href`. Converting anything else to the editor drops formatting.
+/// Whether `html` uses only what a visual editor keeps (see [`EDITABLE`]).
+///
+/// The only attributes are links' `href` and a `<span>`'s text color ([`is_text_color`])
+/// outside code blocks, which the editor shows uncolored. Converting anything else to the editor drops
+/// formatting.
 #[must_use]
 pub fn fits_editor(html: &str) -> bool {
+    let is_code_block = |n: ego_tree::NodeRef<'_, scraper::Node>| {
+        n.value().as_element().is_some_and(|e| e.name() == "pre")
+    };
     let document = scraper::Html::parse_document(html);
-    document
-        .tree
-        .root()
-        .descendants()
-        .all(|node| match node.value() {
-            scraper::Node::Element(e) => {
-                EDITABLE.contains(&e.name())
-                    && e.attrs().all(|(name, _)| e.name() == "a" && name == "href")
-            }
-            scraper::Node::Comment(_) | scraper::Node::ProcessingInstruction(_) => false,
-            _ => true,
-        })
+    // The editor reads few character references, so a color spelled with one would be dropped.
+    !styles_use_references(html)
+        && document
+            .tree
+            .root()
+            .descendants()
+            .all(|node| match node.value() {
+                scraper::Node::Element(e) => {
+                    EDITABLE.contains(&e.name())
+                        && e.attrs().all(|(name, value)| match (e.name(), name) {
+                            ("a", "href") => true,
+                            ("span", "style") => {
+                                is_text_color(value)
+                                    && !node.ancestors().any(is_code_block)
+                                    && !node.descendants().any(is_code_block)
+                            }
+                            _ => false,
+                        })
+                }
+                scraper::Node::Comment(_) | scraper::Node::ProcessingInstruction(_) => false,
+                _ => true,
+            })
+}
+
+/// Whether a `style` attribute in `html`, as written, has a character reference (`&…;`).
+fn styles_use_references(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    while let Some(at) = rest.find("style") {
+        rest = rest.get(at + "style".len()..).unwrap_or_default();
+        let Some(value) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim_start();
+        let value = match value.chars().next() {
+            Some(quote @ ('"' | '\'')) => value
+                .get(1..)
+                .and_then(|v| v.split(quote).next())
+                .unwrap_or_default(),
+            _ => value
+                .split(|c: char| c.is_ascii_whitespace() || c == '>')
+                .next()
+                .unwrap_or_default(),
+        };
+        if value.contains('&') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `style` sets only the text's color, as `#rgb` or `#rrggbb`: what the visual editor
+/// writes, and reads back without losing anything.
+fn is_text_color(style: &str) -> bool {
+    let declaration = style.trim().strip_suffix(';').unwrap_or(style).trim();
+    let Some((property, value)) = declaration.split_once(':') else {
+        return false;
+    };
+    let hex = value.trim().strip_prefix('#').unwrap_or_default();
+    property.trim().eq_ignore_ascii_case("color")
+        && matches!(hex.len(), 3 | 6)
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Elements that hold text without formatting it.
@@ -198,7 +254,64 @@ mod tests {
             "<p><b>Hi</b> <a href='https://x.test'>x</a></p><ul><li>a</li></ul>"
         ));
         assert!(!fits_editor("<p style='color:red'>x</p>"), "style");
+        assert!(!fits_editor("<p><span class='x'>x</span></p>"), "class");
         assert!(!fits_editor("<table><tr><td>x</td></tr></table>"), "table");
         assert!(!fits_editor("<!-- x --><p>x</p>"), "comment");
+    }
+
+    #[test]
+    fn text_color_fits_the_editor() {
+        for style in ["color:#d93025", " COLOR : #ABC ; ", "color: #1a73e8;"] {
+            assert!(
+                fits_editor(&format!("<p>a <span style='{style}'>b</span></p>")),
+                "{style}"
+            );
+        }
+        for style in [
+            "color:red",
+            "color:rgb(1,2,3)",
+            "color:#d93025cc",
+            "color:#d93025;font-weight:bold",
+            "background-color:#d93025",
+            "background:#d93025",
+            "font-size:20px",
+            "color:#xyz",
+            "color:",
+        ] {
+            assert!(
+                !fits_editor(&format!("<p><span style='{style}'>b</span></p>")),
+                "{style}"
+            );
+        }
+        assert!(!fits_editor("<p style='color:#d93025'>x</p>"), "only spans");
+        assert!(!fits_editor("<font color='#d93025'>x</font>"), "font");
+        for html in [
+            "<pre><span style='color:#d93025'>x</span></pre>",
+            "<pre><code><span style='color:#d93025'>x</span></code></pre>",
+            "<span style='color:#d93025'><pre>x</pre></span>",
+        ] {
+            assert!(!fits_editor(html), "a code block shows no color: {html}");
+        }
+        for html in [
+            "<p><span style='color:#d93025'><code>x</code></span></p>",
+            "<p><code><span style='color:#d93025'>x</span></code></p>",
+        ] {
+            assert!(fits_editor(html), "inline code keeps its color: {html}");
+        }
+        assert!(
+            !fits_editor("<p><span style='color:&num;d93025'>x</span></p>"),
+            "a character reference"
+        );
+        assert!(
+            !fits_editor(
+                "<p><span style='color:#d93025'>a</span><span style=\"color:&#35;d93025\">b</span>\
+                 <span style=color:&num;d93025>c</span></p>"
+            ),
+            "beside one written out"
+        );
+        assert!(
+            fits_editor("<p>Tom &amp; Jerry <span style='color:#d93025'>x &lt; y</span></p>"),
+            "a reference in text"
+        );
     }
 }
