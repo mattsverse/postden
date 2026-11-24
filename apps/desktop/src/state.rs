@@ -66,6 +66,8 @@ pub(crate) struct Reader {
     /// The UIDVALIDITY its mailbox was cached under when it opened: a download made under
     /// another is of another message.
     uid_validity: Option<u32>,
+    /// Whether it was cached when it opened, or since, rather than only found by the server.
+    cached: bool,
     /// Whether it was read before it opened, shown read since: as it shows again when the server
     /// won't mark it.
     seen_before: bool,
@@ -81,6 +83,31 @@ impl Reader {
     fn is(&self, account: &str, mailbox: &str, uid: u32) -> bool {
         is_message(&self.message, account, mailbox, uid)
     }
+}
+
+/// The message the mouse's Back button closed, which its Forward button opens again while the
+/// list behind still shows what it did then.
+#[derive(Debug, Clone, PartialEq)]
+struct Forward {
+    message: MessageKey,
+    /// The UIDVALIDITY its mailbox was cached under: under another, its UID names another message.
+    uid_validity: Option<u32>,
+    /// It was cached, when it opened or since: gone from the cache after that, it's gone from the
+    /// server, whatever a search that found it before still lists.
+    cached: bool,
+    /// The row J and K went on from, when it was opened unlisted from its thread's rail.
+    thread_anchor: Option<MessageKey>,
+    /// What the list showed behind it.
+    behind: Behind,
+}
+
+/// What the list shows: the mailboxes, and what's searched for in them.
+#[derive(Debug, Clone, PartialEq)]
+struct Behind {
+    showing: Showing,
+    query: String,
+    everywhere: bool,
+    all_mail: bool,
 }
 
 /// The menu of a message in the list, opened by right-clicking it.
@@ -654,6 +681,8 @@ pub(crate) struct Mail {
     pub(crate) sidebar: PaneState,
     /// The message open in the main pane, if any.
     pub(crate) reader: Option<Reader>,
+    /// The message the mouse's Back button closed, for its Forward button.
+    forward: Option<Forward>,
     /// Accounts whose mailboxes are hidden in the sidebar.
     pub(crate) collapsed: HashSet<String>,
     /// Accounts whose group of mailboxes with nothing unread is open in the sidebar, while the
@@ -804,6 +833,10 @@ impl Mail {
         Self::failed(None, "starting…".into())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one line for each field of the window's state"
+    )]
     fn failed(handle: Option<AppHandle<Self>>, error: String) -> Self {
         Self {
             handle,
@@ -856,6 +889,7 @@ impl Mail {
             confirm_remove: None,
             sidebar: PaneState::new(260.0).range(200.0, 420.0),
             reader: None,
+            forward: None,
             compose: ComposeForm::default(),
             actions_open: false,
             message_menu: None,
@@ -1366,6 +1400,7 @@ impl Mail {
     /// Rereads accounts and mail from the store.
     fn reload(&mut self) {
         self.prune_returned();
+        self.note_cached();
         let Ok(services) = &self.services else { return };
         let unread_only = self.settings.unread_only;
         // Read ones stay listed only while a message is open: back in the list, by whatever way,
@@ -1996,6 +2031,7 @@ impl Mail {
     /// The query changed: matches it in the cache. What the server found for the last one no
     /// longer stands.
     pub(crate) fn search_changed(&mut self) {
+        self.forward = None;
         if !self.search.asked_server() {
             self.search.forget_server();
         }
@@ -2058,6 +2094,7 @@ impl Mail {
 
     /// Leaves out what the server found, listing what's on this computer again, the query kept.
     pub(crate) fn search_local_only(&mut self) {
+        self.forward = None;
         self.search.forget_server();
         self.list_limit = LIST_LIMIT;
         self.clear_listed();
@@ -2074,6 +2111,7 @@ impl Mail {
     /// inbox or just what's selected. The query stays.
     pub(crate) fn search_within(&mut self, everywhere: bool, all_mail: bool) {
         if self.search.everywhere != everywhere || self.search.all_mail != all_mail {
+            self.forward = None;
             self.search.everywhere = everywhere;
             self.search.all_mail = all_mail;
             self.search.forget_server();
@@ -2371,6 +2409,7 @@ impl Mail {
             );
             return;
         }
+        self.forward = None;
         self.search.forget_server();
         let mut failed = Vec::new();
         for key in mailboxes {
@@ -2627,7 +2666,7 @@ impl Mail {
 
     /// Opens a message in the main pane, downloading it unless it was downloaded ahead, and
     /// marking it read. One the list doesn't show, such as one a search leaves out, opens from
-    /// the cache.
+    /// the cache, or from what the server found.
     pub(crate) fn open_message(&mut self, account: &str, mailbox: &str, uid: u32) {
         // Opening marks it read, which would be lost once it's moved back.
         if self.moving_back(&(account.to_owned(), mailbox.to_owned(), uid)) {
@@ -2637,6 +2676,8 @@ impl Mail {
             .remove(&(account.to_owned(), mailbox.to_owned(), uid));
         self.pending_reply = None;
         self.thread_anchor = None;
+        // Another message opened, Forward has nothing to go to.
+        self.forward = None;
         let listed = self
             .messages
             .iter()
@@ -2646,7 +2687,16 @@ impl Mail {
             let services = self.services.as_ref().ok()?;
             services.store.message(account, mailbox, uid).ok().flatten()
         };
-        let Some(mut message) = listed.or_else(cached) else {
+        // Found by the server and not cached, as one read and gone from a list of unread mail
+        // that Forward opens again.
+        let found = || {
+            self.search
+                .found
+                .iter()
+                .find(|m| is_message(m, account, mailbox, uid))
+                .cloned()
+        };
+        let Some(mut message) = listed.or_else(cached).or_else(found) else {
             return;
         };
         self.shown_as_asked(&mut message);
@@ -2670,6 +2720,7 @@ impl Mail {
         }
         let mut reader = Reader {
             seen_before: message.envelope.seen,
+            cached: self.cached(&key),
             message,
             body: None,
             markdown: None,
@@ -2898,6 +2949,111 @@ impl Mail {
         self.leave_reader();
         self.pending_reply = None;
         self.forget_read();
+    }
+
+    /// The mouse's Back button: closes the open message, back to the list behind it, as Esc
+    /// does, and keeps it for Forward. Returns whether it did. Nothing shows over the list then
+    /// but a message.
+    pub(crate) fn mouse_back(&mut self) -> bool {
+        if !self.only_browsing() {
+            return false;
+        }
+        let Some(reader) = &self.reader else {
+            return false;
+        };
+        let forward = Forward {
+            cached: reader.cached,
+            message: message_key(&reader.message),
+            uid_validity: reader.uid_validity,
+            thread_anchor: self.thread_anchor.clone(),
+            behind: self.behind(),
+        };
+        self.close_reader();
+        self.forward = Some(forward);
+        true
+    }
+
+    /// The mouse's Forward button: opens again the message Back closed, while the list shows what
+    /// it did then and the message is still where it was, cached. Returns whether it did.
+    pub(crate) fn mouse_forward(&mut self) -> bool {
+        if !self.only_browsing() || self.reader.is_some() {
+            return false;
+        }
+        let Some(forward) = self.forward.take() else {
+            return false;
+        };
+        // Moved, or gone from the cache, it isn't there; with its mailbox started over, its UID
+        // names another message.
+        let (account, mailbox, uid) = &forward.message;
+        if forward.behind != self.behind()
+            || (forward.cached && !self.cached(&forward.message))
+            || self.moving.contains(&forward.message)
+            || self.uid_validity(account, mailbox) != forward.uid_validity
+        {
+            return false;
+        }
+        self.open_message(account, mailbox, *uid);
+        let listed = self.find_listed(&forward.message).is_some();
+        if self.reader.is_some() && !listed && forward.thread_anchor.is_some() {
+            self.cursor.clone_from(&forward.thread_anchor);
+            self.thread_anchor = forward.thread_anchor;
+        }
+        self.reader.is_some()
+    }
+
+    /// Nothing shows over the list and the message open: no message being written, settings
+    /// (an account's among them), account form, palette, menu or dialog.
+    const fn only_browsing(&self) -> bool {
+        !self.compose.open
+            && !self.settings_open
+            && !self.form.open
+            && !self.palette.open
+            && !self.actions_open
+            && self.message_menu.is_none()
+            && self.mailbox_menu.is_none()
+            && self.account_menu.is_none()
+            && !self.new_mailbox.open
+            && self.delete_mailbox.mailbox.is_none()
+            && self.asking.is_none()
+            && !self.updater.dialog_open
+    }
+
+    /// The open message, and the one Forward opens, found only by the server, are noted once
+    /// they're cached too: gone from the cache after that, they're gone from the server.
+    fn note_cached(&mut self) {
+        if let Some(key) = (self.reader.as_ref())
+            .filter(|r| !r.cached)
+            .map(|r| message_key(&r.message))
+            && self.cached(&key)
+            && let Some(r) = &mut self.reader
+        {
+            r.cached = true;
+        }
+        if let Some(key) = (self.forward.as_ref())
+            .filter(|f| !f.cached)
+            .map(|f| f.message.clone())
+            && self.cached(&key)
+            && let Some(f) = &mut self.forward
+        {
+            f.cached = true;
+        }
+    }
+
+    /// Whether the message `key` names is in the cache.
+    fn cached(&self, (account, mailbox, uid): &MessageKey) -> bool {
+        self.services.as_ref().is_ok_and(|services| {
+            matches!(services.store.message(account, mailbox, *uid), Ok(Some(_)))
+        })
+    }
+
+    /// What the list shows now.
+    fn behind(&self) -> Behind {
+        Behind {
+            showing: self.showing.clone(),
+            query: self.search.query.text.clone(),
+            everywhere: self.search.everywhere,
+            all_mail: self.search.all_mail,
+        }
     }
 
     /// Closes the open message, however the window leaves it. What was read meanwhile and is still
@@ -5831,6 +5987,7 @@ impl Mail {
     fn switch_list(&mut self, showing: Showing) {
         // A message being moved back no longer takes the cursor once it's listed.
         self.restoring = None;
+        self.forward = None;
         // A search goes on in the mailbox now shown, unless it looks through every inbox or all
         // mail.
         if !self.search.everywhere && !self.search.all_mail {
@@ -7103,6 +7260,7 @@ impl Mail {
         }
         // While it's still on, so what was read and is still being marked so stays put away.
         self.clear_listed();
+        self.forward = None;
         self.settings.unread_only = on;
         self.list_limit = LIST_LIMIT;
         self.save_settings();
@@ -7529,6 +7687,9 @@ impl Mail {
     /// Stops showing account `id`'s mail, removed or now on another server or user, whose UIDs
     /// name other messages: its open message and menus, and what a server search found.
     fn forget_mail_of(&mut self, id: &str) {
+        if self.forward.as_ref().is_some_and(|f| f.message.0 == id) {
+            self.forward = None;
+        }
         if self.undo.as_ref().is_some_and(|u| u.account() == id) {
             self.undo = None;
         }
@@ -8714,6 +8875,7 @@ mod tests {
             body: None,
             markdown: None,
             uid_validity: Some(1),
+            cached: true,
             seen_before: true,
             waited: false,
             thread: Thread::default(),
@@ -8824,6 +8986,7 @@ mod tests {
             body: None,
             markdown: None,
             uid_validity: Some(1),
+            cached: true,
             seen_before: seen,
             waited: false,
             thread: Thread::default(),
@@ -11135,5 +11298,409 @@ mod tests {
         // Arriving again later, as when moved back by hand, it's new.
         s.inbox_mail(target(), 1, false, &[], &["m@example.com".into()]);
         assert!(s.notice.is_some());
+    }
+
+    /// The message open, by its UID in Ada's inbox.
+    fn open_uid(s: &Mail) -> Option<u32> {
+        s.reader.as_ref().map(|r| r.message.envelope.uid)
+    }
+
+    #[test]
+    fn the_mouses_back_leaves_a_message_for_its_list_and_forward_opens_it_again() {
+        let (_dir, mut s) = synced(
+            "mouse-back",
+            &[hello(1, true), hello(2, true), hello(3, true)],
+        );
+        // Nothing open, Back and Forward do nothing.
+        assert!(!s.mouse_back());
+        assert!(!s.mouse_forward());
+        s.open_message("ada@example.com", INBOX, 2);
+        // Nothing to go forward to while a message is open.
+        assert!(!s.mouse_forward());
+        assert!(s.mouse_back());
+        assert_eq!(open_uid(&s), None);
+        assert_eq!(s.showing, Showing::inbox("ada@example.com"));
+        assert_eq!(s.cursor, Some(ada(2)), "back on its row");
+        // Back again has nowhere to go, and keeps what Forward opens.
+        assert!(!s.mouse_back());
+        assert!(s.mouse_forward());
+        assert_eq!(open_uid(&s), Some(2));
+        assert_eq!(s.cursor, Some(ada(2)));
+        // Opened again, Forward has nothing left to open.
+        assert!(!s.mouse_forward());
+        assert!(s.mouse_back());
+        assert!(s.mouse_forward());
+        assert!(s.mouse_back());
+
+        // Another message opened from the list, Forward opens that one, not the first.
+        s.open_message("ada@example.com", INBOX, 1);
+        s.close_reader();
+        assert!(!s.mouse_forward(), "closed with Esc, not Back");
+        s.open_message("ada@example.com", INBOX, 3);
+        assert!(s.mouse_back());
+        s.open_message("ada@example.com", INBOX, 1);
+        assert!(s.mouse_back());
+        assert!(s.mouse_forward());
+        assert_eq!(open_uid(&s), Some(1));
+    }
+
+    #[test]
+    fn the_mouses_back_returns_to_the_search_it_came_from() {
+        let (_dir, mut s) = synced("mouse-search", &[hello(1, true), hello(2, true)]);
+        s.search.query = TextEdit::new("hello");
+        s.search_changed();
+        s.open_message("ada@example.com", INBOX, 2);
+        assert!(s.mouse_back());
+        assert_eq!(s.search.query.text, "hello", "the search stays");
+        assert_eq!(uids(&s), [2, 1]);
+        assert!(s.mouse_forward());
+        assert_eq!(open_uid(&s), Some(2));
+
+        // The query changed, even back to what it was, Forward has nothing to open.
+        assert!(s.mouse_back());
+        s.search.query = TextEdit::new("hell");
+        s.search_changed();
+        s.search.query = TextEdit::new("hello");
+        s.search_changed();
+        assert!(!s.mouse_forward());
+        // Nor once the search looks through more mailboxes, or ends.
+        s.open_message("ada@example.com", INBOX, 2);
+        assert!(s.mouse_back());
+        s.search_within(true, false);
+        s.search_within(false, false);
+        assert!(!s.mouse_forward());
+        s.open_message("ada@example.com", INBOX, 2);
+        assert!(s.mouse_back());
+        s.clear_search();
+        assert!(!s.mouse_forward());
+    }
+
+    #[test]
+    fn forward_opens_a_server_result_read_and_gone_from_a_list_of_unread_mail() {
+        let (_dir, mut s) = synced("mouse-found", &[hello(1, false)]);
+        s.set_unread_only(true);
+        s.search.query = TextEdit::new("hello");
+        s.search_changed();
+        let found = |seen| StoredMessage {
+            account: "ada@example.com".into(),
+            mailbox: INBOX.into(),
+            envelope: hello(9, seen),
+        };
+        s.search.found = vec![found(false)];
+        s.reload();
+        assert_eq!(uids(&s), [9, 1]);
+        s.open_message("ada@example.com", INBOX, 9);
+        assert!(s.mouse_back());
+        // Read, it's no longer listed, and not cached either.
+        s.search.found = vec![found(true)];
+        s.reload();
+        assert_eq!(uids(&s), [1]);
+        assert!(s.mouse_forward());
+        assert_eq!(open_uid(&s), Some(9));
+
+        // The server asked anew, it's gone.
+        assert!(s.mouse_back());
+        s.search_server();
+        assert!(!s.mouse_forward());
+    }
+
+    #[test]
+    fn forward_has_nothing_to_open_once_only_whats_on_this_computer_is_searched() {
+        let (_dir, mut s) = synced("mouse-local", &[hello(1, true)]);
+        // Cached, but only the server found it, by its text.
+        s.search.query = TextEdit::new("words in its text");
+        s.search_changed();
+        s.search.found = vec![StoredMessage {
+            account: "ada@example.com".into(),
+            mailbox: INBOX.into(),
+            envelope: hello(1, true),
+        }];
+        s.reload();
+        assert_eq!(uids(&s), [1]);
+        s.open_message("ada@example.com", INBOX, 1);
+        assert!(s.mouse_back());
+        s.search_local_only();
+        assert_eq!(uids(&s), Vec::<u32>::new());
+        assert!(!s.mouse_forward());
+    }
+
+    #[test]
+    fn forward_doesnt_open_a_message_deleted_though_a_server_search_still_lists_it() {
+        let (_dir, mut s) = synced("mouse-found-gone", &[hello(1, true)]);
+        s.search.query = TextEdit::new("hello");
+        s.search_changed();
+        s.search.found = vec![StoredMessage {
+            account: "ada@example.com".into(),
+            mailbox: INBOX.into(),
+            envelope: hello(1, true),
+        }];
+        s.reload();
+        let delete = |s: &mut Mail| {
+            s.services
+                .as_mut()
+                .unwrap()
+                .store
+                .remove_message("ada@example.com", INBOX, 1)
+                .unwrap();
+            s.reload();
+        };
+        // Deleted while it's open, as after Back.
+        s.open_message("ada@example.com", INBOX, 1);
+        delete(&mut s);
+        assert!(s.mouse_back());
+        assert!(!s.mouse_forward());
+        assert_eq!(open_uid(&s), None);
+        let (_dir, mut s) = synced("mouse-found-gone-after", &[hello(1, true)]);
+        s.search.query = TextEdit::new("hello");
+        s.search_changed();
+        s.search.found = vec![StoredMessage {
+            account: "ada@example.com".into(),
+            mailbox: INBOX.into(),
+            envelope: hello(1, true),
+        }];
+        s.reload();
+        s.open_message("ada@example.com", INBOX, 1);
+        assert!(s.mouse_back());
+        delete(&mut s);
+        assert!(!s.mouse_forward());
+        assert_eq!(open_uid(&s), None);
+    }
+
+    #[test]
+    fn forward_doesnt_open_a_server_result_cached_since_and_then_deleted() {
+        for delete_before_back in [true, false] {
+            let name = format!("mouse-found-cached-{delete_before_back}");
+            let (_dir, mut s) = synced(&name, &[hello(1, true)]);
+            s.search.query = TextEdit::new("hello");
+            s.search_changed();
+            // Only the server found it at first.
+            s.search.found = vec![StoredMessage {
+                account: "ada@example.com".into(),
+                mailbox: INBOX.into(),
+                envelope: hello(9, true),
+            }];
+            s.reload();
+            s.open_message("ada@example.com", INBOX, 9);
+            let store = |s: &mut Mail, envelopes: &[Envelope]| {
+                s.services
+                    .as_mut()
+                    .unwrap()
+                    .store
+                    .save_messages("ada@example.com", INBOX, Role::Inbox, 1, envelopes)
+                    .unwrap();
+                s.reload();
+            };
+            // Cached as older mail is fetched, then deleted on the server.
+            store(&mut s, &[hello(1, true), hello(9, true)]);
+            let delete = |s: &mut Mail| {
+                s.services
+                    .as_mut()
+                    .unwrap()
+                    .store
+                    .remove_message("ada@example.com", INBOX, 9)
+                    .unwrap();
+                s.reload();
+            };
+            if delete_before_back {
+                delete(&mut s);
+                assert!(s.mouse_back());
+            } else {
+                assert!(s.mouse_back());
+                delete(&mut s);
+            }
+            assert!(
+                !s.mouse_forward(),
+                "deleted before Back: {delete_before_back}"
+            );
+            assert_eq!(open_uid(&s), None);
+        }
+    }
+
+    #[test]
+    fn forward_has_nothing_to_open_once_only_unread_mail_is_listed_or_all_again() {
+        let (_dir, mut s) = synced("mouse-unread", &[hello(1, false), hello(2, false)]);
+        s.open_message("ada@example.com", INBOX, 2);
+        assert!(s.mouse_back());
+        s.set_unread_only(true);
+        s.set_unread_only(false);
+        assert!(!s.mouse_forward());
+        s.set_unread_only(true);
+        s.open_message("ada@example.com", INBOX, 1);
+        assert!(s.mouse_back());
+        s.set_unread_only(false);
+        assert!(!s.mouse_forward());
+    }
+
+    #[test]
+    fn side_buttons_work_again_once_the_sidebar_leaves_an_accounts_settings() {
+        let (_dir, mut s) = synced("mouse-account-page", &[hello(1, true)]);
+        s.settings_open = true;
+        s.account_settings.open = true;
+        s.show(Showing::inbox("ada@example.com"));
+        s.open_message("ada@example.com", INBOX, 1);
+        assert!(s.mouse_back());
+        assert!(s.mouse_forward());
+    }
+
+    #[test]
+    fn forward_has_nothing_to_open_once_the_list_shows_another_mailbox() {
+        let (_dir, mut s) = synced("mouse-mailbox", &[hello(1, true), hello(2, true)]);
+        s.open_message("ada@example.com", INBOX, 2);
+        assert!(s.mouse_back());
+        // Shown again as it is, from the sidebar, it's the same list.
+        s.show(Showing::inbox("ada@example.com"));
+        assert!(s.mouse_forward());
+        assert!(s.mouse_back());
+        // Another mailbox, even before coming back to this one.
+        s.show(Showing::Mailbox {
+            account: "ada@example.com".into(),
+            name: "Sent".into(),
+        });
+        s.show(Showing::inbox("ada@example.com"));
+        assert!(!s.mouse_forward());
+        s.open_message("ada@example.com", INBOX, 2);
+        assert!(s.mouse_back());
+        s.show(Showing::All(Role::Inbox));
+        assert!(!s.mouse_forward());
+        assert_eq!(open_uid(&s), None);
+    }
+
+    #[test]
+    fn forward_doesnt_open_a_message_moved_deleted_or_whose_account_is_gone() {
+        let (_dir, mut s) = synced(
+            "mouse-gone",
+            &[hello(1, true), hello(2, true), hello(3, true)],
+        );
+        let back_from = |s: &mut Mail, uid: u32| {
+            s.open_message("ada@example.com", INBOX, uid);
+            assert!(s.mouse_back());
+        };
+        // Moved, or snoozed, from the list.
+        back_from(&mut s, 3);
+        s.left_list(ada(3));
+        assert!(!s.mouse_forward());
+        // Another one leaving it changes nothing.
+        back_from(&mut s, 2);
+        s.left_list(ada(1));
+        assert!(s.mouse_forward());
+        // Deleted on the server, and gone from the cache as it syncs.
+        back_from(&mut s, 2);
+        s.services
+            .as_mut()
+            .unwrap()
+            .store
+            .remove_message("ada@example.com", INBOX, 2)
+            .unwrap();
+        s.reload();
+        assert!(!s.mouse_forward());
+        assert_eq!(open_uid(&s), None);
+        // Its mailbox started over: its UID may name another message now.
+        let (_dir, mut s) = synced("mouse-over", &[hello(1, true)]);
+        back_from(&mut s, 1);
+        s.services
+            .as_mut()
+            .unwrap()
+            .store
+            .save_messages("ada@example.com", INBOX, Role::Inbox, 2, &[hello(1, true)])
+            .unwrap();
+        s.started_over("ada@example.com", INBOX);
+        s.reload();
+        assert!(!s.mouse_forward());
+        // Its account removed, behind every inbox.
+        let (_dir, mut s) = synced("mouse-account", &[hello(1, true)]);
+        s.show(Showing::All(Role::Inbox));
+        back_from(&mut s, 1);
+        s.forget_mail_of("bob@example.com");
+        assert!(s.mouse_forward(), "another account's going changes nothing");
+        assert!(s.mouse_back());
+        s.forget_mail_of("ada@example.com");
+        assert!(!s.mouse_forward());
+        // Another account removed whose mailbox the list showed, the list shows every inbox.
+        s.show(Showing::inbox("bob@example.com"));
+        back_from(&mut s, 1);
+        s.forget_mail_of("bob@example.com");
+        assert_eq!(s.showing, Showing::All(Role::Inbox));
+        assert!(!s.mouse_forward());
+    }
+
+    #[test]
+    fn the_mouses_side_buttons_do_nothing_while_something_shows_over_the_list() {
+        let (_dir, mut s) = synced("mouse-over-list", &[hello(1, true)]);
+        let covers: [fn(&mut Mail, bool); 9] = [
+            |s, on| s.compose.open = on,
+            |s, on| s.settings_open = on,
+            |s, on| s.form.open = on,
+            |s, on| s.palette.open = on,
+            |s, on| s.actions_open = on,
+            |s, on| s.new_mailbox.open = on,
+            |s, on| {
+                s.delete_mailbox.mailbox = on.then(|| ("ada@example.com".into(), "Work".into()));
+            },
+            |s, on| s.updater.dialog_open = on,
+            |s, on| {
+                s.message_menu = on.then(|| MessageMenu {
+                    message: ada(1),
+                    point: PointerPress { x: 0.0, y: 0.0 },
+                    move_open: false,
+                    snooze_open: false,
+                });
+            },
+        ];
+        for cover in covers {
+            s.open_message("ada@example.com", INBOX, 1);
+            cover(&mut s, true);
+            assert!(!s.mouse_back());
+            assert_eq!(open_uid(&s), Some(1), "still open under it");
+            cover(&mut s, false);
+            assert!(s.mouse_back());
+            cover(&mut s, true);
+            assert!(!s.mouse_forward());
+            assert_eq!(open_uid(&s), None);
+            cover(&mut s, false);
+            assert!(s.mouse_forward(), "kept for once it's gone");
+        }
+    }
+
+    #[test]
+    fn forward_to_a_message_the_rail_opened_goes_on_with_j_and_k_from_its_row() {
+        let threaded = |uid: u32, id: &str, parent: Option<&str>| Envelope {
+            message_id: Some(id.into()),
+            in_reply_to: parent.map(Into::into),
+            references: parent.into_iter().map(Into::into).collect(),
+            ..hello(uid, true)
+        };
+        let (_dir, mut s) = synced(
+            "mouse-thread",
+            &[
+                threaded(1, "other@example.com", None),
+                threaded(2, "ask@example.com", None),
+                threaded(3, "answer@example.com", Some("ask@example.com")),
+            ],
+        );
+        s.services
+            .as_mut()
+            .unwrap()
+            .store
+            .save_messages(
+                "ada@example.com",
+                "Sent",
+                Role::Sent,
+                1,
+                &[threaded(9, "mine@example.com", Some("answer@example.com"))],
+            )
+            .unwrap();
+        s.reload();
+        s.open_message("ada@example.com", INBOX, 3);
+        s.open_in_thread(&("ada@example.com".into(), "Sent".into(), 9));
+        assert!(s.mouse_back());
+        assert_eq!(s.cursor, Some(ada(3)), "on the row it was opened from");
+        assert!(s.mouse_forward());
+        assert!(
+            s.reader
+                .as_ref()
+                .is_some_and(|r| r.is("ada@example.com", "Sent", 9))
+        );
+        s.move_cursor(1, &mut Tx::default());
+        assert_eq!(open_uid(&s), Some(2));
     }
 }

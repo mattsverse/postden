@@ -10,8 +10,8 @@ use postden_mail::imap::Status;
 use postden_store::StoredMessage;
 use postden_update::Track;
 use rune::{
-    Align, Block, Color, Cx, El, GrowthSpec, Icon, Mark, ScrollSpec, Side, TextEdit, TextStyle,
-    Transition, Tx, col, el, icon, row, text,
+    Align, Block, Color, Cx, El, GrowthSpec, Icon, Mark, PointerButton, ScrollSpec, Side, TextEdit,
+    TextStyle, Transition, Tx, col, el, icon, row, text,
 };
 use rune_kit::shell::{RowStatus, Sidebar, SidebarRow, SplitView, Toolbar};
 use rune_kit::{
@@ -209,11 +209,30 @@ pub(crate) fn view(s: &Mail, cx: &mut Cx<Mail>) -> El {
         .sidebar_padding(18.0, 10.0)
         .reduced_motion(cx.is_reduced_motion())
         .build(&k);
-    root(window, layer).on_window_focus(|s: &mut Mail, focused, _| {
-        if focused {
-            s.window_focused();
-        }
-    })
+    root(window, layer)
+        .on_window_focus(|s: &mut Mail, focused, _| {
+            if focused {
+                s.window_focused();
+            }
+        })
+        .on_button(side_button)
+}
+
+/// The mouse's Back or Forward side button, pressed where nothing under the pointer takes it: Back
+/// leaves the open message for the list, as the toolbar's back button does, and Forward opens it
+/// again. Other buttons go on, so the middle button still scrolls.
+fn side_button(s: &mut Mail, button: PointerButton, tx: &mut Tx) -> bool {
+    let went = match button {
+        PointerButton::Back => s.mouse_back(),
+        PointerButton::Forward => s.mouse_forward(),
+        _ => return false,
+    };
+    if went {
+        // With the list or the message as it comes, not a frame after.
+        s.reveal_cursor(tx);
+        tx.instant();
+    }
+    true
 }
 
 /// What's shown, with the notice's bar under it while there is one: always the same frame, so
