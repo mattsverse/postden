@@ -25,7 +25,7 @@ use crate::account_settings::{AccountSettings, IMAGE_EXTENSIONS, Servers};
 use crate::commands::{Command, Entry, Shortcut};
 use crate::compose::{ComposeForm, Mode, Preview, Recipients};
 use crate::form::{AccountForm, SECURITY, Step, Unreadable, is_set_up, security_index};
-use crate::rich::RichEditor;
+use crate::rich::{self, RichEditor};
 use crate::search::{SERVER_PAGE, ServerSearch};
 use crate::state::{
     AccountMenu, Answer, Asking, INBOX as INBOX_NAME, ListRow, Mail, MailboxMenu, MessageMenu,
@@ -5764,6 +5764,11 @@ static QUOTE: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M3.25 3.5V12.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M6.5 5H13M6.5 8H13M6.5 11H11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>"#,
 };
+static TEXT_COLOR: Icon = Icon {
+    name: "postden-text-color",
+    view: 16.0,
+    body: r#"<path d="M4.75 10.5L8 2.75L11.25 10.5M6 7.75H10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" fill="none"/><path d="M3 13.25H13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>"#,
+};
 static CODE_BLOCK: Icon = Icon {
     name: "postden-code-block",
     view: 16.0,
@@ -5899,6 +5904,10 @@ fn editor(e: &RichEditor, r: Rich, k: &Kit) -> El {
     if let Some(link) = &e.link {
         editor = editor.child(link_row(e, r, link, k));
     }
+    // Not while sending: what's sent was taken already.
+    if e.picking_color && e.mode == Mode::Visual && !r.disabled {
+        editor = editor.child(color_row(e, r, k));
+    }
     editor.child(area)
 }
 
@@ -5949,6 +5958,18 @@ fn format_bar(e: &RichEditor, r: Rich, k: &Kit) -> El {
         .build(k)
         .checked(linked)
         .key(r.key("format-link"));
+    let colored = enabled && e.text.active_color().is_some();
+    let color = tool(
+        &TEXT_COLOR,
+        "Text color",
+        colored || e.picking_color,
+        enabled,
+    )
+    .on_press(move |s: &mut Mail| (r.get)(s).toggle_colors())
+    .build(k)
+    .checked(colored)
+    .expanded(e.picking_color)
+    .key(r.key("format-text-color"));
     let separator = || el().w(1.0).h(16.0).fill(k.c.border_weak);
     // Works in both modes: a pill in the editor, an `<img>` in the source.
     let image = r.add_image.map(|add| {
@@ -5979,6 +6000,7 @@ fn format_bar(e: &RichEditor, r: Rich, k: &Kit) -> El {
         .child(mark(&STRIKE, "Strikethrough", None, Mark::Strike))
         .child(mark(&CODE, "Code", None, Mark::Code))
         .child(link)
+        .child(color)
         .children(image)
         .child(row().px(6.0).child(separator()))
         .child(block_button(&BULLETS, "Bulleted list", Block::Bullet(0)))
@@ -6052,6 +6074,65 @@ fn link_row(e: &RichEditor, r: Rich, link: &TextEdit, k: &Kit) -> El {
             .on_press(move |s: &mut Mail| (r.get)(s).toggle_link())
             .build(k),
     )
+}
+
+/// The text colors, under the formatting bar: the default, then [`rich::COLORS`].
+fn color_row(e: &RichEditor, r: Rich, k: &Kit) -> El {
+    let active = e.text.active_color();
+    let swatch = |name: &'static str, hex: &'static str| {
+        let on = active == Some(hex);
+        row()
+            .key(r.key(&format!("text-color-{}", name.to_ascii_lowercase())))
+            .role("button")
+            .label(name)
+            .help(name)
+            .focusable(true)
+            .checked(on)
+            .center()
+            .size(24.0, 24.0)
+            .radius(k.radius.sm)
+            .border(
+                if on { 1.5 } else { 1.0 },
+                if on { k.c.text_base } else { k.c.border_weak },
+            )
+            .child(
+                el().size(14.0, 14.0)
+                    .radius(3.0)
+                    .fill(rune::color::hex(hex).unwrap_or(k.c.text_base)),
+            )
+            .on_press(move |s: &mut Mail| {
+                (r.get)(s).set_color(Some(hex));
+                (r.changed)(s);
+            })
+    };
+    row()
+        .key(r.key("text-color-row"))
+        .w_full()
+        .gap(6.0)
+        .center_y()
+        .child(
+            Button::new("Default")
+                .variant(if active.is_none() {
+                    ButtonVariant::Neutral
+                } else {
+                    ButtonVariant::Ghost
+                })
+                .on_press(move |s: &mut Mail| {
+                    (r.get)(s).set_color(None);
+                    (r.changed)(s);
+                })
+                .build(k)
+                .checked(active.is_none())
+                .key(r.key("text-color-default")),
+        )
+        .children(rich::COLORS.map(|(name, hex)| swatch(name, hex)))
+        .child(el().grow(1.0))
+        .child(
+            Button::new("Cancel")
+                .variant(ButtonVariant::Ghost)
+                .on_press(move |s: &mut Mail| (r.get)(s).toggle_colors())
+                .build(k),
+        )
 }
 
 /// The message replied to, below the editor: its header, and the message itself when opened.

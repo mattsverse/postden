@@ -605,6 +605,27 @@ mod tests {
     }
 
     #[test]
+    fn a_colored_signature_reopens_in_the_visual_editor() {
+        let images = [logo("logo", 600, 200)];
+        let html = "<p><span style=\"color:#1a73e8\">Ada</span></p><p><img alt=\"Logo\" \
+                    src=\"cid:logo@postden\" width=\"120\" height=\"40\"></p>";
+        let (editor, fits) = to_editor(html, &images);
+        assert!(fits, "{editor}");
+        assert!(
+            editor.contains("<span style=\"color:#1a73e8\">Ada</span>"),
+            "{editor}"
+        );
+        assert!(
+            !to_editor(
+                "<p><span style='color:#1a73e8;font-size:20px'>Ada</span></p>",
+                &[]
+            )
+            .1,
+            "other styles still don't fit"
+        );
+    }
+
+    #[test]
     fn removing_an_image_drops_its_tags() {
         let html = "<p>Ada</p>\n<p><img src=\"cid:a@x\" alt=\"a\"> <IMG alt='b' src='cid:b@x'></p>\
                     <p>see cid:b@x</p>";

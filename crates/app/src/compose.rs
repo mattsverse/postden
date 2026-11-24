@@ -463,6 +463,30 @@ mod tests {
         assert!(html.contains("<p>Hi <b>there</b></p>"), "{html}");
     }
 
+    #[test]
+    fn colored_text_and_signature_keep_their_color_in_the_html_only() {
+        let mut d = Draft::new("me@example.com");
+        d.to = "ada@example.com".into();
+        d.text = "Hi there".into();
+        d.html = Some("<p>Hi <span style=\"color:#d93025\">there</span></p>".into());
+        d.signature = Some(Signature {
+            html: "<p><span style=\"color:#1a73e8\">Ada</span></p>".into(),
+            source: false,
+            images: Vec::new(),
+        });
+        let m = d.outgoing(&account()).unwrap();
+        let html = m.html.unwrap();
+        assert!(
+            html.contains("<span style=\"color:#d93025\">there</span>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span style=\"color:#1a73e8\">Ada</span>"),
+            "{html}"
+        );
+        assert_eq!(m.text, "Hi there\n\n-- \nAda");
+    }
+
     fn logo() -> postden_core::message::InlineImage {
         postden_core::message::InlineImage {
             cid: "logo@postden".into(),
