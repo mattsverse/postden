@@ -7181,13 +7181,6 @@ impl Mail {
     }
 
     /// The tray icon started: closing the window keeps the app running from now on.
-    #[cfg_attr(
-        target_os = "macos",
-        expect(
-            clippy::missing_const_for_fn,
-            reason = "Rune's tray only drops its icon off macOS"
-        )
-    )]
     pub(crate) fn attach_tray(&mut self, tray: Tray) {
         self.tray = Some(tray);
     }

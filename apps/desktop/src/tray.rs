@@ -1,5 +1,5 @@
-//! The tray icon that brings the window back once it's closed, on Linux and Windows. Rune has no
-//! tray on macOS, where the Dock icon does that instead, as it does for Mail.
+//! The tray icon that brings the window back once it's closed, on Linux and Windows. On macOS
+//! the Dock icon does that instead, as it does for Mail.
 
 use rune::{AppHandle, Tray, TrayEvent, TrayIcon, TrayItem, TraySpec};
 
