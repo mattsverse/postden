@@ -46,7 +46,7 @@ const BLOCKS: [Block; 4] = [
 
 /// A visual editor holding `html`, or plain `text` when there's no HTML.
 fn visual(html: Option<&str>, text: &str) -> TextEdit {
-    let edit = html.map_or_else(|| TextEdit::new(text), TextEdit::from_html);
+    let edit = html.map_or_else(|| TextEdit::new(text), TextEdit::from_html_with_color);
     edit.rich().allow_marks(marks()).allow_blocks(BLOCKS)
 }
 
