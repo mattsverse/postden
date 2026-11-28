@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.11.0](https://github.com/mattsverse/postden/compare/v0.10.0...v0.11.0) (2026-11-28)
+
+
+### Features
+
+* color text in the message and signature editors ([e6206d7](https://github.com/mattsverse/postden/commit/e6206d7dcc0e318555ebfffbadb505fc8f2f62f2))
+* **desktop:** edit an account's IMAP and SMTP settings ([820967f](https://github.com/mattsverse/postden/commit/820967fe7d472dbbdc37d37ddc1ba9ddc090ffb0))
+* **desktop:** make search, undo and autosort review easier to follow ([2965106](https://github.com/mattsverse/postden/commit/296510643b6747b2ddca1c4c16b9e0df5dddb0be))
+* go back to the list and forward to the message with the mouse's side buttons ([6f03db2](https://github.com/mattsverse/postden/commit/6f03db2f66ba929255cb2c84582952bf94b5817d))
+* show an open message's whole thread as a graph beside it ([d873d5c](https://github.com/mattsverse/postden/commit/d873d5ce5d4ae445e9140834afc0b6eab9b20b96))
+
+
+### Bug Fixes
+
+* **desktop:** keep read marks as asked while the server answers ([da67a31](https://github.com/mattsverse/postden/commit/da67a31f89bfa8af04785ccf2339b6bd6714fdcc))
+
 ## [0.10.0](https://github.com/mattsverse/postden/compare/v0.9.0...v0.10.0) (2026-11-20)
 
 
